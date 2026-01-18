@@ -2,19 +2,20 @@
 """
 RLM-Mem MCP Server
 
-An MCP server that provides Claude Code with the ability to process
-arbitrarily large inputs using the Recursive Language Model technique.
+An MCP server implementing the TRUE RLM technique from arXiv:2512.24601.
 
-Based on:
-- arXiv:2512.24601 (Recursive Language Models)
-- Anthropic MCP Best Practices
-- Anthropic Prompt Caching Documentation
+KEY INSIGHT: Content is stored as a VARIABLE, not in LLM context.
+- LLM writes CODE to examine portions of the content
+- Sub-LLM responses stored in VARIABLES (not summarized!)
+- Full data PRESERVED - LLM can access any part anytime
+
+This is NOT summarization - data is kept intact and accessible.
 
 Tools provided:
-- rlm_analyze: Analyze files/directories recursively
-- rlm_query_text: Process large text blocks
+- rlm_analyze: Analyze files/directories using RLM
+- rlm_query_text: Process large text using RLM
 - rlm_status: Check server health and configuration
-- rlm_memory_store: Store important findings for later recall
+- rlm_memory_store: Store findings for later recall
 - rlm_memory_recall: Recall stored information
 """
 
@@ -28,7 +29,6 @@ from mcp.server.stdio import stdio_server
 from mcp.types import (
     Tool,
     TextContent,
-    CallToolResult,
 )
 
 from .config import get_config, RLMConfig, ServerConfig
@@ -70,10 +70,10 @@ def create_server() -> Server:
             Tool(
                 name="rlm_analyze",
                 description=(
-                    "Analyze files or directories using Recursive Language Model (RLM) technique. "
-                    "Use this for large codebases, security audits, architecture reviews, or any "
-                    "task requiring analysis of 50+ files. Returns a summarized result that fits "
-                    "in context while processing arbitrarily large inputs."
+                    "Analyze files/directories using TRUE RLM technique (arXiv:2512.24601). "
+                    "Content stored as variable, LLM writes code to examine portions. "
+                    "Sub-LLM responses stored in full (NOT summarized). "
+                    "Use for: large codebases (50+ files), security audits, architecture reviews."
                 ),
                 inputSchema={
                     "type": "object",
@@ -81,9 +81,10 @@ def create_server() -> Server:
                         "query": {
                             "type": "string",
                             "description": (
-                                "What to find/analyze. Be specific for better results. "
-                                "Examples: 'security vulnerabilities', 'find all TODO comments', "
-                                "'describe architecture and main components'"
+                                "What to find/analyze. Be specific. "
+                                "Examples: 'find SQL injection vulnerabilities', "
+                                "'list all API endpoints with their HTTP methods', "
+                                "'find functions that handle user authentication'"
                             ),
                         },
                         "paths": {
@@ -98,16 +99,16 @@ def create_server() -> Server:
             Tool(
                 name="rlm_query_text",
                 description=(
-                    "Process a large text block using RLM technique. Use this when you already "
-                    "have large text content (logs, transcripts, documents) that needs recursive "
-                    "processing to fit in context."
+                    "Process large text using TRUE RLM technique. "
+                    "Text stored as `prompt` variable, LLM writes code to examine it. "
+                    "Use for: logs, transcripts, documents, any large text input."
                 ),
                 inputSchema={
                     "type": "object",
                     "properties": {
                         "query": {
                             "type": "string",
-                            "description": "Question or task to perform on the text",
+                            "description": "What to find/extract from the text",
                         },
                         "text": {
                             "type": "string",
