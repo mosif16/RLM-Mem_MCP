@@ -41,6 +41,7 @@ from .content_analyzer import (
     Confidence,
 )
 from .fallback_analyzer import FallbackAnalyzer
+from .structured_tools import StructuredTools, ToolResult, Finding, Confidence as ToolConfidence, Severity
 
 
 # Dangerous attribute names that could be used for sandbox escapes
@@ -443,242 +444,105 @@ class RLMReplEnvironment:
 
         return query.strip()
 
-    # System prompt matching the paper's approach - with anti-hallucination measures
-    SYSTEM_PROMPT = '''You are an RLM (Recursive Language Model) analyzing REAL code via a Python REPL.
+    # System prompt - emphasizes using STRUCTURED TOOLS over raw code
+    SYSTEM_PROMPT = '''You are an RLM analyzing REAL code via Python REPL with STRUCTURED TOOLS.
 
-## CRITICAL: This is REAL content, NOT a simulation
+## USE STRUCTURED TOOLS (PREFERRED)
 
-The `prompt` variable contains ACTUAL source code files. You must:
-- Extract and analyze REAL code from the prompt
-- Report ONLY findings that exist in the actual content
-- Include EXACT file paths, LINE NUMBERS, and code snippets from the prompt
-- NEVER generate example/simulated/hypothetical findings
-- ALWAYS assign a CONFIDENCE LEVEL to each finding
+Instead of writing raw code, use these preconfigured tools that return structured results:
 
-## CRITICAL: Code Execution Rules
-
-**ALWAYS initialize variables before using them.** Each code block runs independently.
-
-WRONG (will cause NameError):
+### Security Tools
 ```python
-findings.append(x)  # NameError: 'findings' not defined!
+result = find_secrets()           # Find hardcoded API keys, passwords, tokens
+result = find_sql_injection()     # Find SQL injection vulnerabilities
+result = find_command_injection() # Find command injection (os.system, subprocess)
+result = find_xss()               # Find XSS vulnerabilities (innerHTML, etc.)
+result = find_python_security()   # Find Python issues (pickle, yaml.load, bare except)
 ```
 
-CORRECT:
+### iOS/Swift Tools
 ```python
-findings = []  # Initialize first!
-findings.append(x)
+result = find_force_unwraps()          # Find ! force unwraps (excluding !=)
+result = find_retain_cycles()          # Find closures missing [weak self]
+result = find_main_thread_violations() # Find UI updates off main thread
 ```
 
-**Common variables you MUST initialize:**
-- `findings = []` before appending findings
-- `output = ""` before building output strings
-- `results = []` before collecting results
-- `files = []` before storing file lists
-
-## Sandbox Environment
-
-**Pre-loaded (no import needed):**
-- `re` - Regular expressions (just use `re.findall(...)` directly)
-- `prompt` - The full source code content
-
-**Available builtins:**
-len, str, int, float, bool, list, dict, tuple, set, range, enumerate, zip,
-map, filter, sorted, reversed, min, max, sum, any, all, abs, round, print,
-isinstance, ord, chr, repr, frozenset
-
-**NOT available (will error):**
-- `import` statements (except `import re` which is auto-handled)
-- `open()`, `eval()`, `exec()`, `__import__()`
-- File I/O operations
-- Network operations
-
-**Variable scope:**
-- Variables persist across code blocks (e.g., `files` defined in one block is available in the next)
-- ALWAYS define variables before using them in the SAME code block
-- If you get NameError, check spelling and ensure the variable was defined in a previous successful execution
-
-**Helper functions provided:**
-
-1. `llm_query(text)` - Query a sub-LLM. Pass ACTUAL code snippets from prompt.
-   The sub-LLM will analyze ONLY what you send it.
-
-2. `extract_with_lines(filepath)` - Extract file content WITH line numbers.
-   Returns formatted string: "1: first line\\n2: second line\\n..."
-
-3. `verify_line(filepath, line_num, expected_pattern)` - VERIFY a line exists and contains expected content.
-   Returns: dict with 'is_valid', 'actual_content', 'in_dead_code', 'confidence', 'reason'
-   USE THIS before reporting any finding to avoid false positives!
-
-4. `check_dead_code(filepath)` - Check if file has dead code regions (#if false, #if DEBUG, etc.)
-   Returns: list of dead code regions with start_line, end_line, condition
-
-5. `is_implemented(filepath, function_name)` - Check if a function is actually implemented (not a stub).
-   Returns: dict with 'is_implemented', 'has_body', 'is_stub', 'confidence', 'reason'
-
-6. `batch_verify(findings)` - EFFICIENT batch verification for multiple findings.
-   Pass a list of {{'file': path, 'line': num, 'pattern': regex}} dicts.
-   Returns: list of verification results (more efficient than calling verify_line repeatedly!)
-   USE THIS when you have 5+ findings to verify.
-
-7. `find_swift_issues(file_path, issue_types)` - Swift-specific issue finder.
-   issue_types: ["retain_cycle", "force_unwrap", "actor_isolation", "swiftui"]
-   Returns: list of issues with file, line, type, description, confidence
-   Example: `issues = find_swift_issues("PaywallView.swift", ["retain_cycle", "force_unwrap"])`
-
-8. `analyze_file(file_path, analysis_type)` - Deep analysis using sub-LLM.
-   analysis_type: "security", "quality", or "architecture"
-   Returns: Detailed analysis from sub-LLM
-   Example: `analysis = analyze_file("AuthManager.swift", "security")`
-
-9. `search_pattern(pattern, file_filter)` - Fast regex search across all files.
-    file_filter: Optional extension filter like ".swift"
-    Returns: list of {{'file', 'line', 'content', 'match'}} dicts
-    Example: `matches = search_pattern(r'api.?key', '.swift')`
-
-10. `FINAL_ANSWER` - Set this to your final response with REAL findings.
-
-## Content
-
-`prompt` contains {char_count:,} chars of REAL source code (files concatenated).
-Format: "### File: path/to/file.ext\\n<actual code>\\n### File: ..."
-
-## PRE-INITIALIZED VARIABLES (ready to use)
-
-These variables are already initialized - you can append to them directly:
-- `findings = []` - Append your findings here
-- `results = []` - Append results here
-- `issues = []` - Append issues here
-- `files = []` - Store file paths here
-- `output = ""` - Build output strings here
-
-## CONFIDENCE LEVELS (REQUIRED)
-
-Every finding MUST have a confidence level:
-
-**[Confidence: HIGH]** - Use when:
-- Code is in active (non-conditional) blocks
-- Line verified with verify_line()
-- Function has real implementation (check with is_implemented())
-
-**[Confidence: MEDIUM]** - Use when:
-- Code context unclear
-- Cannot verify reachability
-- Implementation status uncertain
-
-**[Confidence: LOW]** - Use when:
-- Code is in #if false, #if DEBUG blocks (check with check_dead_code())
-- Line couldn't be verified
-- Function is a stub or unimplemented
-- Finding based on signature only
-
-## CRITICAL OUTPUT FORMAT
-
-All findings MUST include:
-- **File:Line** format: `path/to/file.py:42`
-- **[Confidence: HIGH/MEDIUM/LOW]** with reason if LOW
-- **Code snippet**: The actual code from the file
-- **Context**: What the issue is
-
-Example finding format:
-```
-**src/auth.py:156** [Confidence: HIGH]
-Issue: Hardcoded API key
+### Quality Tools
 ```python
-API_KEY = "sk-1234567890abcdef"  # Line 156
+result = find_long_functions(max_lines=50)  # Find functions over N lines
+result = find_todos()                        # Find TODO/FIXME/HACK comments
 ```
 
-**src/legacy.swift:42** [Confidence: LOW - in #if false block]
-Issue: Potential hardcoded secret (DEAD CODE - not compiled)
-```swift
-let key = "test-key"  # Line 42
+### Architecture Tools
+```python
+result = map_architecture()        # Categorize files by type
+result = find_imports("module")    # Find all imports of a module
 ```
+
+### Batch Scans (run multiple tools at once)
+```python
+results = run_security_scan()  # Runs all security tools
+results = run_quality_scan()   # Runs all quality tools
+results = run_ios_scan()       # Runs all iOS/Swift tools
 ```
 
-## Required Workflow
+### Using Results
+Each tool returns a `ToolResult` with:
+- `result.findings` - List of Finding objects
+- `result.count` - Number of findings
+- `result.high_confidence` - Only HIGH confidence findings
+- `result.to_markdown()` - Formatted output for FINAL_ANSWER
 
-1. **First, discover what files exist**:
-   ```python
-   # Find all actual file paths in the content
-   files = re.findall(r'### File: ([^\\n]+)', prompt)
-   print(f"Found {{len(files)}} files:")
-   for f in files[:20]:
-       print(f"  - {{f}}")
-   ```
+```python
+# Example workflow
+result = find_secrets()
+if result.count > 0:
+    print(result.to_markdown())
+    FINAL_ANSWER = result.to_markdown()
+else:
+    FINAL_ANSWER = "No hardcoded secrets found."
+```
 
-2. **Check for dead code regions BEFORE analyzing**:
-   ```python
-   # Check each file for conditional compilation blocks
-   for f in files[:10]:
-       dead_regions = check_dead_code(f)
-       if dead_regions:
-           print(f"{{f}}: {{len(dead_regions)}} dead code regions")
-           for r in dead_regions:
-               print(f"  Lines {{r['start_line']}}-{{r['end_line']}}: {{r['condition']}}")
-   ```
+## Content Info
 
-3. **Extract files WITH LINE NUMBERS**:
-   ```python
-   # Use the helper to get line-numbered content
-   content = extract_with_lines("path/to/file.py")
-   print(content[:2000])  # Shows "1: line1\\n2: line2\\n..."
-   ```
+- `files` - List of {file_count} file paths (pre-loaded)
+- `prompt` - Full content ({char_count:,} chars)
 
-4. **VERIFY findings before reporting**:
-   ```python
-   # Always verify line references!
-   result = verify_line("src/auth.py", 42, r"API_KEY|secret|password")
-   if result['is_valid'] and not result['in_dead_code']:
-       print(f"CONFIRMED: Line 42 contains: {{result['actual_content']}}")
-       confidence = "HIGH"
-   elif result['in_dead_code']:
-       print(f"WARNING: Line 42 is in dead code block")
-       confidence = "LOW"
-   else:
-       print(f"NOT FOUND: {{result['reason']}}")
-   ```
+## Quick Reference
 
-5. **Check implementation status for function findings**:
-   ```python
-   # Don't report "function returns NotImplemented" if it's actually implemented
-   status = is_implemented("src/api.py", "process_request")
-   if status['is_stub']:
-       print(f"WARNING: Function is a stub - {{status['reason']}}")
-   elif status['is_implemented']:
-       print(f"Function is fully implemented with {{status['body_lines']}} lines")
-   ```
+| Task | Tool |
+|------|------|
+| Security audit | `run_security_scan()` or individual tools |
+| iOS/Swift review | `run_ios_scan()` |
+| Code quality | `run_quality_scan()` |
+| Find secrets | `find_secrets()` |
+| Force unwraps | `find_force_unwraps()` |
+| SQL injection | `find_sql_injection()` |
+| Architecture map | `map_architecture()` |
 
-6. **Compile findings with confidence levels**:
-   ```python
-   FINAL_ANSWER = f"""## Analysis of {{len(files)}} files
+## Advanced: Custom Search
 
-   ### High Confidence Findings
-   {{high_confidence_findings}}
+If no tool matches your needs, use raw search:
+```python
+matches = search_pattern(r'your_regex', '.py')  # Returns list of matches
+for m in matches:
+    print(f"{{m['file']}}:{{m['line']}} - {{m['content']}}")
+```
 
-   ### Medium Confidence Findings
-   {{medium_confidence_findings}}
+Or use `llm_query(text)` for semantic analysis of specific code sections.
 
-   ### Low Confidence Findings (verify manually)
-   {{low_confidence_findings}}
+## Output
 
-   Files analyzed: {{', '.join(analyzed_files)}}"""
-   ```
-
-## Anti-Hallucination Rules
-
-- ONLY report file paths that appear in `prompt`
-- ONLY quote code that exists in `prompt`
-- ALWAYS verify line numbers with verify_line() before reporting
-- ALWAYS check for dead code with check_dead_code()
-- ALWAYS assign confidence levels (HIGH/MEDIUM/LOW)
-- If a finding is in dead code (#if false, etc.), mark as LOW confidence
-- If no issues found, say "No issues found" - don't invent examples
-- Every finding MUST have format: `filepath:line_number [Confidence: X]`
+Set `FINAL_ANSWER` with your results:
+```python
+result = find_secrets()
+FINAL_ANSWER = result.to_markdown()
+```
 
 ## Query
 {query}
 
-Start by discovering files, checking for dead code regions, then use verification helpers before reporting findings.'''
+Start by selecting the appropriate tool(s), run them, and set FINAL_ANSWER with the results.'''
 
     def __init__(self, config: RLMConfig):
         self.config = config
@@ -1545,6 +1409,9 @@ Remove duplicates (same line, same issue). Keep all unique findings with their l
         # Merge with existing state variables (state takes precedence)
         all_variables = {**pre_initialized, **self.state.variables}
 
+        # Initialize structured tools
+        tools = StructuredTools(self.state.prompt)
+
         return {
             "__builtins__": safe_builtins,
             "prompt": self.state.prompt,
@@ -1560,6 +1427,43 @@ Remove duplicates (same line, same issue). Keep all unique findings with their l
             "search_pattern": self._create_pattern_search_function(),
             "re": re,  # Regex support
             "FINAL_ANSWER": None,
+
+            # ===== STRUCTURED TOOLS (PREFERRED) =====
+            # These return ToolResult objects with structured findings
+            "tools": tools,
+
+            # Security tools
+            "find_secrets": tools.find_secrets,
+            "find_sql_injection": tools.find_sql_injection,
+            "find_command_injection": tools.find_command_injection,
+            "find_xss": tools.find_xss_vulnerabilities,
+            "find_python_security": tools.find_python_security,
+
+            # iOS/Swift tools
+            "find_force_unwraps": tools.find_force_unwraps,
+            "find_retain_cycles": tools.find_retain_cycles,
+            "find_main_thread_violations": tools.find_main_thread_violations,
+            "find_weak_self_issues": tools.find_weak_self_issues,
+            "find_cloudkit_issues": tools.find_cloudkit_issues,
+            "find_deprecated_apis": tools.find_deprecated_apis,
+            "find_swiftdata_issues": tools.find_swiftdata_issues,
+
+            # Quality tools
+            "find_long_functions": tools.find_long_functions,
+            "find_todos": tools.find_todos,
+
+            # Architecture tools
+            "map_architecture": tools.map_architecture,
+            "find_imports": tools.find_imports,
+
+            # Batch scans
+            "run_security_scan": tools.run_security_scan,
+            "run_quality_scan": tools.run_quality_scan,
+            "run_ios_scan": tools.run_ios_scan,
+
+            # Helper to get file list
+            "files": tools.files,
+
             **all_variables
         }
 
@@ -1694,40 +1598,38 @@ Remove duplicates (same line, same issue). Keep all unique findings with their l
         # Sanitize query to prevent format string issues and clean markdown
         safe_query = self.sanitize_query(query)
 
-        system = self.SYSTEM_PROMPT.format(
-            query=safe_query,
-            char_count=len(self.state.prompt)
-        )
-
         # Extract actual file list to ground the LLM in reality
         actual_files = self._extract_file_list()
+
+        system = self.SYSTEM_PROMPT.format(
+            query=safe_query,
+            char_count=len(self.state.prompt),
+            file_count=len(actual_files)
+        )
 
         # Build categorized file index for better discovery
         categorized_index = self._build_categorized_file_index(actual_files)
 
-        # Initial message showing REAL file paths (grounds the LLM)
-        initial_msg = f"""REPL ready. `prompt` contains {len(self.state.prompt):,} characters of REAL source code.
+        # Initial message - simplified to emphasize tool usage
+        initial_msg = f"""REPL ready with {len(actual_files)} files ({len(self.state.prompt):,} chars).
 
-## CATEGORIZED FILE INDEX ({len(actual_files)} files):
+## Available Files
 {categorized_index}
 
-## Quick File Search
-To find specific files, use: `[f for f in files if 'keyword' in f.lower()]`
-Example: `[f for f in files if 'widget' in f.lower() or 'extension' in f.lower()]`
+## Quick Start
+```python
+# Security scan
+result = run_security_scan()
+print(result[0].to_markdown())  # First tool's results
 
-## Important Patterns to Check
-- **Extensions/Widgets**: App extensions, widget targets, share extensions
-- **Paywall/Subscription**: Payment, subscription, StoreKit files
-- **Auth/Security**: Login, authentication, session management
-
-## Content Preview (first 500 chars):
-```
-{self.state.prompt[:500]}
+# Or individual tools
+result = find_secrets()
+FINAL_ANSWER = result.to_markdown()
 ```
 
-These are REAL files. Analyze them to answer: {safe_query}
+## Query: {safe_query}
 
-Start by exploring the actual content with Python code. Use the categorized index above to find relevant files."""
+Select the appropriate tool(s) and run them."""
 
         messages = [{"role": "user", "content": initial_msg}]
 

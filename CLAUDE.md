@@ -1,235 +1,248 @@
-# CLAUDE.md - Guidance for Claude Code
+# RLM-Mem MCP - Codebase State & Agent Notes
 
-This repository contains an MCP server implementing the Recursive Language Model (RLM) technique for handling large context with Claude.
+> This file tracks codebase state, recent changes, and agent observations.
+> For usage documentation, see [README.md](README.md).
 
-## Project Overview
+---
 
-**RLM-Mem MCP** provides tools for Claude Code to process arbitrarily large inputs (codebases, logs, documents) that would otherwise exceed the context window.
+## Codebase Overview
 
-## How RLM Works
+**Purpose**: MCP server implementing TRUE RLM technique (arXiv:2512.24601) for processing large codebases that exceed Claude's context window.
 
-The RLM technique stores content in a **variable** (not in LLM context):
-1. Files are collected and combined into a `prompt` variable
-2. An LLM writes **Python code** to examine portions of the content
-3. Sub-LLM calls analyze chunks, results stored in **full** (not summarized)
-4. Final answer compiled from all findings
+**Tech Stack**: Python 3.10+, OpenRouter API (Gemini Flash), MCP Protocol
 
-This means: **Your query drives the code the LLM writes to search the content.**
+**Entry Point**: `python -m rlm_mem_mcp.server`
 
-## Large Codebase Protocol
+---
 
-### When to use RLM tools:
-
-- **Analyzing 50+ files** - Use `rlm_analyze` instead of reading each file
-- **Searching entire codebase** - For queries like "find all X in the repo"
-- **Tasks with "all", "every", or "entire" scope**
-- **Security audits** - Need to check all files for vulnerabilities
-- **Architecture reviews** - Understanding overall structure
-- **Log analysis** - Processing large log files
-
-### When NOT to use RLM tools:
-
-- Working with 1-5 specific files (just read them directly)
-- Making targeted edits to known files
-- Quick lookups in known locations
-- Simple file operations
-
-## ⚠️ RLM Behavior Notes
-
-**RLM now auto-handles broad queries** by decomposing them into focused sub-queries.
-
-| Feature | Behavior |
-|---------|----------|
-| Broad queries ("audit everything") | Auto-decomposed into 3-4 focused queries |
-| Truncated responses | Auto-detected and continued |
-| Code execution failures | Retried up to 3 times with recovery |
-| Relevance threshold | Dynamically adjusted based on query specificity |
-
-### Still Requires Manual Verification
-
-Even with these improvements, ~40-60% of findings benefit from Grep/Read verification:
-- **False positives** can still occur (test code flagged as vulnerable, etc.)
-- **Context matters** - RLM can't understand business logic
-- **Dead code detection** - Now includes confidence levels (HIGH/MEDIUM/LOW)
-
-## Query Construction Rules (CRITICAL)
-
-### Anti-Patterns to Avoid
-
-These query patterns consistently fail or produce unreliable results:
-
-| ❌ AVOID | Why It Fails | ✅ INSTEAD |
-|----------|--------------|------------|
-| "audit this codebase" | Too broad - LLM doesn't know what to look for | Run 3-4 focused queries (security, architecture, quality) |
-| "find all problems" | Undefined scope - returns nothing or false positives | "Find X, Y, Z issues with file:line output" |
-| "check everything for security" | Overloaded - code generation gets truncated | One query per vulnerability class |
-| "summarize and also find bugs and review architecture" | Multiple unrelated goals - partial results | Separate queries for each goal |
-
-### Rule 1: Be Exhaustively Specific
-
-The LLM uses your query to decide what code to write. Vague queries = vague searches.
-
-| ❌ BAD | ✅ GOOD |
-|--------|---------|
-| "find problems" | "find: SQL injection, XSS, CSRF, command injection, path traversal, hardcoded secrets, insecure deserialization, auth bypasses" |
-| "summarize" | "list: all modules, their purpose, entry points, data flow between components, external dependencies" |
-| "check security" | "find security issues: (1) injection flaws - SQL, command, LDAP, XPath (2) broken auth - weak sessions, credential exposure (3) sensitive data exposure - hardcoded keys, API tokens in code (4) XXE, SSRF, insecure deserialization" |
-
-### Rule 2: Use Structured Query Format
+## Key Architecture
 
 ```
-TASK: [what you want to find/analyze]
-LOOK FOR:
-- [specific item 1]
-- [specific item 2]
-- [specific item 3]
-OUTPUT: [how you want results formatted]
+User Query → Claude Code → MCP Tool Call
+                              ↓
+                    ┌─────────────────────┐
+                    │   RLM MCP Server    │
+                    │   (server.py)       │
+                    └──────────┬──────────┘
+                               ↓
+              ┌────────────────┴────────────────┐
+              ↓                                 ↓
+    ┌─────────────────┐              ┌─────────────────┐
+    │ File Collector  │              │ RLM Processor   │
+    │ (async I/O)     │              │ (rlm_processor) │
+    └─────────────────┘              └────────┬────────┘
+                                              ↓
+                                   ┌─────────────────┐
+                                   │ REPL Environment│
+                                   │ (repl_env.py)   │
+                                   │                 │
+                                   │ prompt = content│
+                                   │ llm_query(...)  │
+                                   │ verify_line()   │
+                                   └─────────────────┘
 ```
 
-### Rule 3: One Focused Query Per Call
+---
 
-Instead of one massive query, make multiple focused calls:
+## Critical Files
 
-```
-# Call 1: Security
-query: "Find injection vulnerabilities: SQL injection via string concatenation, command injection via os.system/subprocess, path traversal via user-controlled file paths"
+| File | Purpose | Last Modified |
+|------|---------|---------------|
+| `server.py` | MCP server, tool definitions, request routing | 2025-01 |
+| `rlm_processor.py` | Query analysis, decomposition, chunk processing | 2025-01 |
+| `repl_environment.py` | TRUE RLM: content as variable, LLM writes code | 2025-01 |
+| `structured_tools.py` | **NEW**: Preconfigured search tools with typed output | 2025-01 |
+| `config.py` | Environment config (OPENROUTER_API_KEY, models) | 2025-01 |
+| `fallback_analyzer.py` | Pattern-based fallback when REPL fails | 2025-01 |
+| `content_analyzer.py` | Dead code detection, line verification | 2025-01 |
 
-# Call 2: Architecture
-query: "Map the architecture: list all classes/modules, their responsibilities, how they connect, entry points, data flow"
+---
 
-# Call 3: Error Handling
-query: "Find error handling issues: bare except clauses, swallowed exceptions, missing try/except around I/O, resource leaks"
-```
+## Structured Tools System
 
-### Example Queries by Task Type
+The REPL now exposes preconfigured tools instead of requiring raw Python:
 
-**Security Audit:**
-```
-Find security vulnerabilities in this Python codebase:
-1. INJECTION: SQL via string concat, command via subprocess/os.system, code via eval/exec
-2. SECRETS: hardcoded API keys, passwords, tokens in source code
-3. PATH TRAVERSAL: user input used in file paths without sanitization
-4. DESERIALIZATION: pickle.loads, yaml.load without SafeLoader
-5. AUTH: weak session handling, credential exposure, missing access controls
-For each finding: file path, line number, code snippet, severity (critical/high/medium/low)
-```
+```python
+# OLD: Write Python code (error-prone)
+matches = []
+for line in prompt.split('\n'):
+    if re.search(r'api_key', line):
+        matches.append(line)
 
-**Architecture Review:**
-```
-Analyze the codebase architecture:
-1. List all modules/packages and their single-line purpose
-2. Identify entry points (main functions, API endpoints, CLI commands)
-3. Map dependencies between modules (who imports whom)
-4. Identify external dependencies and what they're used for
-5. Note any circular dependencies or architectural concerns
+# NEW: Call structured tool (reliable)
+result = find_secrets()
+FINAL_ANSWER = result.to_markdown()
 ```
 
-**Code Quality:**
-```
-Find code quality issues:
-1. Functions over 50 lines (list them with line counts)
-2. Deeply nested code (3+ levels of indentation)
-3. Duplicate code patterns (similar logic in multiple places)
-4. Missing type hints on public functions
-5. TODO/FIXME/HACK comments (list with context)
-```
+### Tool Output Format
 
-## Verification Workflow (REQUIRED)
-
-**Every RLM finding must be verified.** RLM surfaces candidates; you confirm them.
-
-### Standard Verification Steps
-
-```
-1. RLM_ANALYZE → Get list of potential issues with file:line references
-2. GREP → Search for the specific pattern RLM flagged
-3. READ → Examine the actual code in context
-4. CONFIRM/REJECT → Mark as real issue or false positive
+All tools return `ToolResult`:
+```python
+result.findings      # List[Finding] - structured findings
+result.count         # int - total findings
+result.high_confidence  # List[Finding] - only HIGH confidence
+result.to_markdown() # str - formatted for FINAL_ANSWER
 ```
 
-### Example Workflow
-
-```bash
-# Step 1: RLM finds potential SQL injection
-rlm_analyze("Find SQL injection: string concatenation in queries", ["./src"])
-# Result: "Potential SQLi in src/db/users.py:45 - query built with f-string"
-
-# Step 2: Verify with Grep
-Grep("f\"SELECT.*{", path="./src/db")
-# Result: Confirms pattern exists in users.py:45
-
-# Step 3: Read the actual code
-Read("./src/db/users.py", offset=40, limit=15)
-# Result: See full context - is it actually user input? Parameterized elsewhere?
-
-# Step 4: Verdict
-# Real issue: Report with evidence
-# False positive: Note why (e.g., "input is sanitized at line 38")
+Each `Finding` contains:
+```python
+finding.file        # str - file path
+finding.line        # int - line number
+finding.code        # str - code snippet
+finding.issue       # str - issue description
+finding.confidence  # HIGH/MEDIUM/LOW
+finding.severity    # CRITICAL/HIGH/MEDIUM/LOW/INFO
+finding.fix         # str - suggested fix
 ```
 
-### Verification Priority
+---
 
-| RLM Confidence | Verification Effort |
-|----------------|---------------------|
-| "Definitely found X at file:line" | Quick Grep to confirm |
-| "Possibly X in file" | Grep + Read full function |
-| "May have X patterns" | Read + trace data flow |
-| "No findings" | Run narrower queries, don't trust "clean bill" |
+## Recent Changes
 
-### Common False Positives
+### 2025-01-18: Structured Tools System (v2 - Improved)
 
-RLM often flags these incorrectly:
-- **Already-implemented features** marked as "missing"
-- **Test code** flagged as "vulnerable" (intentional test cases)
-- **Commented-out code** reported as active
-- **Type-safe patterns** misidentified as injection risks
+**Added** `structured_tools.py`:
+- Preconfigured search tools that agents call directly instead of writing raw Python
+- Each tool returns `ToolResult` with structured `Finding` objects
+- Includes confidence levels, severity, and fix suggestions
 
-## Available Tools
+**Security Tools** (with false positive filtering):
+- `find_secrets()` - API keys, passwords, tokens (skips .md, test files = LOW confidence)
+- `find_sql_injection()` - SQL injection patterns (code files only)
+- `find_command_injection()` - os.system, subprocess issues
+- `find_xss()` - innerHTML, document.write XSS
+- `find_python_security()` - pickle, yaml.load, bare except
 
-### `rlm_analyze`
-```json
-{
-  "query": "What to find/analyze",
-  "paths": ["./src", "./lib"]
-}
-```
+**iOS/Swift Tools** (expanded):
+- `find_force_unwraps()` - ! unwraps (filters safe patterns: NSRegularExpression, static let)
+- `find_retain_cycles()` - Missing [weak self] on delegates
+- `find_main_thread_violations()` - UI off main thread
+- `find_weak_self_issues()` - **NEW**: NotificationCenter, Timer, Combine sinks without [weak self]
+- `find_cloudkit_issues()` - **NEW**: CKError handling, missing completion handlers
+- `find_deprecated_apis()` - **NEW**: UIWebView, keyWindow, foregroundColor, etc.
+- `find_swiftdata_issues()` - **NEW**: ModelContext threading, @MainActor issues
 
-### `rlm_query_text`
-```json
-{
-  "query": "What to extract",
-  "text": "<large text content>"
-}
-```
+**Quality Tools**:
+- `find_long_functions(max_lines)` - Functions over N lines
+- `find_todos()` - TODO/FIXME/HACK comments
 
-### `rlm_status`
-Check server health and cache statistics.
+**Architecture Tools**:
+- `map_architecture()` - Categorize files
+- `find_imports(module)` - Find module imports
 
-### `rlm_memory_store` / `rlm_memory_recall`
-Store and retrieve important findings for cross-conversation persistence.
+**Batch Scans**:
+- `run_security_scan()` - All security tools
+- `run_ios_scan()` - All 7 iOS tools (expanded)
+- `run_quality_scan()` - All quality tools
+
+**Improvements based on feedback**:
+1. Non-code files (markdown, docs) filtered from security scans
+2. Test files get LOW confidence automatically
+3. Safe Swift patterns filtered (try! NSRegularExpression, static let)
+4. Added missing iOS checks: CloudKit, deprecated APIs, SwiftData, weak self
+
+### 2025-01-18: Query Enhancement System
+
+**Changed**:
+- `rlm_processor.py`: Added 10 query types with auto-detection
+- `rlm_processor.py`: Added `enhance_query()` for automatic enhancement
+- `server.py`: Enhanced tool descriptions with query patterns
+
+**Why**: Vague queries produced poor results. Now auto-detected and enhanced.
+
+### 2025-01 (Earlier): Core RLM Implementation
+
+- Implemented TRUE RLM from arXiv:2512.24601
+- Content stored as `prompt` variable, not in LLM context
+- Sub-LLM responses preserved in full (not summarized)
+- Added confidence levels (HIGH/MEDIUM/LOW) to findings
+- Added dead code detection (#if false, #if DEBUG blocks)
+- Added line verification before reporting findings
+
+---
+
+## Known Issues
+
+### Authentication (401 Errors)
+- **Symptom**: `AuthenticationError: 401 - User not found`
+- **Cause**: OpenRouter API key invalid/expired
+- **Fix**: Update `OPENROUTER_API_KEY` in `~/.mcp.json`
+
+### Circuit Breaker Trips
+- **Symptom**: `Circuit breaker is open - too many recent failures`
+- **Cause**: 5+ consecutive API failures
+- **Fix**: Wait 60s for auto-reset, or restart server
+
+### REPL Execution Failures
+- **Symptom**: `NameError: 'findings' not defined`
+- **Cause**: LLM generates code without initializing variables
+- **Mitigation**: Pre-initialized variables in sandbox (findings, results, output, issues, files)
+- **Fallback**: `fallback_analyzer.py` provides pattern-based analysis
+
+---
+
+## Agent Notes
+
+### Query Quality Matters Most
+The entire system's effectiveness depends on query specificity. The query is used to generate Python code that searches the content. Vague query → vague code → poor results.
+
+### Confidence Levels
+- **HIGH**: Line verified, code in active block, function has implementation
+- **MEDIUM**: Context unclear, cannot verify reachability
+- **LOW**: Dead code (#if false), unverified line, signature-only
+
+### Verification Still Required
+~40-60% of RLM findings need Grep/Read verification:
+- Test code flagged as vulnerable
+- Commented-out code reported as active
+- Type-safe patterns misidentified
+
+### Model Selection
+Using `google/gemini-2.5-flash-lite` via OpenRouter:
+- Fast (~1-3s per chunk)
+- Cost-effective (~$0.15/1M input tokens)
+- Good at generating Python code for search
+
+---
 
 ## Development Commands
 
 ```bash
-# Install dependencies
+# Install
 cd python && pip install -e .
 
-# Run the server manually
+# Run server
 python -m rlm_mem_mcp.server
 
-# Run tests
+# Test
 pytest
+
+# Check status via Claude Code
+# Use: rlm_status tool
 ```
 
-## File Structure
+---
 
-- `python/src/rlm_mem_mcp/` - Main Python MCP server
-- `src/` - Optional TypeScript implementation
-- `.mcp.json` - MCP configuration for this project
+## Environment Variables
 
-## Key Files
+| Variable | Required | Default | Purpose |
+|----------|----------|---------|---------|
+| `OPENROUTER_API_KEY` | Yes | - | API authentication |
+| `RLM_MODEL` | No | `google/gemini-2.5-flash-lite` | Processing model |
+| `RLM_AGGREGATOR_MODEL` | No | `google/gemini-2.5-flash-lite` | Aggregation model |
+| `RLM_MAX_CHUNK_TOKENS` | No | `8000` | Max tokens per chunk |
+| `RLM_MAX_RESULT_TOKENS` | No | `4000` | Max tokens in result |
 
-- `python/src/rlm_mem_mcp/server.py` - MCP server entry point
-- `python/src/rlm_mem_mcp/rlm_processor.py` - RLM algorithm implementation
-- `python/src/rlm_mem_mcp/cache_manager.py` - Prompt caching logic
-- `python/src/rlm_mem_mcp/file_collector.py` - File collection utilities
+---
+
+## Performance Notes
+
+- **File Collection**: Async with parallel I/O
+- **Chunk Processing**: Parallel relevance assessment
+- **Caching**: LRU response cache (1000 entries), semantic cache for similar queries
+- **Rate Limiting**: 60 req/min, 100k tokens/min
+- **Circuit Breaker**: Opens after 5 failures, resets after 60s
+
+---
+
+*Last updated: 2025-01-18*

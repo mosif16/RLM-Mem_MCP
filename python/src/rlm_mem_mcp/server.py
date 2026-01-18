@@ -49,6 +49,7 @@ from .cache_manager import CacheManager
 from .utils import get_memory_monitor, get_metrics_collector
 from .result_verifier import ResultVerifier, BatchVerifier
 from .project_analyzer import ProjectAnalyzer
+from .structured_tools import StructuredTools, ToolResult
 
 
 # Input validation constants
@@ -159,8 +160,8 @@ def create_server() -> Server:
                 description=(
                     "Analyze files/directories using TRUE RLM technique (arXiv:2512.24601). "
                     "Content stored as variable, LLM writes code to examine portions. "
-                    "Sub-LLM responses stored in full (NOT summarized). "
-                    "Use for: large codebases (50+ files), security audits, architecture reviews."
+                    "Use for: large codebases (50+ files), security audits, architecture reviews. "
+                    "Query types auto-detected: security, ios, python, javascript, api, database, quality, architecture, testing."
                 ),
                 inputSchema={
                     "type": "object",
@@ -168,18 +169,23 @@ def create_server() -> Server:
                         "query": {
                             "type": "string",
                             "description": (
-                                "CRITICAL: Be exhaustively specific. Your query drives the code written to search. "
-                                "BAD: 'find security issues' "
-                                "GOOD: 'Find security vulnerabilities: (1) INJECTION - SQL via string concat, "
-                                "command via subprocess/os.system, code via eval/exec (2) SECRETS - hardcoded API keys, "
-                                "passwords, tokens (3) PATH TRAVERSAL - user input in file paths (4) DESERIALIZATION - "
-                                "pickle.loads, unsafe yaml.load. For each: file, line, code snippet, severity.'"
+                                "CRITICAL: Be specific about WHAT to find and HOW to report it. "
+                                "Your query drives the Python code generated to search.\n\n"
+                                "QUERY PATTERNS BY TYPE:\n"
+                                "• SECURITY: 'Find (1) SQL injection via string concat (2) hardcoded secrets matching sk-, api_key, password (3) eval/exec with user input. Report: file:line, code, severity.'\n"
+                                "• iOS/SWIFT: 'Find (1) force unwraps (!) excluding != (2) closures missing [weak self] (3) @ObservedObject with default value. Report: file:line, code, fix.'\n"
+                                "• PYTHON: 'Find (1) pickle.loads with untrusted data (2) bare except clauses (3) mutable default args. Report: file:line, code.'\n"
+                                "• JAVASCRIPT: 'Find (1) innerHTML XSS (2) missing await (3) useEffect missing deps. Report: file:line, code.'\n"
+                                "• API: 'Find (1) endpoints missing auth (2) SQL injection in params (3) missing rate limiting. Report: file:line, code.'\n"
+                                "• ARCHITECTURE: 'Map all modules with purpose, entry points, dependencies, data flow.'\n\n"
+                                "BAD: 'find problems' or 'check security' (too vague)\n"
+                                "GOOD: Numbered list of specific patterns + output format"
                             ),
                         },
                         "paths": {
                             "type": "array",
                             "items": {"type": "string"},
-                            "description": "File or directory paths to analyze",
+                            "description": "File or directory paths to analyze. Use ['.'] for current directory.",
                         },
                     },
                     "required": ["query", "paths"],
@@ -190,7 +196,7 @@ def create_server() -> Server:
                 description=(
                     "Process large text using TRUE RLM technique. "
                     "Text stored as `prompt` variable, LLM writes code to examine it. "
-                    "Use for: logs, transcripts, documents, any large text input."
+                    "Use for: logs, transcripts, documents, configs, any large text input."
                 ),
                 inputSchema={
                     "type": "object",
@@ -198,11 +204,14 @@ def create_server() -> Server:
                         "query": {
                             "type": "string",
                             "description": (
-                                "CRITICAL: Be exhaustively specific. Your query drives the code written to search. "
-                                "BAD: 'summarize this' "
-                                "GOOD: 'Extract from these logs: (1) all ERROR and WARN entries with timestamps "
-                                "(2) stack traces with root cause (3) frequency of each error type (4) time periods "
-                                "with highest error rates. Format as: timestamp | level | message | count'"
+                                "CRITICAL: Be specific about WHAT to extract and HOW to format output.\n\n"
+                                "QUERY PATTERNS BY TEXT TYPE:\n"
+                                "• LOGS: 'Extract (1) ERROR/WARN entries with timestamps (2) stack traces with root cause (3) error frequency by type. Format: timestamp | level | message | count'\n"
+                                "• CONFIG: 'Extract (1) all environment variables (2) connection strings (3) feature flags. Format: key = value with file location'\n"
+                                "• TRANSCRIPT: 'Extract (1) key decisions made (2) action items with owners (3) unresolved questions. Format: bullet points with timestamps'\n"
+                                "• JSON/DATA: 'Extract (1) all unique field names (2) data types per field (3) nested structure depth. Format: field: type (count)'\n\n"
+                                "BAD: 'summarize this' (too vague)\n"
+                                "GOOD: Numbered extraction criteria + output format"
                             ),
                         },
                         "text": {
@@ -300,6 +309,265 @@ def create_server() -> Server:
     return server
 
 
+# Tool routing prompt for LLM-based auto-routing
+TOOL_ROUTER_PROMPT = """You are a code analysis tool router. Given a user query, decide which tools to run.
+
+AVAILABLE TOOLS:
+- ios_scan: Full iOS audit (force unwraps, weak self, retain cycles, main thread, CloudKit, deprecated APIs, SwiftData, insecure storage, input sanitization, jailbreak detection)
+- security_scan: Security vulnerabilities (secrets, SQL injection, command injection, XSS, Python security, insecure storage, input sanitization)
+- quality_scan: Code quality (long functions, TODOs/FIXMEs)
+
+Individual tools (for targeted searches):
+- find_secrets: Hardcoded secrets/API keys
+- find_force_unwraps: Swift force unwraps (!)
+- find_weak_self_issues: Missing [weak self] in closures
+- find_sql_injection: SQL injection vulnerabilities
+- find_insecure_storage: Sensitive data in UserDefaults instead of Keychain
+- find_input_sanitization_issues: User input not sanitized
+- find_deprecated_apis: Deprecated API usage (params: min_severity=LOW|MEDIUM|HIGH)
+- find_missing_jailbreak_detection: Check for jailbreak detection (finance apps)
+- map_architecture: Map codebase structure and dependencies
+
+RULES:
+1. For broad audits, prefer scan tools (ios_scan, security_scan) over individual tools
+2. For specific issues, use targeted tools
+3. Can run multiple tools if query spans categories
+4. Return empty array if query doesn't match any tools (e.g., "explain this code")
+
+Respond with ONLY a JSON object:
+{"tools": ["tool_name", ...], "params": {"tool_name": {"param": "value"}}}
+
+Examples:
+Query: "audit this iOS app for issues"
+{"tools": ["ios_scan", "security_scan"], "params": {}}
+
+Query: "find memory leaks in Swift code"
+{"tools": ["find_weak_self_issues", "find_force_unwraps"], "params": {}}
+
+Query: "check for hardcoded API keys"
+{"tools": ["find_secrets"], "params": {}}
+
+Query: "is sensitive data stored securely"
+{"tools": ["find_insecure_storage", "find_secrets"], "params": {}}
+
+Query: "find deprecated APIs, only high severity"
+{"tools": ["find_deprecated_apis"], "params": {"find_deprecated_apis": {"min_severity": "HIGH"}}}
+
+Query: "explain how this function works"
+{"tools": [], "params": {}}
+"""
+
+
+async def _llm_route_tools(query: str, config: "RLMConfig") -> dict[str, Any]:
+    """
+    Use LLM to intelligently decide which tools to run.
+
+    This is Layer 1 of the double-layer system:
+    - Layer 1: LLM decides WHAT to run (intelligent routing)
+    - Layer 2: Structured tools execute deterministically (reliable execution)
+
+    Returns:
+        {"tools": ["tool_name", ...], "params": {"tool_name": {"param": "value"}}}
+    """
+    import httpx
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                f"{config.api_base_url}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {config.api_key}",
+                    "HTTP-Referer": "https://github.com/mosif16/RLM-Mem_MCP",
+                    "X-Title": "RLM-Mem MCP Server"
+                },
+                json={
+                    "model": config.model,  # Use fast model for routing
+                    "messages": [
+                        {"role": "system", "content": TOOL_ROUTER_PROMPT},
+                        {"role": "user", "content": f"Query: {query}"}
+                    ],
+                    "max_tokens": 200,
+                    "temperature": 0  # Deterministic routing
+                }
+            )
+            response.raise_for_status()
+            result = response.json()
+            content = result["choices"][0]["message"]["content"]
+
+            # Parse JSON from response
+            import json as json_mod
+            # Handle markdown code blocks
+            if "```json" in content:
+                content = content.split("```json")[1].split("```")[0]
+            elif "```" in content:
+                content = content.split("```")[1].split("```")[0]
+
+            content = content.strip()
+
+            # Handle empty or non-JSON responses
+            if not content or content.lower() in ["none", "null", "n/a"]:
+                return {"tools": [], "params": {}}
+
+            result = json_mod.loads(content)
+
+            # Validate structure
+            if not isinstance(result, dict):
+                return {"tools": [], "params": {}}
+            if "tools" not in result:
+                result["tools"] = []
+            if "params" not in result:
+                result["params"] = {}
+
+            return result
+
+    except Exception as e:
+        # Fall back to empty (will use keyword matching)
+        print(f"[RLM Router] LLM routing failed: {e}, falling back to keywords", file=sys.stderr)
+        return {"tools": [], "params": {}}
+
+
+def _execute_routed_tools(
+    tools_to_run: list[str],
+    params: dict[str, dict],
+    content: str
+) -> tuple[str, list[ToolResult]]:
+    """
+    Execute the tools selected by the LLM router.
+
+    This is Layer 2 of the double-layer system:
+    - Deterministic execution of structured tools
+    - No LLM involved in actual scanning
+    """
+    tools = StructuredTools(content)
+    all_results: list[ToolResult] = []
+
+    for tool_name in tools_to_run:
+        tool_params = params.get(tool_name, {})
+
+        try:
+            if tool_name == "ios_scan":
+                all_results.extend(tools.run_ios_scan())
+            elif tool_name == "security_scan":
+                all_results.extend(tools.run_security_scan())
+            elif tool_name == "quality_scan":
+                all_results.extend(tools.run_quality_scan())
+            elif tool_name == "find_secrets":
+                all_results.append(tools.find_secrets())
+            elif tool_name == "find_force_unwraps":
+                all_results.append(tools.find_force_unwraps())
+            elif tool_name == "find_weak_self_issues":
+                all_results.append(tools.find_weak_self_issues())
+            elif tool_name == "find_sql_injection":
+                all_results.append(tools.find_sql_injection())
+            elif tool_name == "find_deprecated_apis":
+                min_sev = tool_params.get("min_severity", "LOW")
+                all_results.append(tools.find_deprecated_apis(min_severity=min_sev))
+            elif tool_name == "map_architecture":
+                all_results.append(tools.map_architecture())
+            elif tool_name == "find_retain_cycles":
+                all_results.append(tools.find_retain_cycles())
+            elif tool_name == "find_main_thread_violations":
+                all_results.append(tools.find_main_thread_violations())
+            elif tool_name == "find_cloudkit_issues":
+                all_results.append(tools.find_cloudkit_issues())
+            elif tool_name == "find_swiftdata_issues":
+                all_results.append(tools.find_swiftdata_issues())
+            elif tool_name == "find_command_injection":
+                all_results.append(tools.find_command_injection())
+            elif tool_name == "find_xss_vulnerabilities":
+                all_results.append(tools.find_xss_vulnerabilities())
+            elif tool_name == "find_python_security":
+                all_results.append(tools.find_python_security())
+            elif tool_name == "find_long_functions":
+                all_results.append(tools.find_long_functions())
+            elif tool_name == "find_todos":
+                all_results.append(tools.find_todos())
+            elif tool_name == "find_insecure_storage":
+                all_results.append(tools.find_insecure_storage())
+            elif tool_name == "find_input_sanitization_issues":
+                all_results.append(tools.find_input_sanitization_issues())
+            elif tool_name == "find_missing_jailbreak_detection":
+                all_results.append(tools.find_missing_jailbreak_detection())
+        except Exception as e:
+            print(f"[RLM Router] Tool {tool_name} failed: {e}", file=sys.stderr)
+
+    return _format_tool_results(all_results, tools_to_run)
+
+
+def _format_tool_results(
+    all_results: list[ToolResult],
+    tools_run: list[str]
+) -> tuple[str, list[ToolResult]]:
+    """Format tool results into markdown output."""
+    if not all_results:
+        return "", []
+
+    # Format results
+    output_parts = [f"## Structured Tool Results (LLM-Routed: {', '.join(tools_run)})\n"]
+    total_findings = 0
+    high_confidence_findings = 0
+
+    for result in all_results:
+        if result.findings:
+            output_parts.append(result.to_markdown())
+            output_parts.append("\n---\n")
+            total_findings += result.count
+            high_confidence_findings += len(result.high_confidence)
+
+    if total_findings == 0:
+        return f"## Structured Tool Results\n\n**Tools Run**: {', '.join(tools_run)}\n**Findings**: None\n", all_results
+
+    # Add summary at top
+    summary = f"**Summary**: {total_findings} findings ({high_confidence_findings} high confidence) from {len(tools_run)} tools\n\n"
+    output_parts.insert(1, summary)
+
+    return "\n".join(output_parts), all_results
+
+
+def _run_structured_tools_for_query_type(
+    query_type: str,
+    content: str,
+    query_lower: str
+) -> tuple[str, list[ToolResult]]:
+    """
+    Fallback: Auto-route to structured tools based on detected query type.
+    Used when LLM routing fails or returns empty.
+
+    Returns:
+        (formatted_output, list_of_results)
+    """
+    tools = StructuredTools(content)
+    all_results: list[ToolResult] = []
+    tools_run: list[str] = []
+
+    # Determine which scans to run based on query type
+    if query_type == "ios":
+        all_results = tools.run_ios_scan()
+        tools_run = ["ios_scan"]
+    elif query_type == "security":
+        all_results = tools.run_security_scan()
+        tools_run = ["security_scan"]
+    elif query_type == "quality":
+        all_results = tools.run_quality_scan()
+        tools_run = ["quality_scan"]
+    else:
+        # For mixed/general queries, check keywords and run matching scans
+        if any(kw in query_lower for kw in ["swift", "ios", "unwrap", "swiftui", "xcode"]):
+            all_results.extend(tools.run_ios_scan())
+            tools_run.append("ios_scan")
+        if any(kw in query_lower for kw in ["security", "secret", "inject", "vulnerab", "xss"]):
+            all_results.extend(tools.run_security_scan())
+            tools_run.append("security_scan")
+        if any(kw in query_lower for kw in ["quality", "long function", "todo", "fixme"]):
+            all_results.extend(tools.run_quality_scan())
+            tools_run.append("quality_scan")
+
+    if not all_results:
+        return "", []
+
+    return _format_tool_results(all_results, tools_run)
+
+
 async def handle_rlm_analyze(arguments: dict[str, Any]) -> list[TextContent]:
     """Handle rlm_analyze tool call with semantic caching and result verification."""
     start_time = time.time()
@@ -366,12 +634,54 @@ async def handle_rlm_analyze(arguments: dict[str, Any]) -> list[TextContent]:
     query_analysis = rlm_processor.analyze_query_quality(query)
     _log_timing("query_analysis", start_time, is_broad=query_analysis["is_broad"], query_type=query_analysis["query_type"])
 
+    # ===== DOUBLE-LAYER AUTO-ROUTING =====
+    # Layer 1: LLM decides which tools to run (intelligent routing)
+    # Layer 2: Structured tools execute deterministically (reliable execution)
+    content = collection.get_combined_content(include_headers=True)
+
+    # Try LLM-based routing first
+    routing_decision = await _llm_route_tools(query, rlm_config)
+    tools_to_run = routing_decision.get("tools", [])
+    tool_params = routing_decision.get("params", {})
+
+    if tools_to_run:
+        # LLM routing succeeded - execute selected tools
+        _log_timing("llm_routing", start_time, tools=tools_to_run)
+        structured_output, structured_results = _execute_routed_tools(
+            tools_to_run, tool_params, content
+        )
+    else:
+        # Fall back to keyword-based routing
+        _log_timing("keyword_routing", start_time, query_type=query_analysis["query_type"])
+        structured_output, structured_results = _run_structured_tools_for_query_type(
+            query_analysis["query_type"],
+            content,
+            query.lower()
+        )
+
+    _log_timing("structured_tools", start_time,
+                tools_run=len(structured_results),
+                findings=sum(r.count for r in structured_results))
+
+    # If structured tools found significant results, return them directly
+    # without additional LLM processing (faster, more reliable)
+    total_findings = sum(r.count for r in structured_results)
+    high_conf_findings = sum(len(r.high_confidence) for r in structured_results)
+
+    if total_findings > 0:
+        # Add file scan stats
+        structured_output += f"\n\n*Scanned {collection.file_count} files in {int((time.time() - start_time) * 1000)}ms*"
+
+        # For comprehensive results, skip LLM processing entirely
+        if high_conf_findings >= 3 or total_findings >= 10:
+            return [TextContent(type="text", text=structured_output)]
+
     # Progress callback that logs to stderr for visibility
     def progress_log(msg: str) -> None:
         import sys
         print(f"[RLM Progress] {msg}", file=sys.stderr)
 
-    # Process with RLM (auto-decompose if broad)
+    # Process with RLM (auto-decompose if broad) - for additional context or if no structured tools matched
     _log_timing("rlm_process:start", start_time)
     result = await rlm_processor.process_with_decomposition(query, collection, progress_callback=progress_log)
     _log_timing("rlm_process:complete", start_time, chunks=len(result.chunk_results))
@@ -393,7 +703,13 @@ async def handle_rlm_analyze(arguments: dict[str, Any]) -> list[TextContent]:
         project_context = f"\n\n## Project Context\n- Type: {project_info.project_type}\n- Key files from docs: {', '.join(project_info.key_files[:10])}"
         verified_output += project_context
 
-    return [TextContent(type="text", text=verified_output)]
+    # Combine structured tool output with LLM output
+    if structured_output:
+        final_output = structured_output + "\n\n---\n\n## Additional LLM Analysis\n\n" + verified_output
+    else:
+        final_output = verified_output
+
+    return [TextContent(type="text", text=final_output)]
 
 
 async def handle_rlm_query_text(arguments: dict[str, Any]) -> list[TextContent]:
