@@ -315,21 +315,55 @@ rate the relevance from 0.0 to 1.0. Only output a single decimal number.
     CHUNK_ANALYSIS_PROMPT = """You are a precise information extractor analyzing code and text.
 Your task is to find information relevant to the given query.
 
+CRITICAL OUTPUT REQUIREMENTS:
+1. ALWAYS include file:line format (e.g., `src/utils.py:42`)
+2. ALWAYS include the actual code snippet showing the issue
+3. Format each finding as:
+   ```
+   **File:** path/to/file.ext:LINE_NUMBER
+   **Issue:** Brief description
+   **Code:**
+   ```language
+   <actual code from the content>
+   ```
+   ```
+
 Guidelines:
 - Focus ONLY on the provided content
-- Be specific: cite file names, line numbers, function names
-- If content is not relevant, say so briefly
-- Be concise but thorough"""
+- Extract EXACT code snippets (copy from content, don't paraphrase)
+- Count line numbers from file headers (### File: path starts at line 1)
+- If content is not relevant, say "No relevant findings" briefly
+- Be specific and actionable - readers should find the exact location"""
 
     AGGREGATION_PROMPT = """You are an expert at synthesizing information from multiple sources.
 Your task is to combine findings into a coherent, well-organized response.
 
+CRITICAL: PRESERVE ALL SPECIFIC DETAILS
+- Keep ALL file:line references (e.g., `src/auth.py:42`)
+- Keep ALL code snippets exactly as provided
+- Keep ALL severity ratings and categories
+- Do NOT generalize specific findings into vague summaries
+
+Output Format:
+## Summary
+Brief overview of findings count and categories
+
+## Findings
+
+### [Category 1]
+**file.py:LINE** - Description
+```language
+actual code snippet
+```
+
+### [Category 2]
+...
+
 Guidelines:
-- Remove redundancy while preserving important details
-- Organize by theme or importance
-- Cite specific sources when relevant
-- Be comprehensive but concise
-- If findings conflict, note the discrepancy"""
+- Group similar findings by category/severity
+- Remove exact duplicates only (same file, same line, same issue)
+- Preserve unique findings even if similar
+- If findings conflict, note the discrepancy with both locations"""
 
     def __init__(
         self,
