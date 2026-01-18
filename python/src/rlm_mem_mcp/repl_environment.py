@@ -80,14 +80,13 @@ def attempt_syntax_repair(code: str, error: SyntaxError) -> tuple[str | None, st
         (repaired_code, repair_description) - repaired_code is None if repair failed
     """
     error_msg = str(error).lower()
+    repairs = []
 
     # Handle unterminated triple-quoted strings
     if "unterminated triple-quoted string" in error_msg or "unterminated string" in error_msg:
         # Count triple quotes to see if we're missing closers
         triple_double = code.count('"""')
         triple_single = code.count("'''")
-
-        repairs = []
 
         # If odd number of triple double quotes, add closing one
         if triple_double % 2 == 1:
@@ -102,8 +101,8 @@ def attempt_syntax_repair(code: str, error: SyntaxError) -> tuple[str | None, st
         if repairs:
             return code, "; ".join(repairs)
 
-    # Handle unterminated regular strings
-    if "eol while scanning string literal" in error_msg:
+    # Handle unterminated regular strings (EOL while scanning)
+    if "eol while scanning string literal" in error_msg or "unterminated string literal" in error_msg:
         lines = code.split('\n')
         if error.lineno and error.lineno <= len(lines):
             line = lines[error.lineno - 1]
@@ -115,7 +114,64 @@ def attempt_syntax_repair(code: str, error: SyntaxError) -> tuple[str | None, st
                 lines[error.lineno - 1] = line + "'"
                 return '\n'.join(lines), f"Added missing ' at line {error.lineno}"
 
+    # Handle f-string with unmatched braces
+    if "f-string" in error_msg:
+        # Try to balance braces in f-strings
+        if code.count('{') > code.count('}'):
+            code = code + '}'
+            repairs.append('Added missing } for f-string')
+        elif code.count('}') > code.count('{'):
+            code = '{' + code
+            repairs.append('Added missing { for f-string')
+        if repairs:
+            return code, "; ".join(repairs)
+
+    # Handle missing colons at end of control structures
+    if "expected ':'" in error_msg or "expected ':':" in error_msg:
+        lines = code.split('\n')
+        if error.lineno and error.lineno <= len(lines):
+            line = lines[error.lineno - 1].rstrip()
+            # Check if it's a control structure missing colon
+            control_keywords = ['if ', 'elif ', 'else', 'for ', 'while ', 'def ', 'class ', 'try', 'except', 'finally', 'with ']
+            for kw in control_keywords:
+                if line.lstrip().startswith(kw) and not line.endswith(':'):
+                    lines[error.lineno - 1] = line + ':'
+                    return '\n'.join(lines), f'Added missing : at line {error.lineno}'
+
+    # Handle incomplete code blocks (truncated by LLM)
+    # If the error is near the end and we have unclosed structures
+    if error.lineno and error.lineno >= len(code.split('\n')) - 2:
+        # Check for unclosed parentheses/brackets
+        open_parens = code.count('(') - code.count(')')
+        open_brackets = code.count('[') - code.count(']')
+        open_braces = code.count('{') - code.count('}')
+
+        if open_parens > 0:
+            code = code + ')' * open_parens
+            repairs.append(f'Added {open_parens} missing )')
+        if open_brackets > 0:
+            code = code + ']' * open_brackets
+            repairs.append(f'Added {open_brackets} missing ]')
+        if open_braces > 0:
+            code = code + '}' * open_braces
+            repairs.append(f'Added {open_braces} missing }}')
+
+        if repairs:
+            return code, "; ".join(repairs)
+
     return None, "Could not auto-repair"
+
+
+# Modules that are pre-loaded in the REPL environment (safe to "import")
+PRELOADED_MODULES = frozenset({'re'})
+
+# Available built-in functions in the sandbox (for documentation)
+AVAILABLE_BUILTINS = [
+    "len", "str", "int", "float", "bool", "list", "dict", "tuple", "set",
+    "range", "enumerate", "zip", "map", "filter", "sorted", "reversed",
+    "min", "max", "sum", "any", "all", "abs", "round", "print",
+    "isinstance", "ord", "chr", "repr", "frozenset"
+]
 
 
 class CodeValidator(ast.NodeVisitor):
@@ -125,13 +181,16 @@ class CodeValidator(ast.NodeVisitor):
     Blocks:
     - Access to dunder attributes (__class__, __globals__, etc.)
     - Dangerous function calls (eval, exec, open, etc.)
-    - Import statements
+    - Import statements (except pre-loaded modules like 're')
     - Attribute chains that could escape sandbox
+
+    Pre-loaded modules: re
     """
 
     def __init__(self):
         self.errors: list[str] = []
         self.syntax_error: SyntaxError | None = None
+        self.import_hints: list[str] = []  # Helpful hints for import errors
 
     def visit_Attribute(self, node: ast.Attribute) -> None:
         """Check for forbidden attribute access."""
@@ -161,22 +220,43 @@ class CodeValidator(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_Import(self, node: ast.Import) -> None:
-        """Block import statements."""
-        names = ', '.join(alias.name for alias in node.names)
-        self.errors.append(f"Import statements not allowed: 'import {names}'")
+        """Block import statements (except pre-loaded modules)."""
+        for alias in node.names:
+            if alias.name in PRELOADED_MODULES:
+                # This module is pre-loaded - add helpful hint instead of error
+                self.import_hints.append(
+                    f"Note: '{alias.name}' is already available (no import needed). "
+                    f"Just use it directly: {alias.name}.findall(...)"
+                )
+            else:
+                self.errors.append(
+                    f"Import not allowed: 'import {alias.name}'. "
+                    f"Pre-loaded modules: {', '.join(sorted(PRELOADED_MODULES))}. "
+                    f"Available builtins: {', '.join(AVAILABLE_BUILTINS[:10])}..."
+                )
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
-        """Block from...import statements."""
-        self.errors.append(f"Import statements not allowed: 'from {node.module} import ...'")
+        """Block from...import statements (except pre-loaded modules)."""
+        if node.module in PRELOADED_MODULES:
+            self.import_hints.append(
+                f"Note: '{node.module}' is already available (no import needed). "
+                f"Just use it directly: {node.module}.findall(...)"
+            )
+        else:
+            self.errors.append(
+                f"Import not allowed: 'from {node.module} import ...'. "
+                f"Pre-loaded modules: {', '.join(sorted(PRELOADED_MODULES))}."
+            )
 
-    def validate(self, code: str) -> tuple[bool, list[str]]:
+    def validate(self, code: str) -> tuple[bool, list[str], list[str]]:
         """
         Validate code for safety.
 
         Returns:
-            (is_safe, errors) tuple
+            (is_safe, errors, hints) tuple
         """
         self.errors = []
+        self.import_hints = []
         self.syntax_error = None
 
         try:
@@ -186,10 +266,10 @@ class CodeValidator(ast.NodeVisitor):
             self.syntax_error = e
             self.errors.append(f"Syntax error: {e}")
 
-        return len(self.errors) == 0, self.errors
+        return len(self.errors) == 0, self.errors, self.import_hints
 
 
-def validate_code(code: str) -> tuple[bool, list[str], SyntaxError | None]:
+def validate_code(code: str) -> tuple[bool, list[str], SyntaxError | None, list[str]]:
     """
     Validate Python code for sandbox safety.
 
@@ -197,11 +277,15 @@ def validate_code(code: str) -> tuple[bool, list[str], SyntaxError | None]:
         code: Python source code to validate
 
     Returns:
-        (is_safe, errors, syntax_error) tuple - syntax_error is set if a SyntaxError occurred
+        (is_safe, errors, syntax_error, hints) tuple
+        - is_safe: True if code passed validation
+        - errors: List of error messages
+        - syntax_error: SyntaxError if one occurred (for repair attempts)
+        - hints: Helpful hints (e.g., "re is already available")
     """
     validator = CodeValidator()
-    is_safe, errors = validator.validate(code)
-    return is_safe, errors, validator.syntax_error
+    is_safe, errors, hints = validator.validate(code)
+    return is_safe, errors, validator.syntax_error, hints
 
 
 @dataclass
@@ -256,28 +340,52 @@ The `prompt` variable contains ACTUAL source code files. You must:
 - NEVER generate example/simulated/hypothetical findings
 - ALWAYS assign a CONFIDENCE LEVEL to each finding
 
-## Environment
+## Sandbox Environment - IMPORTANT
 
-1. `prompt` - Contains {char_count:,} chars of REAL source code (files concatenated)
-   Format: "### File: path/to/file.ext\\n<actual code>\\n### File: ..."
+**Pre-loaded (no import needed):**
+- `re` - Regular expressions (just use `re.findall(...)` directly)
+- `prompt` - The full source code content
 
-2. `llm_query(text)` - Query a sub-LLM. Pass ACTUAL code snippets from prompt.
+**Available builtins:**
+len, str, int, float, bool, list, dict, tuple, set, range, enumerate, zip,
+map, filter, sorted, reversed, min, max, sum, any, all, abs, round, print,
+isinstance, ord, chr, repr, frozenset
+
+**NOT available (will error):**
+- `import` statements (except `import re` which is auto-handled)
+- `open()`, `eval()`, `exec()`, `__import__()`
+- File I/O operations
+- Network operations
+
+**Variable scope:**
+- Variables persist across code blocks (e.g., `files` defined in one block is available in the next)
+- ALWAYS define variables before using them in the SAME code block
+- If you get NameError, check spelling and ensure the variable was defined in a previous successful execution
+
+**Helper functions provided:**
+
+1. `llm_query(text)` - Query a sub-LLM. Pass ACTUAL code snippets from prompt.
    The sub-LLM will analyze ONLY what you send it.
 
-3. `extract_with_lines(filepath)` - Extract file content WITH line numbers.
+2. `extract_with_lines(filepath)` - Extract file content WITH line numbers.
    Returns formatted string: "1: first line\\n2: second line\\n..."
 
-4. `verify_line(filepath, line_num, expected_pattern)` - VERIFY a line exists and contains expected content.
+3. `verify_line(filepath, line_num, expected_pattern)` - VERIFY a line exists and contains expected content.
    Returns: dict with 'is_valid', 'actual_content', 'in_dead_code', 'confidence', 'reason'
    USE THIS before reporting any finding to avoid false positives!
 
-5. `check_dead_code(filepath)` - Check if file has dead code regions (#if false, #if DEBUG, etc.)
+4. `check_dead_code(filepath)` - Check if file has dead code regions (#if false, #if DEBUG, etc.)
    Returns: list of dead code regions with start_line, end_line, condition
 
-6. `is_implemented(filepath, function_name)` - Check if a function is actually implemented (not a stub).
+5. `is_implemented(filepath, function_name)` - Check if a function is actually implemented (not a stub).
    Returns: dict with 'is_implemented', 'has_body', 'is_stub', 'confidence', 'reason'
 
-7. `FINAL_ANSWER` - Set this to your final response with REAL findings.
+6. `FINAL_ANSWER` - Set this to your final response with REAL findings.
+
+## Content
+
+`prompt` contains {char_count:,} chars of REAL source code (files concatenated).
+Format: "### File: path/to/file.ext\\n<actual code>\\n### File: ..."
 
 ## CONFIDENCE LEVELS (REQUIRED)
 
@@ -490,9 +598,35 @@ Start by discovering files, checking for dead code regions, then use verificatio
 
     def _extract_file_list(self) -> list[str]:
         """Extract list of actual file paths from the prompt content."""
-        import re
         files = re.findall(r'### File: ([^\n]+)', self.state.prompt)
         return files
+
+    def _strip_preloaded_imports(self, code: str) -> str:
+        """
+        Remove import statements for pre-loaded modules.
+
+        This allows LLM-generated code with `import re` to work,
+        since `re` is already available in the sandbox.
+        """
+        lines = code.split('\n')
+        filtered_lines = []
+
+        for line in lines:
+            stripped = line.strip()
+            # Check for `import re` or `import re as ...`
+            skip = False
+            for module in PRELOADED_MODULES:
+                if stripped == f"import {module}" or stripped.startswith(f"import {module} as "):
+                    skip = True
+                    break
+                if stripped.startswith(f"from {module} import"):
+                    skip = True
+                    break
+
+            if not skip:
+                filtered_lines.append(line)
+
+        return '\n'.join(filtered_lines)
 
     def _create_extract_with_lines_function(self) -> Callable[[str], str]:
         """Create the extract_with_lines helper function for line-numbered extraction."""
@@ -774,7 +908,12 @@ Start by discovering files, checking for dead code regions, then use verificatio
             (output, success) tuple
         """
         # SECURITY: Validate code with AST analysis BEFORE execution
-        is_safe, validation_errors, syntax_error = validate_code(code)
+        is_safe, validation_errors, syntax_error, hints = validate_code(code)
+
+        # If we have hints (e.g., "re is already available"), include them
+        hint_output = ""
+        if hints:
+            hint_output = "\n".join(f"[HINT] {h}" for h in hints) + "\n\n"
 
         if not is_safe:
             # Attempt syntax repair if it's a syntax error
@@ -782,18 +921,42 @@ Start by discovering files, checking for dead code regions, then use verificatio
                 repaired_code, repair_desc = attempt_syntax_repair(code, syntax_error)
                 if repaired_code:
                     # Re-validate repaired code
-                    is_repaired_safe, repaired_errors, _ = validate_code(repaired_code)
+                    is_repaired_safe, repaired_errors, _, repaired_hints = validate_code(repaired_code)
                     if is_repaired_safe:
                         # Recursively execute repaired code (but don't allow further repair)
                         output, success = self.execute_code(repaired_code, allow_repair=False)
                         if success:
                             return f"[Auto-repaired: {repair_desc}]\n{output}", True
 
-            error_msg = "Code rejected for security reasons:\n" + "\n".join(f"  - {e}" for e in validation_errors)
+            # Build detailed error message with the failed code shown
+            error_msg = "Code execution failed.\n\n"
+            error_msg += "**Errors:**\n" + "\n".join(f"  - {e}" for e in validation_errors)
+
             if syntax_error:
-                error_msg += "\n\nHint: Check that all strings (especially triple-quoted ones) are properly closed."
+                error_msg += "\n\n**Syntax Error Details:**\n"
+                error_msg += f"  Line {syntax_error.lineno}: {syntax_error.msg}\n"
+                error_msg += "\n**Hint:** Check that all strings (especially triple-quoted ones) are properly closed."
+
+            # Show the failed code for debugging (truncated if long)
+            code_preview = code[:500] + "..." if len(code) > 500 else code
+            error_msg += f"\n\n**Failed code:**\n```python\n{code_preview}\n```"
+
+            # Add environment info to help LLM understand what's available
+            error_msg += "\n\n**Available in sandbox:**\n"
+            error_msg += f"  - Pre-loaded modules: {', '.join(sorted(PRELOADED_MODULES))}\n"
+            error_msg += f"  - Builtins: {', '.join(AVAILABLE_BUILTINS[:15])}...\n"
+            error_msg += "  - Special: prompt, llm_query(), extract_with_lines(), verify_line(), check_dead_code(), is_implemented()"
+
             self.state.output_history.append(error_msg)
-            return error_msg, False
+            return hint_output + error_msg, False
+
+        # If we have hints but code is valid, show hints before output
+        if hint_output:
+            # Strip the import statement that generated the hint and re-execute
+            # This allows code with `import re` to work (since re is already available)
+            code_without_imports = self._strip_preloaded_imports(code)
+            if code_without_imports != code:
+                return self.execute_code(code_without_imports, allow_repair=False)
 
         self.state.code_history.append(code)
 
@@ -821,8 +984,25 @@ Start by discovering files, checking for dead code regions, then use verificatio
             self.state.output_history.append(output)
             return output, True
 
+        except NameError as e:
+            # Provide helpful context for undefined variable errors
+            error_output = f"**NameError:** {e}\n\n"
+            error_output += "**Available variables:**\n"
+            user_vars = [k for k in self.state.variables.keys()
+                        if not k.startswith('_') and k not in ('prompt', 'FINAL_ANSWER')]
+            if user_vars:
+                error_output += f"  - {', '.join(user_vars[:20])}"
+                if len(user_vars) > 20:
+                    error_output += f" ... and {len(user_vars) - 20} more"
+            else:
+                error_output += "  (none yet - define variables before using them)"
+            error_output += "\n\n**Tip:** Make sure to define variables before using them in the same code block."
+            self.state.output_history.append(error_output)
+            return error_output, False
+
         except Exception as e:
-            error_output = f"Error: {type(e).__name__}: {e}"
+            # Generic error with code context
+            error_output = f"**{type(e).__name__}:** {e}"
             self.state.output_history.append(error_output)
             return error_output, False
 
@@ -938,11 +1118,11 @@ Start by exploring the actual content with Python code."""
             if not any_success:
                 consecutive_failures += 1
                 if consecutive_failures >= max_consecutive_failures:
-                    # Too many failures - return what we have
-                    if self.state.output_history:
-                        return f"Analysis incomplete (code execution failed). Partial findings:\n\n" + \
-                               "\n".join(self.state.output_history[-5:])
-                    return "Analysis failed - code execution errors. Try a more specific query."
+                    # Too many failures - return partial results
+                    partial = self.get_partial_results()
+                    if partial and partial != "No partial results accumulated.":
+                        return f"## Analysis Incomplete\n\n**Reason:** Code execution failed {consecutive_failures} times consecutively.\n\n**Partial findings (before failure):**\n\n{partial}"
+                    return "Analysis failed - code execution errors. Try a more specific query.\n\n**Tip:** Check the error messages above for what went wrong."
             else:
                 consecutive_failures = 0
 
@@ -961,7 +1141,19 @@ Start by exploring the actual content with Python code."""
             })
 
         # Return best available answer
-        return self.state.final_answer or self.state.output_history[-1] if self.state.output_history else "No answer generated"
+        if self.state.final_answer:
+            return self.state.final_answer
+
+        # No final answer - gather partial results
+        partial = self.get_partial_results()
+        if partial and partial != "No partial results accumulated.":
+            return f"## Analysis Reached Iteration Limit ({max_iterations})\n\n**Partial findings:**\n\n{partial}"
+
+        # Fall back to last output
+        if self.state.output_history:
+            return self.state.output_history[-1]
+
+        return "No answer generated - try a more specific query."
 
     def _extract_code_blocks(self, text: str) -> list[str]:
         """Extract Python code blocks from text."""
@@ -976,4 +1168,54 @@ Start by exploring the actual content with Python code."""
     def get_execution_history(self) -> list[tuple[str, str]]:
         """Get (code, output) history."""
         return list(zip(self.state.code_history, self.state.output_history))
+
+    def get_partial_results(self) -> str:
+        """
+        Gather all accumulated findings for partial result reporting.
+
+        Returns a formatted string with:
+        - Sub-LLM responses (the actual analysis results)
+        - Successful execution outputs
+        - Variables that might contain findings
+        """
+        parts = []
+
+        # Include sub-LLM responses (these are the actual findings)
+        if self.state.llm_responses:
+            parts.append("## Sub-LLM Analysis Results\n")
+            for query_id, response in self.state.llm_responses.items():
+                # Skip error responses and empty results
+                if "error:" in response.lower() or not response.strip():
+                    continue
+                # Skip "no findings" type responses
+                if any(phrase in response.lower() for phrase in ["no relevant", "no issues", "nothing found", "no findings"]):
+                    continue
+                parts.append(f"### {query_id}\n{response}\n")
+
+        # Include successful outputs that look like findings
+        finding_keywords = ["found", "issue", "vulnerability", "error", "warning", "file:", "line"]
+        for output in self.state.output_history:
+            if not output or "(no output)" in output:
+                continue
+            # Skip error messages
+            if output.startswith("Code execution failed") or output.startswith("Error:"):
+                continue
+            # Include if it looks like it contains findings
+            if any(kw in output.lower() for kw in finding_keywords):
+                if output not in parts:  # Avoid duplicates
+                    parts.append(output)
+
+        # Include any variables that look like findings
+        for var_name, value in self.state.variables.items():
+            if var_name.startswith("_") or var_name in ("prompt", "FINAL_ANSWER"):
+                continue
+            if isinstance(value, str) and len(value) > 50:
+                # Check if it looks like findings
+                if any(kw in value.lower() for kw in finding_keywords):
+                    parts.append(f"\n## Variable: {var_name}\n{value[:2000]}")
+
+        if not parts:
+            return "No partial results accumulated."
+
+        return "\n\n---\n\n".join(parts)
 
