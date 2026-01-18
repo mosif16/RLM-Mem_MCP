@@ -229,13 +229,94 @@ class StructuredTools:
         return False
 
     def _is_in_string(self, line: str, match_pos: int) -> bool:
-        """Check if match position is inside a string literal."""
-        # Simple heuristic: count quotes before position
-        before = line[:match_pos]
-        single_quotes = before.count("'") - before.count("\\'")
-        double_quotes = before.count('"') - before.count('\\"')
+        """
+        Check if match position is inside a string literal.
 
-        return (single_quotes % 2 == 1) or (double_quotes % 2 == 1)
+        Handles:
+        - Double-quoted strings: "Hello!"
+        - Single-quoted strings: 'Hello!'
+        - Swift string interpolation: "Value: \\(x)"
+        - Multi-line string indicators: triple quotes
+        """
+        # Find all string regions in the line
+        in_string = False
+        string_char = None
+        i = 0
+
+        while i < len(line) and i < match_pos:
+            char = line[i]
+
+            # Check for escape sequences
+            if i > 0 and line[i-1] == '\\':
+                i += 1
+                continue
+
+            # Toggle string state
+            if char in ('"', "'"):
+                if not in_string:
+                    in_string = True
+                    string_char = char
+                elif char == string_char:
+                    in_string = False
+                    string_char = None
+
+            i += 1
+
+        return in_string
+
+    def _is_string_literal_pattern(self, line: str) -> bool:
+        """
+        Check if the line contains a force unwrap inside a string literal.
+
+        Specifically handles SwiftUI and common Swift patterns where ! appears
+        in user-facing text, not as a force unwrap operator.
+
+        Patterns detected:
+        - Text("Hello!")
+        - Label("Warning!", systemImage: ...)
+        - print("Error!")
+        - String literals with ! inside quotes
+        """
+        # Common SwiftUI/UIKit text patterns where ! is in string content
+        text_patterns = [
+            r'Text\s*\(\s*"[^"]*![^"]*"\s*\)',           # Text("Hello!")
+            r'Label\s*\(\s*"[^"]*![^"]*"',               # Label("Warning!", ...)
+            r'print\s*\(\s*"[^"]*![^"]*"\s*\)',          # print("Error!")
+            r'NSLog\s*\(\s*@?"[^"]*![^"]*"',             # NSLog("Error!")
+            r'assertionFailure\s*\(\s*"[^"]*![^"]*"',    # assertionFailure("...")
+            r'preconditionFailure\s*\(\s*"[^"]*![^"]*"', # preconditionFailure("...")
+            r'fatalError\s*\(\s*"[^"]*![^"]*"',          # fatalError("...")
+            r'\.alert\s*\(\s*"[^"]*![^"]*"',             # .alert("Warning!", ...)
+            r'Button\s*\(\s*"[^"]*![^"]*"',              # Button("Click me!", ...)
+            r'NavigationLink\s*\(\s*"[^"]*![^"]*"',      # NavigationLink("Go!", ...)
+            r'\.navigationTitle\s*\(\s*"[^"]*![^"]*"',   # .navigationTitle("Hello!")
+            r'LocalizedStringKey\s*\(\s*"[^"]*![^"]*"',  # LocalizedStringKey("...")
+            r'NSLocalizedString\s*\(\s*"[^"]*![^"]*"',   # NSLocalizedString("...")
+            r'String\s*\(\s*localized:\s*"[^"]*![^"]*"', # String(localized: "...")
+        ]
+
+        for pattern in text_patterns:
+            if re.search(pattern, line, re.IGNORECASE):
+                return True
+
+        # Check if the only ! in the line is inside quotes
+        # Find all ! positions
+        exclamation_positions = [i for i, c in enumerate(line) if c == '!']
+
+        for pos in exclamation_positions:
+            # Skip != operator
+            if pos + 1 < len(line) and line[pos + 1] == '=':
+                continue
+
+            # Check if this ! is inside a string
+            if self._is_in_string(line, pos):
+                continue
+
+            # Found a ! outside a string that's not !=
+            return False
+
+        # All ! are either inside strings or are !=
+        return True if exclamation_positions else False
 
     def _is_code_file(self, filepath: str) -> bool:
         """Check if file is actual code (not docs/config/tests)."""
@@ -575,6 +656,10 @@ class StructuredTools:
                 # Skip matches inside string literals ("Great news!", etc.)
                 match_pos = match.start() if hasattr(match, 'start') else line.find('!')
                 if self._is_in_string(line, match_pos):
+                    continue
+
+                # Skip lines where ! only appears in string literal contexts (SwiftUI Text, etc.)
+                if self._is_string_literal_pattern(line):
                     continue
 
                 # For try!, check if it's a safe pattern (regex, static constants, etc.)
@@ -977,6 +1062,221 @@ class StructuredTools:
                         ))
 
         result.summary = f"Found {len(result.findings)} potential [weak self] issues"
+        return result
+
+    def find_task_cancellation_issues(self) -> ToolResult:
+        """
+        Find Task { } blocks without proper cancellation handling.
+
+        Searches for:
+        - Task { } without Task.isCancelled or Task.checkCancellation()
+        - Long-running operations in Task without cancellation checks
+        - Task.detached without cancellation handling
+        """
+        result = ToolResult(tool_name="Task Cancellation Scanner", files_scanned=len(self.files))
+
+        for filepath in self.files:
+            if not filepath.endswith('.swift'):
+                continue
+
+            lines = self._get_file_lines(filepath)
+            if not lines:
+                continue
+
+            file_content = self._get_file_content(filepath) or ""
+
+            # Find Task { blocks and check for cancellation handling
+            in_task_block = False
+            task_start_line = 0
+            task_depth = 0
+            task_has_cancellation = False
+            task_code_lines: list[str] = []
+
+            for line_num, line in enumerate(lines, 1):
+                stripped = line.strip()
+
+                # Detect Task { or Task.detached {
+                if re.search(r'\bTask\s*(\.\s*detached\s*)?\{', stripped):
+                    in_task_block = True
+                    task_start_line = line_num
+                    task_depth = 1
+                    task_has_cancellation = False
+                    task_code_lines = [line]
+                    continue
+
+                if in_task_block:
+                    task_code_lines.append(line)
+                    task_depth += line.count('{') - line.count('}')
+
+                    # Check for cancellation handling
+                    if any(pattern in line for pattern in [
+                        'Task.isCancelled',
+                        'Task.checkCancellation',
+                        'isCancelled',
+                        'checkCancellation',
+                        'withTaskCancellationHandler'
+                    ]):
+                        task_has_cancellation = True
+
+                    # End of Task block
+                    if task_depth <= 0:
+                        # Check if this Task has long-running operations
+                        task_content = '\n'.join(task_code_lines)
+                        has_long_operation = any(op in task_content for op in [
+                            'await', 'for ', 'while ', 'sleep', 'URLSession',
+                            'fetch', 'load', 'download', 'upload'
+                        ])
+
+                        if has_long_operation and not task_has_cancellation:
+                            result.findings.append(Finding(
+                                file=filepath,
+                                line=task_start_line,
+                                code=task_code_lines[0].strip()[:200],
+                                issue="Task with async operation lacks cancellation handling",
+                                confidence=Confidence.MEDIUM,
+                                severity=Severity.MEDIUM,
+                                fix="Add Task.checkCancellation() or check Task.isCancelled in loops",
+                                category="task_cancellation",
+                            ))
+
+                        in_task_block = False
+                        task_code_lines = []
+
+        result.summary = f"Found {len(result.findings)} Task blocks without cancellation handling"
+        return result
+
+    def find_mainactor_issues(self) -> ToolResult:
+        """
+        Find missing @MainActor annotations on UI-related code.
+
+        Searches for:
+        - ObservableObject classes without @MainActor
+        - @Published properties updated from async contexts
+        - ViewModel classes without @MainActor
+        """
+        result = ToolResult(tool_name="@MainActor Scanner", files_scanned=len(self.files))
+
+        for filepath in self.files:
+            if not filepath.endswith('.swift'):
+                continue
+
+            lines = self._get_file_lines(filepath)
+            if not lines:
+                continue
+
+            file_content = self._get_file_content(filepath) or ""
+
+            # Skip if no ObservableObject or ViewModel patterns
+            if 'ObservableObject' not in file_content and 'ViewModel' not in file_content.lower():
+                continue
+
+            has_main_actor = '@MainActor' in file_content
+
+            # Find class declarations
+            for line_num, line in enumerate(lines, 1):
+                stripped = line.strip()
+
+                # Check for ObservableObject without @MainActor
+                if 'ObservableObject' in line and 'class ' in line:
+                    # Look back a few lines for @MainActor
+                    context_start = max(0, line_num - 5)
+                    context = '\n'.join(lines[context_start:line_num])
+
+                    if '@MainActor' not in context:
+                        result.findings.append(Finding(
+                            file=filepath,
+                            line=line_num,
+                            code=stripped[:200],
+                            issue="ObservableObject without @MainActor - UI updates may cause issues",
+                            confidence=Confidence.MEDIUM,
+                            severity=Severity.MEDIUM,
+                            fix="Add @MainActor to class or ensure @Published updates are on main thread",
+                            category="mainactor",
+                        ))
+
+                # Check for ViewModel pattern without @MainActor
+                if re.search(r'class\s+\w*ViewModel', line, re.IGNORECASE):
+                    context_start = max(0, line_num - 5)
+                    context = '\n'.join(lines[context_start:line_num])
+
+                    if '@MainActor' not in context and 'ObservableObject' not in context:
+                        result.findings.append(Finding(
+                            file=filepath,
+                            line=line_num,
+                            code=stripped[:200],
+                            issue="ViewModel class may need @MainActor for thread safety",
+                            confidence=Confidence.LOW,
+                            severity=Severity.LOW,
+                            fix="Consider adding @MainActor if class updates UI state",
+                            category="mainactor",
+                        ))
+
+                # Check for @Published in async function without @MainActor class
+                if '@Published' in line and not has_main_actor:
+                    # Look for async functions that modify this
+                    var_match = re.search(r'@Published\s+var\s+(\w+)', line)
+                    if var_match:
+                        var_name = var_match.group(1)
+                        # Search for async function modifying this var
+                        for later_line_num, later_line in enumerate(lines[line_num:], line_num + 1):
+                            if f'{var_name} =' in later_line or f'{var_name}.' in later_line:
+                                # Check if inside async context
+                                context_start = max(0, later_line_num - 10)
+                                async_context = '\n'.join(lines[context_start:later_line_num])
+                                if 'func ' in async_context and 'async' in async_context:
+                                    if '@MainActor' not in async_context and 'MainActor.run' not in later_line:
+                                        result.findings.append(Finding(
+                                            file=filepath,
+                                            line=later_line_num,
+                                            code=later_line.strip()[:200],
+                                            issue=f"@Published var '{var_name}' modified in async context without @MainActor",
+                                            confidence=Confidence.HIGH,
+                                            severity=Severity.HIGH,
+                                            fix="Wrap in MainActor.run { } or add @MainActor to function/class",
+                                            category="mainactor",
+                                        ))
+                                        break  # Only report first occurrence
+
+        result.summary = f"Found {len(result.findings)} potential @MainActor issues"
+        return result
+
+    def find_stateobject_issues(self) -> ToolResult:
+        """
+        Find @ObservedObject used where @StateObject should be used.
+
+        In SwiftUI, @StateObject should be used for object creation,
+        @ObservedObject for objects passed in from parent.
+        """
+        result = ToolResult(tool_name="@StateObject Scanner", files_scanned=len(self.files))
+
+        patterns = [
+            # @ObservedObject with inline initialization
+            (r'@ObservedObject\s+(?:private\s+)?var\s+\w+\s*=\s*\w+\(',
+             "@ObservedObject with inline init - use @StateObject", Severity.HIGH),
+
+            # @ObservedObject with default value
+            (r'@ObservedObject\s+(?:private\s+)?var\s+\w+:\s*\w+\s*=\s*',
+             "@ObservedObject with default value - use @StateObject", Severity.HIGH),
+        ]
+
+        for pattern, issue, severity in patterns:
+            matches = self._search_pattern(pattern, file_filter=".swift")
+            for filepath, line_num, line, match in matches:
+                if self._is_in_comment(line, filepath):
+                    continue
+
+                result.findings.append(Finding(
+                    file=filepath,
+                    line=line_num,
+                    code=line.strip()[:200],
+                    issue=issue,
+                    confidence=Confidence.HIGH,
+                    severity=severity,
+                    fix="Change @ObservedObject to @StateObject for owned objects",
+                    category="stateobject",
+                ))
+
+        result.summary = f"Found {len(result.findings)} @StateObject issues"
         return result
 
     # ===== PYTHON TOOLS =====
@@ -1434,9 +1734,14 @@ class StructuredTools:
 
     # ===== RUN ALL SECURITY =====
 
-    def run_security_scan(self) -> list[ToolResult]:
-        """Run all security-related scans."""
-        return [
+    def run_security_scan(self, min_confidence: str = "LOW") -> list[ToolResult]:
+        """
+        Run all security-related scans.
+
+        Args:
+            min_confidence: Minimum confidence level ("LOW", "MEDIUM", "HIGH")
+        """
+        all_results = [
             self.find_secrets(),
             self.find_sql_injection(),
             self.find_command_injection(),
@@ -1446,20 +1751,41 @@ class StructuredTools:
             self.find_input_sanitization_issues(),
         ]
 
+        if min_confidence.upper() != "LOW":
+            all_results = self._filter_by_confidence(all_results, min_confidence)
+
+        return all_results
+
     # ===== RUN ALL QUALITY =====
 
-    def run_quality_scan(self) -> list[ToolResult]:
-        """Run all quality-related scans."""
-        return [
+    def run_quality_scan(self, min_confidence: str = "LOW") -> list[ToolResult]:
+        """
+        Run all quality-related scans.
+
+        Args:
+            min_confidence: Minimum confidence level ("LOW", "MEDIUM", "HIGH")
+        """
+        all_results = [
             self.find_long_functions(),
             self.find_todos(),
         ]
 
+        if min_confidence.upper() != "LOW":
+            all_results = self._filter_by_confidence(all_results, min_confidence)
+
+        return all_results
+
     # ===== RUN ALL iOS =====
 
-    def run_ios_scan(self) -> list[ToolResult]:
-        """Run all iOS/Swift scans including new checks."""
-        return [
+    def run_ios_scan(self, min_confidence: str = "LOW") -> list[ToolResult]:
+        """
+        Run all iOS/Swift scans including new checks.
+
+        Args:
+            min_confidence: Minimum confidence level to include ("LOW", "MEDIUM", "HIGH")
+                           Use "HIGH" to filter out noise, "LOW" for comprehensive scan.
+        """
+        all_results = [
             self.find_force_unwraps(),
             self.find_retain_cycles(),
             self.find_main_thread_violations(),
@@ -1470,7 +1796,55 @@ class StructuredTools:
             self.find_insecure_storage(),
             self.find_input_sanitization_issues(),
             self.find_missing_jailbreak_detection(),
+            # New scanners
+            self.find_task_cancellation_issues(),
+            self.find_mainactor_issues(),
+            self.find_stateobject_issues(),
         ]
+
+        # Filter by confidence if requested
+        if min_confidence.upper() != "LOW":
+            all_results = self._filter_by_confidence(all_results, min_confidence)
+
+        return all_results
+
+    def _filter_by_confidence(
+        self,
+        results: list[ToolResult],
+        min_confidence: str
+    ) -> list[ToolResult]:
+        """
+        Filter results to only include findings at or above minimum confidence.
+
+        Args:
+            results: List of ToolResult objects
+            min_confidence: "LOW", "MEDIUM", or "HIGH"
+
+        Returns:
+            Filtered list with updated summaries
+        """
+        confidence_order = {"LOW": 0, "MEDIUM": 1, "HIGH": 2}
+        min_level = confidence_order.get(min_confidence.upper(), 0)
+
+        filtered_results = []
+        for result in results:
+            filtered_findings = [
+                f for f in result.findings
+                if confidence_order.get(f.confidence.value, 0) >= min_level
+            ]
+
+            if filtered_findings or not result.findings:
+                # Create new result with filtered findings
+                new_result = ToolResult(
+                    tool_name=result.tool_name,
+                    findings=filtered_findings,
+                    summary=f"{result.summary} (filtered: >={min_confidence})",
+                    files_scanned=result.files_scanned,
+                    errors=result.errors,
+                )
+                filtered_results.append(new_result)
+
+        return filtered_results
 
 
 def create_tools(content: str) -> StructuredTools:

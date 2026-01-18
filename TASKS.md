@@ -189,3 +189,51 @@ pytest tests/test_benchmark.py -v
 # Run stress tests only
 pytest tests/test_stress.py -v
 ```
+
+---
+
+# RLM iOS/Swift Scanner Improvements
+
+**Created:** 2026-01-18
+**Status:** 🔄 IN PROGRESS
+**Based on:** User feedback from iOS codebase scanning
+
+## Issues Fixed
+
+### 1. Force Unwrap False Positives ✅ FIXED
+**Problem:** String literals like `Text("Payment overdue!")` flagged as force unwraps
+**Solution:**
+- Improved `_is_in_string()` with proper quote tracking
+- Added `_is_string_literal_pattern()` to detect SwiftUI Text(), Label(), Button(), print() patterns
+- Now correctly skips: `Text("Hello!")`, `Label("Warning!", ...)`, `print("Error!")`
+
+### 2. Missing iOS Security Patterns ✅ FIXED
+**Problem:** Missing detection for Task cancellation, @MainActor, StateObject issues
+**Solution:** Added 3 new scanners:
+- `find_task_cancellation_issues()` - Detects Task {} without Task.isCancelled/checkCancellation
+- `find_mainactor_issues()` - Detects ObservableObject/ViewModel without @MainActor
+- `find_stateobject_issues()` - Detects @ObservedObject with inline init (should be @StateObject)
+
+### 3. Confidence Threshold Parameter ✅ FIXED
+**Problem:** No way to filter low-confidence noise
+**Solution:** Added `min_confidence` parameter to:
+- `rlm_analyze` tool (global filter)
+- `run_ios_scan()`, `run_security_scan()`, `run_quality_scan()`
+- `_filter_by_confidence()` helper method
+- Options: "LOW" (all), "MEDIUM" (filter noise), "HIGH" (verified only)
+
+### 4. iOS Mode Parameter ✅ FIXED
+**Problem:** Need `--ios` mode for pre-configured iOS scanners
+**Solution:** Added `scan_mode` parameter to `rlm_analyze`:
+- `"auto"` (default) - LLM-based routing
+- `"ios"` - Run all 13 iOS scanners
+- `"security"` - Run all 7 security scanners
+- `"quality"` - Run code quality scanners
+- `"all"` - Run everything
+
+### 5. Query Routing Priority ✅ FIXED
+**Problem:** Security queries got "long functions" results first
+**Solution:** Updated TOOL_ROUTER_PROMPT with explicit priority order:
+1. Security issues (exploitable bugs) - FIRST
+2. iOS/Swift specific issues (crashes, memory)
+3. Code quality (style) - LAST

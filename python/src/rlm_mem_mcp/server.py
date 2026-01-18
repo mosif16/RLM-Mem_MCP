@@ -187,6 +187,28 @@ def create_server() -> Server:
                             "items": {"type": "string"},
                             "description": "File or directory paths to analyze. Use ['.'] for current directory.",
                         },
+                        "scan_mode": {
+                            "type": "string",
+                            "enum": ["auto", "ios", "security", "quality", "all"],
+                            "description": (
+                                "Pre-configured scan mode. Options:\n"
+                                "• 'auto' (default): Auto-detect based on query and file types\n"
+                                "• 'ios': Run all iOS/Swift scanners (force unwraps, weak self, @MainActor, etc.)\n"
+                                "• 'security': Run all security scanners (secrets, injection, XSS, etc.)\n"
+                                "• 'quality': Run code quality scanners (long functions, TODOs)\n"
+                                "• 'all': Run all available scanners"
+                            ),
+                        },
+                        "min_confidence": {
+                            "type": "string",
+                            "enum": ["LOW", "MEDIUM", "HIGH"],
+                            "description": (
+                                "Minimum confidence level for findings. Options:\n"
+                                "• 'LOW' (default): Include all findings\n"
+                                "• 'MEDIUM': Filter out low-confidence noise\n"
+                                "• 'HIGH': Only high-confidence, verified findings"
+                            ),
+                        },
                     },
                     "required": ["query", "paths"],
                 },
@@ -312,43 +334,76 @@ def create_server() -> Server:
 # Tool routing prompt for LLM-based auto-routing
 TOOL_ROUTER_PROMPT = """You are a code analysis tool router. Given a user query, decide which tools to run.
 
-AVAILABLE TOOLS:
-- ios_scan: Full iOS audit (force unwraps, weak self, retain cycles, main thread, CloudKit, deprecated APIs, SwiftData, insecure storage, input sanitization, jailbreak detection)
-- security_scan: Security vulnerabilities (secrets, SQL injection, command injection, XSS, Python security, insecure storage, input sanitization)
-- quality_scan: Code quality (long functions, TODOs/FIXMEs)
+PRIORITY ORDER (when query is ambiguous, prefer this order):
+1. Security issues (bugs that can be exploited)
+2. iOS/Swift specific issues (crashes, memory leaks)
+3. Code quality (style, maintainability)
 
-Individual tools (for targeted searches):
-- find_secrets: Hardcoded secrets/API keys
-- find_force_unwraps: Swift force unwraps (!)
+AVAILABLE TOOLS:
+Scan Tools (comprehensive):
+- ios_scan: Full iOS audit (force unwraps, weak self, retain cycles, @MainActor, Task cancellation, CloudKit, deprecated APIs, SwiftData, StateObject issues, insecure storage, jailbreak detection) - 13 scanners
+- security_scan: Security vulnerabilities (secrets, SQL injection, command injection, XSS, Python security, insecure storage, input sanitization) - 7 scanners
+- quality_scan: Code quality (long functions, TODOs/FIXMEs) - 2 scanners
+
+Individual iOS Tools:
+- find_force_unwraps: Swift force unwraps (!) - excludes string literals
 - find_weak_self_issues: Missing [weak self] in closures
+- find_retain_cycles: Strong reference cycles
+- find_mainactor_issues: Missing @MainActor on ObservableObject/ViewModel
+- find_task_cancellation_issues: Task {} without cancellation handling
+- find_stateobject_issues: @ObservedObject used where @StateObject needed
+- find_main_thread_violations: UI updates off main thread
+- find_cloudkit_issues: CloudKit error handling issues
+- find_swiftdata_issues: SwiftData threading issues
+- find_deprecated_apis: Deprecated API usage (params: min_severity=LOW|MEDIUM|HIGH)
+
+Individual Security Tools:
+- find_secrets: Hardcoded secrets/API keys
 - find_sql_injection: SQL injection vulnerabilities
+- find_command_injection: Command injection (os.system, subprocess)
+- find_xss_vulnerabilities: XSS in JavaScript
 - find_insecure_storage: Sensitive data in UserDefaults instead of Keychain
 - find_input_sanitization_issues: User input not sanitized
-- find_deprecated_apis: Deprecated API usage (params: min_severity=LOW|MEDIUM|HIGH)
 - find_missing_jailbreak_detection: Check for jailbreak detection (finance apps)
+- find_python_security: Python-specific security (pickle, yaml, eval)
+
+Architecture Tools:
 - map_architecture: Map codebase structure and dependencies
 
 RULES:
-1. For broad audits, prefer scan tools (ios_scan, security_scan) over individual tools
-2. For specific issues, use targeted tools
-3. Can run multiple tools if query spans categories
-4. Return empty array if query doesn't match any tools (e.g., "explain this code")
+1. SECURITY queries should run security_scan FIRST, not quality_scan
+2. iOS/Swift queries should run ios_scan which includes security checks
+3. For "audit" or "review" queries, run comprehensive scans not individual tools
+4. Only use quality_scan when explicitly asked about code quality/style
+5. Return empty array for non-analysis queries ("explain this", "how does X work")
 
 Respond with ONLY a JSON object:
 {"tools": ["tool_name", ...], "params": {"tool_name": {"param": "value"}}}
 
 Examples:
-Query: "audit this iOS app for issues"
+Query: "audit this iOS app for security issues"
 {"tools": ["ios_scan", "security_scan"], "params": {}}
 
+Query: "find security vulnerabilities"
+{"tools": ["security_scan"], "params": {}}
+
+Query: "check this Swift code for issues"
+{"tools": ["ios_scan"], "params": {}}
+
 Query: "find memory leaks in Swift code"
-{"tools": ["find_weak_self_issues", "find_force_unwraps"], "params": {}}
+{"tools": ["find_weak_self_issues", "find_retain_cycles", "find_mainactor_issues"], "params": {}}
 
 Query: "check for hardcoded API keys"
 {"tools": ["find_secrets"], "params": {}}
 
-Query: "is sensitive data stored securely"
-{"tools": ["find_insecure_storage", "find_secrets"], "params": {}}
+Query: "find @MainActor issues"
+{"tools": ["find_mainactor_issues", "find_main_thread_violations"], "params": {}}
+
+Query: "check Task cancellation handling"
+{"tools": ["find_task_cancellation_issues"], "params": {}}
+
+Query: "find code quality issues"
+{"tools": ["quality_scan"], "params": {}}
 
 Query: "find deprecated APIs, only high severity"
 {"tools": ["find_deprecated_apis"], "params": {"find_deprecated_apis": {"min_severity": "HIGH"}}}
@@ -429,7 +484,8 @@ async def _llm_route_tools(query: str, config: "RLMConfig") -> dict[str, Any]:
 def _execute_routed_tools(
     tools_to_run: list[str],
     params: dict[str, dict],
-    content: str
+    content: str,
+    min_confidence: str = "LOW"
 ) -> tuple[str, list[ToolResult]]:
     """
     Execute the tools selected by the LLM router.
@@ -437,6 +493,12 @@ def _execute_routed_tools(
     This is Layer 2 of the double-layer system:
     - Deterministic execution of structured tools
     - No LLM involved in actual scanning
+
+    Args:
+        tools_to_run: List of tool names to execute
+        params: Tool-specific parameters
+        content: File content to analyze
+        min_confidence: Global minimum confidence filter ("LOW", "MEDIUM", "HIGH")
     """
     tools = StructuredTools(content)
     all_results: list[ToolResult] = []
@@ -446,11 +508,11 @@ def _execute_routed_tools(
 
         try:
             if tool_name == "ios_scan":
-                all_results.extend(tools.run_ios_scan())
+                all_results.extend(tools.run_ios_scan(min_confidence=min_confidence))
             elif tool_name == "security_scan":
-                all_results.extend(tools.run_security_scan())
+                all_results.extend(tools.run_security_scan(min_confidence=min_confidence))
             elif tool_name == "quality_scan":
-                all_results.extend(tools.run_quality_scan())
+                all_results.extend(tools.run_quality_scan(min_confidence=min_confidence))
             elif tool_name == "find_secrets":
                 all_results.append(tools.find_secrets())
             elif tool_name == "find_force_unwraps":
@@ -488,8 +550,19 @@ def _execute_routed_tools(
                 all_results.append(tools.find_input_sanitization_issues())
             elif tool_name == "find_missing_jailbreak_detection":
                 all_results.append(tools.find_missing_jailbreak_detection())
+            # New iOS tools
+            elif tool_name == "find_mainactor_issues":
+                all_results.append(tools.find_mainactor_issues())
+            elif tool_name == "find_task_cancellation_issues":
+                all_results.append(tools.find_task_cancellation_issues())
+            elif tool_name == "find_stateobject_issues":
+                all_results.append(tools.find_stateobject_issues())
         except Exception as e:
             print(f"[RLM Router] Tool {tool_name} failed: {e}", file=sys.stderr)
+
+    # Apply global confidence filter to individual tool results
+    if min_confidence.upper() != "LOW":
+        all_results = tools._filter_by_confidence(all_results, min_confidence)
 
     return _format_tool_results(all_results, tools_to_run)
 
@@ -527,11 +600,18 @@ def _format_tool_results(
 def _run_structured_tools_for_query_type(
     query_type: str,
     content: str,
-    query_lower: str
+    query_lower: str,
+    min_confidence: str = "LOW"
 ) -> tuple[str, list[ToolResult]]:
     """
     Fallback: Auto-route to structured tools based on detected query type.
     Used when LLM routing fails or returns empty.
+
+    Args:
+        query_type: Detected query type (ios, security, quality, etc.)
+        content: File content to analyze
+        query_lower: Lowercase query for keyword matching
+        min_confidence: Minimum confidence filter ("LOW", "MEDIUM", "HIGH")
 
     Returns:
         (formatted_output, list_of_results)
@@ -542,24 +622,25 @@ def _run_structured_tools_for_query_type(
 
     # Determine which scans to run based on query type
     if query_type == "ios":
-        all_results = tools.run_ios_scan()
+        all_results = tools.run_ios_scan(min_confidence=min_confidence)
         tools_run = ["ios_scan"]
     elif query_type == "security":
-        all_results = tools.run_security_scan()
+        all_results = tools.run_security_scan(min_confidence=min_confidence)
         tools_run = ["security_scan"]
     elif query_type == "quality":
-        all_results = tools.run_quality_scan()
+        all_results = tools.run_quality_scan(min_confidence=min_confidence)
         tools_run = ["quality_scan"]
     else:
         # For mixed/general queries, check keywords and run matching scans
-        if any(kw in query_lower for kw in ["swift", "ios", "unwrap", "swiftui", "xcode"]):
-            all_results.extend(tools.run_ios_scan())
-            tools_run.append("ios_scan")
-        if any(kw in query_lower for kw in ["security", "secret", "inject", "vulnerab", "xss"]):
-            all_results.extend(tools.run_security_scan())
+        # PRIORITY: Security first, then iOS, then quality
+        if any(kw in query_lower for kw in ["security", "secret", "inject", "vulnerab", "xss", "attack"]):
+            all_results.extend(tools.run_security_scan(min_confidence=min_confidence))
             tools_run.append("security_scan")
-        if any(kw in query_lower for kw in ["quality", "long function", "todo", "fixme"]):
-            all_results.extend(tools.run_quality_scan())
+        if any(kw in query_lower for kw in ["swift", "ios", "unwrap", "swiftui", "xcode", "mainactor"]):
+            all_results.extend(tools.run_ios_scan(min_confidence=min_confidence))
+            tools_run.append("ios_scan")
+        if any(kw in query_lower for kw in ["quality", "long function", "todo", "fixme", "style"]):
+            all_results.extend(tools.run_quality_scan(min_confidence=min_confidence))
             tools_run.append("quality_scan")
 
     if not all_results:
@@ -574,6 +655,8 @@ async def handle_rlm_analyze(arguments: dict[str, Any]) -> list[TextContent]:
 
     query = arguments.get("query", "")
     paths = arguments.get("paths", [])
+    scan_mode = arguments.get("scan_mode", "auto")  # auto, ios, security, quality, all
+    min_confidence = arguments.get("min_confidence", "LOW")  # LOW, MEDIUM, HIGH
 
     # Input validation
     if not query:
@@ -639,25 +722,53 @@ async def handle_rlm_analyze(arguments: dict[str, Any]) -> list[TextContent]:
     # Layer 2: Structured tools execute deterministically (reliable execution)
     content = collection.get_combined_content(include_headers=True)
 
-    # Try LLM-based routing first
-    routing_decision = await _llm_route_tools(query, rlm_config)
-    tools_to_run = routing_decision.get("tools", [])
-    tool_params = routing_decision.get("params", {})
+    # Handle explicit scan_mode
+    if scan_mode != "auto":
+        _log_timing("explicit_scan_mode", start_time, mode=scan_mode)
+        tools = StructuredTools(content)
 
-    if tools_to_run:
-        # LLM routing succeeded - execute selected tools
-        _log_timing("llm_routing", start_time, tools=tools_to_run)
-        structured_output, structured_results = _execute_routed_tools(
-            tools_to_run, tool_params, content
-        )
+        if scan_mode == "ios":
+            structured_results = tools.run_ios_scan(min_confidence=min_confidence)
+            tools_to_run = ["ios_scan"]
+        elif scan_mode == "security":
+            structured_results = tools.run_security_scan(min_confidence=min_confidence)
+            tools_to_run = ["security_scan"]
+        elif scan_mode == "quality":
+            structured_results = tools.run_quality_scan(min_confidence=min_confidence)
+            tools_to_run = ["quality_scan"]
+        elif scan_mode == "all":
+            structured_results = (
+                tools.run_ios_scan(min_confidence=min_confidence) +
+                tools.run_security_scan(min_confidence=min_confidence) +
+                tools.run_quality_scan(min_confidence=min_confidence)
+            )
+            tools_to_run = ["ios_scan", "security_scan", "quality_scan"]
+        else:
+            structured_results = []
+            tools_to_run = []
+
+        structured_output, _ = _format_tool_results(structured_results, tools_to_run)
     else:
-        # Fall back to keyword-based routing
-        _log_timing("keyword_routing", start_time, query_type=query_analysis["query_type"])
-        structured_output, structured_results = _run_structured_tools_for_query_type(
-            query_analysis["query_type"],
-            content,
-            query.lower()
-        )
+        # Auto mode: Try LLM-based routing first
+        routing_decision = await _llm_route_tools(query, rlm_config)
+        tools_to_run = routing_decision.get("tools", [])
+        tool_params = routing_decision.get("params", {})
+
+        if tools_to_run:
+            # LLM routing succeeded - execute selected tools
+            _log_timing("llm_routing", start_time, tools=tools_to_run)
+            structured_output, structured_results = _execute_routed_tools(
+                tools_to_run, tool_params, content, min_confidence
+            )
+        else:
+            # Fall back to keyword-based routing
+            _log_timing("keyword_routing", start_time, query_type=query_analysis["query_type"])
+            structured_output, structured_results = _run_structured_tools_for_query_type(
+                query_analysis["query_type"],
+                content,
+                query.lower(),
+                min_confidence
+            )
 
     _log_timing("structured_tools", start_time,
                 tools_run=len(structured_results),
