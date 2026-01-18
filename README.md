@@ -1,6 +1,6 @@
 # RLM-Mem MCP Server
 
-An MCP (Model Context Protocol) server implementing the **Recursive Language Model (RLM)** technique for ultimate context management with Claude Code.
+An MCP (Model Context Protocol) server implementing the **TRUE Recursive Language Model (RLM)** technique for ultimate context management with Claude Code.
 
 Based on:
 - **[arXiv:2512.24601](https://arxiv.org/abs/2512.24601)** - Recursive Language Models (Zhang, Kraska, Khattab - MIT, 2025)
@@ -14,27 +14,32 @@ Claude Code has a context window of ~200k tokens. When analyzing large codebases
 - Experiences "context rot" (degraded performance)
 - Runs out of space for reasoning
 
-## The Solution
+## The TRUE RLM Solution
 
-RLM stores large content **outside** the model's context and processes it recursively:
+**Key Insight**: Content is stored as a **VARIABLE** in a Python REPL, NOT in LLM context.
 
 ```
-Without RLM:
-    Claude tries to read all files → exceeds context → fails
-    OR reads partial files → misses information
+Traditional Summarization (NOT what we do):
+    Large content → LLM summarizes → Information LOST
 
-With RLM:
-    Claude calls RLM tool → RLM processes externally → returns summary
-    Claude receives 4k token summary → has 196k tokens left for reasoning
+TRUE RLM Technique:
+    Large content → Stored as `prompt` variable
+    LLM writes Python CODE to examine portions
+    Sub-LLM responses stored as VARIABLES (NOT summarized)
+    Full data PRESERVED - accessible at any time
 ```
+
+The LLM acts as a programmer, writing code to search and analyze the content rather than trying to hold it all in context.
 
 ## Features
 
-- **Recursive Processing**: Handles arbitrarily large inputs by chunking and aggregating
-- **Prompt Caching**: Leverages Anthropic's caching for 90% cost reduction on repeated content
+- **TRUE RLM Processing**: Content stored as variables, LLM writes code to examine it
+- **Prompt Caching**: Leverages caching for cost reduction on repeated content
 - **Intelligent Chunking**: Respects file/function/section boundaries when splitting
-- **Memory Store**: Persist important findings across conversations
-- **Token Optimization**: Minimizes context usage with efficient tool schemas
+- **Memory Store**: Persist important findings across conversations (SQLite-backed)
+- **Robust Architecture**: Circuit breakers, rate limiters, exponential backoff
+- **Async Pipeline**: Fully async with connection pooling and concurrent operations
+- **Multi-Model Support**: Works with OpenRouter (Gemini, Claude, etc.) or Anthropic direct
 
 ## Installation
 
@@ -42,7 +47,7 @@ With RLM:
 
 - Python 3.10+
 - Claude Code CLI
-- Anthropic API key
+- OpenRouter API key (or Anthropic API key for direct access)
 
 ### Setup
 
@@ -55,8 +60,11 @@ cd RLM-Mem_MCP
 cd python
 pip install -e .
 
-# Set your API key
-export ANTHROPIC_API_KEY=sk-ant-...
+# Set your API key (OpenRouter recommended for flexibility)
+export OPENROUTER_API_KEY=sk-or-...
+
+# Or use Anthropic directly
+# export ANTHROPIC_API_KEY=sk-ant-...
 ```
 
 ### Configure Claude Code
@@ -79,7 +87,7 @@ claude mcp add --transport stdio rlm -- python -m rlm_mem_mcp.server
       "command": "python",
       "args": ["-m", "rlm_mem_mcp.server"],
       "env": {
-        "ANTHROPIC_API_KEY": "${ANTHROPIC_API_KEY}"
+        "OPENROUTER_API_KEY": "${OPENROUTER_API_KEY}"
       }
     }
   }
@@ -152,12 +160,14 @@ Claude uses rlm_query_text({
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `ANTHROPIC_API_KEY` | (required) | Your Anthropic API key |
-| `RLM_MODEL` | `claude-sonnet-4-5-20241022` | Model for RLM processing |
+| `OPENROUTER_API_KEY` | (required) | Your OpenRouter API key |
+| `RLM_MODEL` | `google/gemini-2.5-flash-lite` | Model for RLM processing |
+| `RLM_AGGREGATOR_MODEL` | `google/gemini-2.5-flash-lite` | Model for final aggregation |
 | `RLM_USE_CACHE` | `true` | Enable prompt caching |
 | `RLM_CACHE_TTL` | `5m` | Cache TTL (`5m` or `1h`) |
 | `RLM_MAX_RESULT_TOKENS` | `4000` | Max tokens in result |
 | `RLM_MAX_CHUNK_TOKENS` | `8000` | Max tokens per chunk |
+| `RLM_OVERLAP_TOKENS` | `200` | Overlap tokens between chunks |
 
 ### File Filtering
 
@@ -171,7 +181,7 @@ Claude uses rlm_query_text({
 
 ## How It Works
 
-### RLM Architecture
+### TRUE RLM Architecture
 
 ```
 +------------------+
@@ -184,30 +194,40 @@ Claude uses rlm_query_text({
          |
          | MCP Protocol (JSON-RPC over stdio)
          v
-+------------------+
-|  RLM MCP Server  |
-|                  |
-| - Collects files |
-| - Chunks content |
-| - Recursive LLM  |
-| - Aggregates     |
-+--------+---------+
++------------------+     +------------------+
+|  RLM MCP Server  |     |   REPL Environ   |
+|                  |     |                  |
+| - Collects files |---->| prompt = content |
+| - Stores as var  |     | results = []     |
+| - LLM writes code|     | llm_query(...)   |
+| - Executes code  |     |                  |
++--------+---------+     +------------------+
          |
-         | API calls (with caching)
+         | API calls (with caching, rate limiting, circuit breaker)
          v
 +------------------+
-|  Anthropic API   |
-|  (Claude Model)  |
+|   OpenRouter /   |
+|   Anthropic API  |
 +------------------+
 ```
 
+### The TRUE RLM Technique (arXiv:2512.24601)
+
+Unlike simple summarization, TRUE RLM:
+
+1. **Content as Variable**: Files stored in `prompt` variable, NOT in LLM context
+2. **LLM Writes Code**: The LLM generates Python to examine `prompt`
+3. **Sub-LLM Queries**: `llm_query()` calls analyze specific portions
+4. **Results as Variables**: Sub-LLM responses stored in full, NOT summarized
+5. **Full Preservation**: Original data always accessible for re-examination
+
 ### Processing Steps
 
-1. **File Collection**: Walk directories, filter by extension, skip ignored dirs
-2. **Chunking**: Split content at semantic boundaries (files, functions, sections)
-3. **Relevance Assessment**: Score each chunk's relevance to the query
-4. **Processing**: Query relevant chunks with sub-LLM calls
-5. **Aggregation**: Combine findings into coherent response
+1. **File Collection**: Async walk directories, filter by extension, respect limits
+2. **Variable Storage**: Content stored in REPL environment as `prompt` variable
+3. **Code Generation**: LLM writes Python code to search/analyze content
+4. **Sandboxed Execution**: Code runs in restricted environment with `llm_query()`
+5. **Result Aggregation**: Findings combined into coherent response
 6. **Truncation**: Ensure result fits in context (max 4000 tokens)
 
 ### Prompt Caching Strategy
@@ -236,9 +256,21 @@ system = [
 |--------|------------------|--------------|------|
 | Direct (if possible) | Fails or degrades | 200k+ (full) | N/A |
 | Premium 1M context | Works | 500k | ~$15 |
-| **RLM via MCP** | Works | ~4k summary | **~$3** |
+| **RLM via MCP** | Works | ~4k summary | **~$0.50-3** |
 
-RLM is often **cheaper** and leaves context for reasoning.
+RLM is often **cheaper** and leaves context for reasoning. Using OpenRouter with Gemini Flash makes it even more cost-effective.
+
+## Robust Architecture
+
+The server includes production-ready features:
+
+- **Circuit Breaker**: Stops requests after consecutive failures, auto-recovers
+- **Rate Limiter**: Respects API rate limits (requests/min, tokens/min)
+- **Exponential Backoff**: Retries with increasing delays on 429/503 errors
+- **Connection Pooling**: Reuses HTTP connections via `httpx.AsyncClient`
+- **LRU Response Cache**: Caches LLM responses to avoid redundant calls
+- **Async Everything**: Non-blocking I/O for file collection and API calls
+- **Graceful Shutdown**: Proper resource cleanup on server stop
 
 ## Adding to CLAUDE.md
 
@@ -279,16 +311,34 @@ RLM-Mem_MCP/
 ├── python/
 │   ├── src/
 │   │   └── rlm_mem_mcp/
-│   │       ├── __init__.py
-│   │       ├── server.py          # MCP server entry point
-│   │       ├── rlm_processor.py   # RLM implementation
-│   │       ├── file_collector.py  # File collection
-│   │       ├── cache_manager.py   # Prompt caching
-│   │       └── config.py          # Configuration
+│   │       ├── __init__.py          # Package exports
+│   │       ├── server.py            # MCP server entry point
+│   │       ├── rlm_processor.py     # Core RLM implementation
+│   │       ├── repl_environment.py  # TRUE RLM REPL with llm_query()
+│   │       ├── file_collector.py    # Async file collection
+│   │       ├── cache_manager.py     # Prompt caching (Anthropic-style)
+│   │       ├── memory_store.py      # SQLite-backed persistent memory
+│   │       ├── agent_pipeline.py    # Claude Agent SDK integration
+│   │       ├── config.py            # Environment configuration
+│   │       └── utils.py             # Performance monitoring
+│   ├── tests/
+│   │   ├── test_integration.py      # End-to-end tests
+│   │   ├── test_benchmark.py        # Performance benchmarks
+│   │   ├── test_stress.py           # Stress tests
+│   │   └── conftest.py              # Test fixtures
 │   ├── requirements.txt
 │   └── pyproject.toml
-├── src/                           # TypeScript implementation (optional)
-├── .mcp.json                      # Project MCP config
+├── src/                             # TypeScript implementation (optional)
+│   ├── index.ts                     # MCP server (Node.js)
+│   ├── core/
+│   │   └── rlm-context-manager.ts   # RLM tree-based context
+│   ├── utils/
+│   │   ├── tokenizer.ts             # Token counting
+│   │   └── text-splitter.ts         # Document chunking
+│   └── types/
+│       └── index.ts                 # TypeScript interfaces
+├── .mcp.json                        # Project MCP config
+├── CLAUDE.md                        # Claude Code guidance
 └── README.md
 ```
 
