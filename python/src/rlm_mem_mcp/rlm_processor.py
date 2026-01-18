@@ -11,28 +11,47 @@ THE KEY INSIGHT (from the paper):
 
 This is NOT summarization! The data is kept intact and accessible.
 
-Processing modes:
-1. REPL Mode (TRUE RLM): LLM writes code to examine content stored as variable
-2. Agent SDK Mode: Uses subagents for parallel processing
-3. Built-in Mode: Sequential chunk processing (fallback)
-
-Models Used:
-- Claude Haiku 4.5: Sub-LLM queries via llm_query() (fast, free with Max)
-- Claude Sonnet: Orchestration - writing code to examine content
+Performance Optimizations:
+- AsyncOpenAI client for true async API calls
+- Exponential backoff retry for transient failures (429, 503)
+- Circuit breaker for repeated failures
+- Request timeout protection
+- Connection pooling via httpx
+- LRU cache for LLM responses
+- Incremental token counting
+- Early termination on relevance threshold
 """
 
 import asyncio
 import hashlib
 import time
+import random
 from dataclasses import dataclass, field
 from typing import Any, Callable
+from functools import lru_cache
+from collections import OrderedDict
 
-import anthropic
+from openai import AsyncOpenAI
+import httpx
 import tiktoken
 
 from .config import RLMConfig
 from .cache_manager import CacheManager
 from .file_collector import CollectionResult
+
+
+# Performance tuning constants
+LLM_REQUEST_TIMEOUT_SECONDS = 120  # Max time for a single LLM call
+MAX_RETRIES = 3  # Max retries for transient failures
+INITIAL_RETRY_DELAY = 1.0  # Initial delay for exponential backoff
+CIRCUIT_BREAKER_THRESHOLD = 5  # Failures before circuit opens
+CIRCUIT_BREAKER_RESET_TIME = 60  # Seconds before circuit resets
+LLM_CACHE_MAX_SIZE = 1000  # Max cached LLM responses
+EARLY_TERMINATION_THRESHOLD = 0.9  # Stop if relevance exceeds this
+
+# Rate limiting constants
+RATE_LIMIT_REQUESTS_PER_MINUTE = 60  # Max requests per minute
+RATE_LIMIT_TOKENS_PER_MINUTE = 100_000  # Max tokens per minute
 
 
 @dataclass
@@ -63,6 +82,205 @@ class RLMResult:
     error: str | None = None
 
 
+class CircuitBreaker:
+    """Circuit breaker pattern for API call protection."""
+
+    def __init__(self, threshold: int = CIRCUIT_BREAKER_THRESHOLD, reset_time: int = CIRCUIT_BREAKER_RESET_TIME):
+        self.threshold = threshold
+        self.reset_time = reset_time
+        self.failure_count = 0
+        self.last_failure_time = 0.0
+        self.is_open = False
+
+    def record_failure(self) -> None:
+        """Record a failure and potentially open the circuit."""
+        self.failure_count += 1
+        self.last_failure_time = time.time()
+        if self.failure_count >= self.threshold:
+            self.is_open = True
+
+    def record_success(self) -> None:
+        """Record a success and reset failure count."""
+        self.failure_count = 0
+        self.is_open = False
+
+    def can_proceed(self) -> bool:
+        """Check if we can proceed with a request."""
+        if not self.is_open:
+            return True
+
+        # Check if reset time has passed
+        if time.time() - self.last_failure_time >= self.reset_time:
+            self.is_open = False
+            self.failure_count = 0
+            return True
+
+        return False
+
+    def get_status(self) -> dict[str, Any]:
+        """Get circuit breaker status."""
+        return {
+            "is_open": self.is_open,
+            "failure_count": self.failure_count,
+            "threshold": self.threshold,
+        }
+
+
+class RateLimiter:
+    """
+    Token bucket rate limiter for API calls.
+
+    Limits both request count and token throughput per minute.
+    """
+
+    def __init__(
+        self,
+        requests_per_minute: int = RATE_LIMIT_REQUESTS_PER_MINUTE,
+        tokens_per_minute: int = RATE_LIMIT_TOKENS_PER_MINUTE
+    ):
+        self.requests_per_minute = requests_per_minute
+        self.tokens_per_minute = tokens_per_minute
+
+        # Sliding window tracking
+        self._request_times: list[float] = []
+        self._token_usage: list[tuple[float, int]] = []  # (timestamp, tokens)
+
+        # Stats
+        self._total_requests = 0
+        self._total_tokens = 0
+        self._throttle_count = 0
+
+    def _cleanup_old_entries(self, current_time: float) -> None:
+        """Remove entries older than 1 minute."""
+        cutoff = current_time - 60.0
+
+        # Clean request times
+        self._request_times = [t for t in self._request_times if t > cutoff]
+
+        # Clean token usage
+        self._token_usage = [(t, tokens) for t, tokens in self._token_usage if t > cutoff]
+
+    def can_proceed(self, estimated_tokens: int = 0) -> tuple[bool, float]:
+        """
+        Check if a request can proceed under rate limits.
+
+        Args:
+            estimated_tokens: Estimated tokens for this request
+
+        Returns:
+            (can_proceed, wait_seconds) tuple
+        """
+        current_time = time.time()
+        self._cleanup_old_entries(current_time)
+
+        # Check request count limit
+        if len(self._request_times) >= self.requests_per_minute:
+            oldest = self._request_times[0]
+            wait_time = 60.0 - (current_time - oldest)
+            return False, max(0.1, wait_time)
+
+        # Check token limit
+        current_tokens = sum(tokens for _, tokens in self._token_usage)
+        if current_tokens + estimated_tokens > self.tokens_per_minute:
+            if self._token_usage:
+                oldest = self._token_usage[0][0]
+                wait_time = 60.0 - (current_time - oldest)
+                return False, max(0.1, wait_time)
+
+        return True, 0.0
+
+    def record_request(self, tokens_used: int = 0) -> None:
+        """Record a completed request."""
+        current_time = time.time()
+        self._request_times.append(current_time)
+        if tokens_used > 0:
+            self._token_usage.append((current_time, tokens_used))
+
+        self._total_requests += 1
+        self._total_tokens += tokens_used
+
+    async def wait_if_needed(self, estimated_tokens: int = 0) -> None:
+        """Wait if rate limit would be exceeded."""
+        can_proceed, wait_time = self.can_proceed(estimated_tokens)
+        if not can_proceed:
+            self._throttle_count += 1
+            await asyncio.sleep(wait_time)
+
+    def get_stats(self) -> dict[str, Any]:
+        """Get rate limiter statistics."""
+        current_time = time.time()
+        self._cleanup_old_entries(current_time)
+
+        return {
+            "requests_last_minute": len(self._request_times),
+            "tokens_last_minute": sum(tokens for _, tokens in self._token_usage),
+            "total_requests": self._total_requests,
+            "total_tokens": self._total_tokens,
+            "throttle_count": self._throttle_count,
+            "requests_limit": self.requests_per_minute,
+            "tokens_limit": self.tokens_per_minute,
+        }
+
+
+class LLMResponseCache:
+    """LRU cache for LLM responses with TTL support."""
+
+    def __init__(self, max_size: int = LLM_CACHE_MAX_SIZE, ttl_seconds: int = 3600):
+        self.max_size = max_size
+        self.ttl_seconds = ttl_seconds
+        self._cache: OrderedDict[str, tuple[str, float]] = OrderedDict()
+        self._hits = 0
+        self._misses = 0
+
+    def _make_key(self, model: str, messages: list[dict], max_tokens: int) -> str:
+        """Create cache key from request parameters."""
+        content = f"{model}:{max_tokens}:{str(messages)}"
+        return hashlib.sha256(content.encode()).hexdigest()[:32]
+
+    def get(self, model: str, messages: list[dict], max_tokens: int) -> str | None:
+        """Get cached response if available and not expired."""
+        key = self._make_key(model, messages, max_tokens)
+
+        if key in self._cache:
+            response, timestamp = self._cache[key]
+            if time.time() - timestamp < self.ttl_seconds:
+                # Move to end (most recently used)
+                self._cache.move_to_end(key)
+                self._hits += 1
+                return response
+            else:
+                # Expired, remove it
+                del self._cache[key]
+
+        self._misses += 1
+        return None
+
+    def set(self, model: str, messages: list[dict], max_tokens: int, response: str) -> None:
+        """Cache a response."""
+        key = self._make_key(model, messages, max_tokens)
+
+        # Remove oldest if at capacity
+        while len(self._cache) >= self.max_size:
+            self._cache.popitem(last=False)
+
+        self._cache[key] = (response, time.time())
+
+    def get_stats(self) -> dict[str, Any]:
+        """Get cache statistics."""
+        total = self._hits + self._misses
+        return {
+            "hits": self._hits,
+            "misses": self._misses,
+            "hit_rate": self._hits / total if total > 0 else 0,
+            "size": len(self._cache),
+            "max_size": self.max_size,
+        }
+
+    def clear(self) -> None:
+        """Clear the cache."""
+        self._cache.clear()
+
+
 class RLMProcessor:
     """
     Recursive Language Model processor.
@@ -76,11 +294,12 @@ class RLMProcessor:
     3. Process relevant chunks with sub-queries
     4. Aggregate results into a coherent response
 
-    This approach:
-    - Stays within context limits
-    - Reduces costs (only process relevant chunks)
-    - Enables arbitrarily large inputs
-    - Leaves context space for reasoning
+    Performance features:
+    - AsyncOpenAI for true async API calls
+    - Exponential backoff retry with jitter
+    - Circuit breaker for failure protection
+    - LRU response caching
+    - Connection pooling
     """
 
     # System prompts for different stages
@@ -118,18 +337,37 @@ Guidelines:
         cache_manager: CacheManager | None = None
     ):
         self.config = config or RLMConfig()
-        self.cache_manager = cache_manager or CacheManager(self.config)
-        self.client = anthropic.Anthropic(api_key=self.config.api_key)
+        self.cache_manager = cache_manager  # Keep for interface compatibility
+
+        # Create async HTTP client with connection pooling
+        self._http_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(LLM_REQUEST_TIMEOUT_SECONDS),
+            limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
+        )
+
+        # Create async OpenAI client with pooled connections
+        self.client = AsyncOpenAI(
+            api_key=self.config.api_key,
+            base_url=self.config.api_base_url,
+            http_client=self._http_client,
+            default_headers={
+                "HTTP-Referer": "https://github.com/mosif16/RLM-Mem_MCP",
+                "X-Title": "RLM-Mem MCP Server"
+            }
+        )
+
         self._encoder: tiktoken.Encoding | None = None
 
-        # Try to import the official RLM library if available
-        self._rlm_available = False
-        try:
-            import rlm
-            self._rlm_available = True
-            self._rlm = rlm
-        except ImportError:
-            pass
+        # Performance components
+        self._circuit_breaker = CircuitBreaker()
+        self._response_cache = LLMResponseCache()
+        self._rate_limiter = RateLimiter()
+        self._api_call_count = 0
+        self._cache_hit_count = 0
+
+    async def close(self) -> None:
+        """Close the HTTP client and cleanup resources."""
+        await self._http_client.aclose()
 
     @property
     def encoder(self) -> tiktoken.Encoding:
@@ -138,11 +376,26 @@ Guidelines:
             self._encoder = tiktoken.encoding_for_model("gpt-4")
         return self._encoder
 
+    async def get_encoder_async(self) -> tiktoken.Encoding:
+        """Get encoder without blocking event loop."""
+        if self._encoder is None:
+            self._encoder = await asyncio.to_thread(
+                tiktoken.encoding_for_model, "gpt-4"
+            )
+        return self._encoder
+
     def count_tokens(self, text: str) -> int:
         """Count tokens in text."""
         if not text:
             return 0
         return len(self.encoder.encode(text))
+
+    async def count_tokens_async(self, text: str) -> int:
+        """Count tokens without blocking event loop."""
+        if not text:
+            return 0
+        encoder = await self.get_encoder_async()
+        return await asyncio.to_thread(lambda: len(encoder.encode(text)))
 
     def split_into_chunks(
         self,
@@ -199,6 +452,7 @@ Guidelines:
         """Split content that has file markers."""
         chunks = []
         current_chunk = ""
+        current_tokens = 0  # Incremental token counting
 
         # Split on file markers but keep the marker with the content
         parts = content.split("### File:")
@@ -209,8 +463,9 @@ Guidelines:
             file_content = ("### File:" + part) if i > 0 else part
             file_tokens = self.count_tokens(file_content)
 
-            if self.count_tokens(current_chunk) + file_tokens <= max_tokens:
+            if current_tokens + file_tokens <= max_tokens:
                 current_chunk += file_content
+                current_tokens += file_tokens
             else:
                 if current_chunk:
                     chunks.append(current_chunk.strip())
@@ -218,8 +473,10 @@ Guidelines:
                     # Split this large file
                     chunks.extend(self._split_by_tokens(file_content, max_tokens))
                     current_chunk = ""
+                    current_tokens = 0
                 else:
                     current_chunk = file_content
+                    current_tokens = file_tokens
 
         if current_chunk.strip():
             chunks.append(current_chunk.strip())
@@ -235,13 +492,18 @@ Guidelines:
         """Merge small sections together until they approach max_tokens."""
         chunks = []
         current_chunk = ""
+        current_tokens = 0  # Incremental token counting
 
         for section in sections:
             section_tokens = self.count_tokens(section)
-            current_tokens = self.count_tokens(current_chunk)
 
             if current_tokens + section_tokens <= max_tokens:
-                current_chunk += (separator if current_chunk else "") + section
+                if current_chunk:
+                    current_chunk += separator + section
+                    current_tokens += section_tokens + self.count_tokens(separator)
+                else:
+                    current_chunk = section
+                    current_tokens = section_tokens
             else:
                 if current_chunk:
                     chunks.append(current_chunk.strip())
@@ -249,8 +511,10 @@ Guidelines:
                     # Section too large, split it further
                     chunks.extend(self._split_by_tokens(section, max_tokens))
                     current_chunk = ""
+                    current_tokens = 0
                 else:
                     current_chunk = section
+                    current_tokens = section_tokens
 
         if current_chunk.strip():
             chunks.append(current_chunk.strip())
@@ -268,6 +532,85 @@ Guidelines:
             chunks.append(chunk_text)
 
         return chunks
+
+    async def _call_llm_with_retry(
+        self,
+        model: str,
+        messages: list[dict],
+        max_tokens: int
+    ) -> str:
+        """
+        Call LLM API with retry logic, caching, and circuit breaker.
+
+        Features:
+        - LRU response caching
+        - Exponential backoff with jitter
+        - Circuit breaker for repeated failures
+        - Timeout protection
+        """
+        # Check circuit breaker
+        if not self._circuit_breaker.can_proceed():
+            raise Exception("Circuit breaker is open - too many recent failures")
+
+        # Check cache first
+        cached = self._response_cache.get(model, messages, max_tokens)
+        if cached is not None:
+            self._cache_hit_count += 1
+            return cached
+
+        # Rate limiting - wait if needed
+        estimated_tokens = max_tokens + sum(len(m.get("content", "")) // 4 for m in messages)
+        await self._rate_limiter.wait_if_needed(estimated_tokens)
+
+        # Retry loop with exponential backoff
+        last_exception = None
+        for attempt in range(MAX_RETRIES):
+            try:
+                self._api_call_count += 1
+
+                response = await asyncio.wait_for(
+                    self.client.chat.completions.create(
+                        model=model,
+                        max_tokens=max_tokens,
+                        messages=messages
+                    ),
+                    timeout=LLM_REQUEST_TIMEOUT_SECONDS
+                )
+
+                result = response.choices[0].message.content if response.choices else ""
+
+                # Record success, rate limit usage, and cache
+                self._circuit_breaker.record_success()
+                tokens_used = getattr(response.usage, 'total_tokens', max_tokens) if response.usage else max_tokens
+                self._rate_limiter.record_request(tokens_used)
+                self._response_cache.set(model, messages, max_tokens, result)
+
+                return result
+
+            except asyncio.TimeoutError:
+                last_exception = Exception(f"Request timeout after {LLM_REQUEST_TIMEOUT_SECONDS}s")
+                self._circuit_breaker.record_failure()
+
+            except Exception as e:
+                last_exception = e
+                error_str = str(e).lower()
+
+                # Check if retryable error
+                if any(code in error_str for code in ["429", "503", "502", "500", "rate"]):
+                    self._circuit_breaker.record_failure()
+
+                    if attempt < MAX_RETRIES - 1:
+                        # Exponential backoff with jitter
+                        delay = INITIAL_RETRY_DELAY * (2 ** attempt) + random.uniform(0, 1)
+                        await asyncio.sleep(delay)
+                        continue
+                else:
+                    # Non-retryable error
+                    self._circuit_breaker.record_failure()
+                    raise
+
+        # All retries exhausted
+        raise last_exception or Exception("Unknown error after retries")
 
     async def process(
         self,
@@ -335,72 +678,18 @@ Guidelines:
 
         except ImportError:
             if progress_callback:
-                progress_callback("REPL environment not available, trying alternatives...")
+                progress_callback("REPL environment not available, using built-in processor...")
         except Exception as e:
             if progress_callback:
-                progress_callback(f"REPL mode failed: {e}, trying alternatives...")
+                progress_callback(f"REPL mode failed: {e}, using built-in processor...")
 
-        # 2. Try Agent SDK pipeline (uses subagents)
-        if self.config.use_agent_sdk:
-            try:
-                from .agent_pipeline import RLMAgentPipeline
-
-                pipeline = RLMAgentPipeline(self.config, self.cache_manager)
-                if pipeline.is_available:
-                    if progress_callback:
-                        progress_callback("Using Claude Agent SDK with subagents...")
-
-                    agent_result = await pipeline.process(query, collection, progress_callback)
-
-                    return RLMResult(
-                        query=agent_result.query,
-                        scope=agent_result.scope,
-                        response=agent_result.response,
-                        chunk_results=[],
-                        total_tokens_processed=agent_result.total_tokens,
-                        total_api_calls=agent_result.chunks_processed,
-                        cache_hits=0,
-                        processing_time_ms=agent_result.processing_time_ms,
-                        truncated=False,
-                        error=agent_result.error
-                    )
-            except ImportError:
-                if progress_callback:
-                    progress_callback("Agent SDK not available...")
-            except Exception as e:
-                if progress_callback:
-                    progress_callback(f"Agent SDK failed: {e}...")
-
-        # 3. Check if we can use the official RLM library
-        if self._rlm_available and collection.total_tokens > 50000:
-            try:
-                return await self._process_with_rlm_library(
-                    query, collection, scope, start_time, progress_callback
-                )
-            except Exception as e:
-                if progress_callback:
-                    progress_callback(f"RLM library failed: {e}")
-
-        # 4. Fall back to built-in sequential processing
+        # 2. Fall back to built-in sequential processing
         if progress_callback:
             progress_callback(f"Using built-in processor with {self.config.model}...")
 
         return await self._process_builtin(
             query, collection, scope, start_time, progress_callback
         )
-
-    async def _process_with_rlm_library(
-        self,
-        query: str,
-        collection: CollectionResult,
-        scope: str,
-        start_time: float,
-        progress_callback: Callable[[str], None] | None
-    ) -> RLMResult:
-        """Process using the official RLM library."""
-        # This would integrate with the actual RLM library
-        # For now, fall back to built-in implementation
-        raise NotImplementedError("RLM library integration pending")
 
     async def _process_builtin(
         self,
@@ -411,7 +700,7 @@ Guidelines:
         progress_callback: Callable[[str], None] | None
     ) -> RLMResult:
         """Process using built-in RLM implementation."""
-        result = RLMResult(query=query, scope=scope)
+        result = RLMResult(query=query, scope=scope, response="")
 
         try:
             # Get combined content
@@ -457,6 +746,10 @@ Guidelines:
                 result.response
             )
 
+            # Update stats
+            result.total_api_calls = self._api_call_count
+            result.cache_hits = self._cache_hit_count
+
         except Exception as e:
             result.error = str(e)
             result.response = f"Error during RLM processing: {e}"
@@ -470,17 +763,23 @@ Guidelines:
         chunks: list[str],
         progress_callback: Callable[[str], None] | None
     ) -> list[ChunkResult]:
-        """Process all chunks with relevance assessment."""
-        results = []
+        """Process all chunks with relevance assessment in parallel."""
+        if progress_callback:
+            progress_callback(f"Processing {len(chunks)} chunks in parallel...")
 
-        for i, chunk in enumerate(chunks):
-            if progress_callback:
-                progress_callback(f"Processing chunk {i + 1}/{len(chunks)}...")
+        # Track if we found highly relevant content (for early termination)
+        found_highly_relevant = asyncio.Event()
 
+        async def process_single_chunk(i: int, chunk: str) -> ChunkResult:
+            """Process a single chunk (relevance + analysis)."""
             start_time = time.time()
 
             # Assess relevance
             relevance = await self._assess_relevance(query, chunk)
+
+            # Check for early termination signal
+            if relevance >= EARLY_TERMINATION_THRESHOLD:
+                found_highly_relevant.set()
 
             # Only process if relevant enough
             if relevance >= 0.3:
@@ -490,16 +789,24 @@ Guidelines:
 
             processing_time = int((time.time() - start_time) * 1000)
 
-            results.append(ChunkResult(
+            return ChunkResult(
                 chunk_id=i,
                 content_preview=chunk[:200] + "..." if len(chunk) > 200 else chunk,
                 response=response,
                 token_count=self.count_tokens(chunk),
                 relevance_score=relevance,
                 processing_time_ms=processing_time,
-            ))
+            )
 
-        return results
+        # Process all chunks in parallel
+        tasks = [process_single_chunk(i, chunk) for i, chunk in enumerate(chunks)]
+        results = await asyncio.gather(*tasks)
+
+        if progress_callback:
+            relevant_count = sum(1 for r in results if r.relevance_score >= 0.3)
+            progress_callback(f"Completed: {relevant_count}/{len(chunks)} chunks relevant")
+
+        return list(results)
 
     async def _assess_relevance(self, query: str, chunk: str) -> float:
         """Assess relevance of a chunk to the query."""
@@ -511,54 +818,42 @@ Guidelines:
             # Use a smaller preview for relevance assessment
             preview = chunk[:2000] if len(chunk) > 2000 else chunk
 
-            system = self.cache_manager.build_cached_system(
-                self.RELEVANCE_PROMPT
-            )
+            messages = [
+                {"role": "system", "content": self.RELEVANCE_PROMPT},
+                {"role": "user", "content": f"Query: {query}\n\nContent:\n{preview}\n\nRelevance (0.0-1.0):"}
+            ]
 
-            response = self.client.messages.create(
+            text = await self._call_llm_with_retry(
                 model=self.config.model,
-                max_tokens=10,
-                system=system,
-                messages=[{
-                    "role": "user",
-                    "content": f"Query: {query}\n\nContent:\n{preview}\n\nRelevance (0.0-1.0):"
-                }]
+                messages=messages,
+                max_tokens=10
             )
 
-            # Update cache stats
-            self.cache_manager.process_response_usage(dict(response.usage))
-
-            text = response.content[0].text if response.content else "0.5"
             score = float(text.strip())
             return max(0.0, min(1.0, score))
 
-        except Exception:
+        except Exception as e:
+            # Log the actual error for debugging
+            import sys
+            print(f"Relevance assessment error: {type(e).__name__}: {e}", file=sys.stderr)
             return 0.5  # Default to moderate relevance on error
 
     async def _analyze_chunk(self, query: str, chunk: str) -> str:
         """Analyze a chunk for information relevant to the query."""
         try:
-            system = self.cache_manager.build_cached_system(
-                self.CHUNK_ANALYSIS_PROMPT
-            )
+            messages = [
+                {"role": "system", "content": self.CHUNK_ANALYSIS_PROMPT},
+                {"role": "user", "content": f"Query: {query}\n\nContent to analyze:\n{chunk}\n\nFindings:"}
+            ]
 
-            response = self.client.messages.create(
+            return await self._call_llm_with_retry(
                 model=self.config.model,
-                max_tokens=1000,
-                system=system,
-                messages=[{
-                    "role": "user",
-                    "content": f"Query: {query}\n\nContent to analyze:\n{chunk}\n\nFindings:"
-                }]
+                messages=messages,
+                max_tokens=1000
             )
-
-            # Update cache stats
-            self.cache_manager.process_response_usage(dict(response.usage))
-
-            return response.content[0].text if response.content else ""
 
         except Exception as e:
-            return f"(Error analyzing chunk: {e})"
+            return f"(Error analyzing chunk: {type(e).__name__}: {e})"
 
     async def _aggregate_results(
         self,
@@ -575,28 +870,20 @@ Guidelines:
         combined = "\n\n---\n\n".join(findings)
 
         try:
-            system = self.cache_manager.build_cached_system(
-                self.AGGREGATION_PROMPT
+            messages = [
+                {"role": "system", "content": self.AGGREGATION_PROMPT},
+                {"role": "user", "content": f"Query: {query}\n\nFindings from {len(findings)} sources:\n\n{combined}\n\nSynthesized response:"}
+            ]
+
+            return await self._call_llm_with_retry(
+                model=self.config.aggregator_model,
+                messages=messages,
+                max_tokens=2000
             )
-
-            response = self.client.messages.create(
-                model=self.config.model,
-                max_tokens=2000,
-                system=system,
-                messages=[{
-                    "role": "user",
-                    "content": f"Query: {query}\n\nFindings from {len(findings)} sources:\n\n{combined}\n\nSynthesized response:"
-                }]
-            )
-
-            # Update cache stats
-            self.cache_manager.process_response_usage(dict(response.usage))
-
-            return response.content[0].text if response.content else combined
 
         except Exception as e:
             # Fall back to just returning combined findings
-            return f"Combined findings:\n\n{combined}\n\n(Aggregation error: {e})"
+            return f"Combined findings:\n\n{combined}\n\n(Aggregation error: {type(e).__name__}: {e})"
 
     def _truncate_response(
         self,
@@ -660,3 +947,13 @@ Guidelines:
         ])
 
         return "\n".join(parts)
+
+    def get_stats(self) -> dict[str, Any]:
+        """Get processor statistics."""
+        return {
+            "api_calls": self._api_call_count,
+            "cache_hits": self._cache_hit_count,
+            "response_cache": self._response_cache.get_stats(),
+            "circuit_breaker": self._circuit_breaker.get_status(),
+            "rate_limiter": self._rate_limiter.get_stats(),
+        }

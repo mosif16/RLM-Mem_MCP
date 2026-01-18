@@ -2,16 +2,11 @@
   "mcpServers": {
     "rlm": {
       "type": "stdio",
-      "command": "python",
+      "command": "/Users/mohammed/Desktop/RLM-Mem_MCP/python/.venv/bin/python",
       "args": ["-m", "rlm_mem_mcp.server"],
-      "cwd": "${workspaceFolder}/python/src",
+      "cwd": "/Users/mohammed/Desktop/RLM-Mem_MCP/python/src",
       "env": {
-        "ANTHROPIC_API_KEY": "${ANTHROPIC_API_KEY}",
-        "RLM_MODEL": "haiku",
-        "RLM_AGGREGATOR_MODEL": "sonnet",
-        "RLM_USE_CACHE": "true",
-        "RLM_CACHE_TTL": "5m",
-        "RLM_USE_AGENT_SDK": "true"
+        "OPENROUTER_API_KEY": "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"
       }
     }
   }
