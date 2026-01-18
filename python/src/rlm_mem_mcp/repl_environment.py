@@ -832,7 +832,7 @@ Start by discovering files, checking for dead code regions, then use verificatio
     async def run_rlm_session(
         self,
         query: str,
-        max_iterations: int = 15
+        max_iterations: int = 25  # Increased from 15 to handle complex queries
     ) -> str:
         """
         Run a complete RLM session.
@@ -875,11 +875,14 @@ Start by exploring the actual content with Python code."""
 
         messages = [{"role": "user", "content": initial_msg}]
 
+        consecutive_failures = 0
+        max_consecutive_failures = 3
+
         for iteration in range(max_iterations):
             # Orchestrating LLM generates code
             response = self.client.chat.completions.create(
                 model=self.config.aggregator_model,
-                max_tokens=4000,
+                max_tokens=6000,  # Increased from 4000 to reduce truncation
                 messages=[
                     {"role": "system", "content": system},
                     *messages
@@ -888,6 +891,16 @@ Start by exploring the actual content with Python code."""
 
             assistant_msg = response.choices[0].message.content if response.choices else ""
 
+            # Detect truncated response (ends mid-code block)
+            if assistant_msg.count("```") % 2 == 1:
+                # Odd number of backticks = unclosed code block = truncated
+                messages.append({"role": "assistant", "content": assistant_msg})
+                messages.append({
+                    "role": "user",
+                    "content": "Your response was truncated mid-code. Please complete the code block and continue."
+                })
+                continue
+
             # Extract code blocks
             code_blocks = self._extract_code_blocks(assistant_msg)
 
@@ -895,24 +908,56 @@ Start by exploring the actual content with Python code."""
                 # No code - check if we have a final answer
                 if self.state.final_answer:
                     return self.state.final_answer
-                return assistant_msg
+
+                # Check if assistant is asking for clarification or done
+                if any(phrase in assistant_msg.lower() for phrase in ["final_answer", "no issues found", "analysis complete", "in conclusion"]):
+                    return assistant_msg
+
+                # No code and no answer - prompt to continue
+                messages.append({"role": "assistant", "content": assistant_msg})
+                messages.append({
+                    "role": "user",
+                    "content": "Please write Python code to analyze the content, or set FINAL_ANSWER with your findings."
+                })
+                continue
 
             # Execute code blocks
             outputs = []
+            any_success = False
             for code in code_blocks:
                 output, success = self.execute_code(code)
                 outputs.append(output if output else "(no output)")
+                if success:
+                    any_success = True
 
                 # Check if FINAL_ANSWER was set
                 if self.state.final_answer:
                     return self.state.final_answer
 
+            # Track consecutive failures for early termination
+            if not any_success:
+                consecutive_failures += 1
+                if consecutive_failures >= max_consecutive_failures:
+                    # Too many failures - return what we have
+                    if self.state.output_history:
+                        return f"Analysis incomplete (code execution failed). Partial findings:\n\n" + \
+                               "\n".join(self.state.output_history[-5:])
+                    return "Analysis failed - code execution errors. Try a more specific query."
+            else:
+                consecutive_failures = 0
+
             # Continue conversation
             execution_results = "\n---\n".join(outputs)
             messages.append({"role": "assistant", "content": assistant_msg})
+
+            # Add progress hint if we're getting close to max iterations
+            progress_hint = ""
+            if iteration >= max_iterations - 5:
+                progress_hint = f" (Iteration {iteration+1}/{max_iterations} - please wrap up soon)"
+
             messages.append({
                 "role": "user",
-                "content": f"Output:\n```\n{execution_results}\n```\n\nContinue or set FINAL_ANSWER."
+                "content": f"Output:\n```\n{execution_results}\n```\n\nContinue or set FINAL_ANSWER.{progress_hint}"
             })
 
         # Return best available answer
