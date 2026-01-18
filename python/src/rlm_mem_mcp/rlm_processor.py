@@ -10,6 +10,15 @@ This processor handles:
 
 The key insight from RLM: store large content OUTSIDE the model's context,
 then have the model write queries to peek at chunks and aggregate findings.
+
+Models Used:
+- Claude Haiku 4.5 (default): Fast, efficient chunk processing
+  - Included in Claude Max subscription at no additional API cost
+  - Perfect for relevance scoring and chunk analysis
+- Claude Sonnet: Used for complex final aggregation when needed
+
+When Claude Agent SDK is available, this processor uses subagents for
+parallel chunk processing. Otherwise, falls back to sequential API calls.
 """
 
 import asyncio
@@ -269,6 +278,11 @@ Guidelines:
         """
         Process a query against collected content using RLM technique.
 
+        Processing order:
+        1. Try Claude Agent SDK with subagents (if available and enabled)
+        2. Try official RLM library (if available)
+        3. Fall back to built-in sequential processing
+
         Args:
             query: The query/question to answer
             collection: Collected files/content to process
@@ -285,6 +299,38 @@ Guidelines:
         if progress_callback:
             progress_callback(f"Processing {scope}...")
 
+        # Try Agent SDK pipeline first (uses Haiku 4.5 for efficiency)
+        if self.config.use_agent_sdk:
+            try:
+                from .agent_pipeline import RLMAgentPipeline
+
+                pipeline = RLMAgentPipeline(self.config, self.cache_manager)
+                if pipeline.is_available:
+                    if progress_callback:
+                        progress_callback("Using Claude Agent SDK with Haiku 4.5...")
+
+                    agent_result = await pipeline.process(query, collection, progress_callback)
+
+                    # Convert AgentPipelineResult to RLMResult
+                    return RLMResult(
+                        query=agent_result.query,
+                        scope=agent_result.scope,
+                        response=agent_result.response,
+                        chunk_results=[],  # Agent SDK handles internally
+                        total_tokens_processed=agent_result.total_tokens,
+                        total_api_calls=agent_result.chunks_processed,
+                        cache_hits=0,  # Agent SDK handles caching
+                        processing_time_ms=agent_result.processing_time_ms,
+                        truncated=False,
+                        error=agent_result.error
+                    )
+            except ImportError:
+                if progress_callback:
+                    progress_callback("Agent SDK not available, using fallback...")
+            except Exception as e:
+                if progress_callback:
+                    progress_callback(f"Agent SDK failed: {e}, using fallback...")
+
         # Check if we can use the official RLM library
         if self._rlm_available and collection.total_tokens > 50000:
             try:
@@ -295,7 +341,10 @@ Guidelines:
                 if progress_callback:
                     progress_callback(f"RLM library failed, using fallback: {e}")
 
-        # Use our built-in RLM implementation
+        # Use our built-in RLM implementation with Haiku 4.5
+        if progress_callback:
+            progress_callback(f"Using built-in processor with {self.config.model}...")
+
         return await self._process_builtin(
             query, collection, scope, start_time, progress_callback
         )

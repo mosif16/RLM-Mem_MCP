@@ -4,8 +4,11 @@
 # MCP SDK for Python
 mcp>=1.0.0
 
-# RLM Library (Recursive Language Models)
-rlm>=0.1.0
+# Claude Agent SDK for orchestration and subagents
+claude-agent-sdk>=0.1.19
+
+# RLM Library (Recursive Language Models) - optional
+# rlm>=0.1.0
 
 # Anthropic SDK with prompt caching support
 anthropic>=0.39.0

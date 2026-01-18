@@ -276,6 +276,16 @@ async def handle_rlm_status(arguments: dict[str, Any]) -> list[TextContent]:
     except ImportError:
         pass
 
+    # Check if Claude Agent SDK is available
+    agent_sdk_installed = False
+    agent_sdk_version = None
+    try:
+        import claude_agent_sdk
+        agent_sdk_installed = True
+        agent_sdk_version = getattr(claude_agent_sdk, "__version__", "unknown")
+    except ImportError:
+        pass
+
     status = {
         "server": {
             "name": server_config.name,
@@ -283,18 +293,26 @@ async def handle_rlm_status(arguments: dict[str, Any]) -> list[TextContent]:
         },
         "configuration": {
             "model": rlm_config.model,
+            "aggregator_model": rlm_config.aggregator_model,
             "backend": rlm_config.backend,
             "api_key_set": bool(rlm_config.api_key),
             "max_result_tokens": rlm_config.max_result_tokens,
             "max_chunk_tokens": rlm_config.max_chunk_tokens,
+            "use_agent_sdk": rlm_config.use_agent_sdk,
         },
         "cache": {
             "enabled": rlm_config.use_cache,
             "ttl": rlm_config.cache_ttl,
             **cache_manager.get_stats(),
         },
+        "agent_sdk": {
+            "installed": agent_sdk_installed,
+            "version": agent_sdk_version,
+            "enabled": rlm_config.use_agent_sdk and agent_sdk_installed,
+        },
         "rlm_library_installed": rlm_installed,
         "memory_entries": len(_memory_store),
+        "claude_max_optimized": True,  # Using Haiku 4.5 by default
     }
 
     # Validate configuration

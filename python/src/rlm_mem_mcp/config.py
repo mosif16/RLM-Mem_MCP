@@ -2,12 +2,19 @@
 Configuration for RLM-Mem MCP Server
 
 Environment Variables:
-- ANTHROPIC_API_KEY: Required for RLM processing
-- RLM_MODEL: Model for RLM processing (default: claude-sonnet-4-5-20241022)
+- ANTHROPIC_API_KEY: Required for RLM processing (or use Claude Max subscription)
+- RLM_MODEL: Model for RLM processing (default: claude-haiku-4-5-20251001)
+- RLM_AGGREGATOR_MODEL: Model for final aggregation (default: claude-sonnet-4-5-20241022)
 - RLM_BACKEND: API backend (default: anthropic)
 - RLM_MAX_RESULT_TOKENS: Maximum tokens in result (default: 4000)
 - RLM_USE_CACHE: Enable prompt caching (default: true)
 - RLM_CACHE_TTL: Cache TTL - "5m" or "1h" (default: 5m)
+- RLM_USE_AGENT_SDK: Use Claude Agent SDK for orchestration (default: true)
+
+Claude Max Subscription:
+- Set ANTHROPIC_API_KEY to your Claude Max API key
+- Haiku 4.5 is included in Claude Max at no additional cost
+- This makes the RLM pipeline extremely cost-effective
 """
 
 import os
@@ -18,14 +25,42 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+# Model aliases for convenience
+MODEL_ALIASES = {
+    "haiku": "claude-haiku-4-5-20251001",
+    "sonnet": "claude-sonnet-4-5-20241022",
+    "opus": "claude-opus-4-20250514",
+}
+
+
+def resolve_model(model: str) -> str:
+    """Resolve model alias to full model name."""
+    return MODEL_ALIASES.get(model.lower(), model)
+
+
 @dataclass
 class RLMConfig:
     """Configuration for RLM processing."""
 
     # API Configuration
     api_key: str = field(default_factory=lambda: os.getenv("ANTHROPIC_API_KEY", ""))
-    model: str = field(default_factory=lambda: os.getenv("RLM_MODEL", "claude-sonnet-4-5-20241022"))
+
+    # Use Haiku 4.5 by default - fast and included in Claude Max
+    model: str = field(default_factory=lambda: resolve_model(
+        os.getenv("RLM_MODEL", "haiku")
+    ))
+
+    # Use Sonnet for complex aggregation tasks
+    aggregator_model: str = field(default_factory=lambda: resolve_model(
+        os.getenv("RLM_AGGREGATOR_MODEL", "sonnet")
+    ))
+
     backend: str = field(default_factory=lambda: os.getenv("RLM_BACKEND", "anthropic"))
+
+    # Claude Agent SDK configuration
+    use_agent_sdk: bool = field(
+        default_factory=lambda: os.getenv("RLM_USE_AGENT_SDK", "true").lower() == "true"
+    )
 
     # Processing Configuration
     max_result_tokens: int = field(
@@ -45,7 +80,9 @@ class RLMConfig:
     cache_ttl: Literal["5m", "1h"] = field(
         default_factory=lambda: os.getenv("RLM_CACHE_TTL", "5m")  # type: ignore
     )
-    min_tokens_for_cache: int = 1024  # Claude Sonnet minimum
+    # Haiku 4.5 requires 2048 tokens minimum for caching
+    # Sonnet requires 1024, Opus requires 4096
+    min_tokens_for_cache: int = 2048  # Claude Haiku 4.5 minimum
 
     # File Collection Configuration
     included_extensions: Set[str] = field(default_factory=lambda: {
