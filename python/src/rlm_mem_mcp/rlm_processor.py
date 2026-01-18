@@ -318,9 +318,10 @@ Your task is to find information relevant to the given query.
 CRITICAL OUTPUT REQUIREMENTS:
 1. ALWAYS include file:line format (e.g., `src/utils.py:42`)
 2. ALWAYS include the actual code snippet showing the issue
-3. Format each finding as:
+3. ALWAYS assign a CONFIDENCE LEVEL to each finding
+4. Format each finding as:
    ```
-   **File:** path/to/file.ext:LINE_NUMBER
+   **File:** path/to/file.ext:LINE_NUMBER [Confidence: HIGH/MEDIUM/LOW]
    **Issue:** Brief description
    **Code:**
    ```language
@@ -328,12 +329,25 @@ CRITICAL OUTPUT REQUIREMENTS:
    ```
    ```
 
+CONFIDENCE LEVELS (REQUIRED):
+- **HIGH**: Code is in active blocks, line verified, finding clearly matches issue type
+- **MEDIUM**: Context unclear, cannot verify reachability, partial pattern match
+- **LOW**: Code in #if false/#if DEBUG blocks, line unverified, signature-only (no body)
+
+DEAD CODE DETECTION:
+- Check for #if false, #if 0, #if DEBUG, #ifdef NEVER blocks
+- Code inside these blocks should be marked [Confidence: LOW - dead code]
+- Swift/ObjC: #if false ... #endif
+- C/C++: #if 0 ... #endif
+- Python: if False: ...
+
 Guidelines:
 - Focus ONLY on the provided content
 - Extract EXACT code snippets (copy from content, don't paraphrase)
 - Count line numbers from file headers (### File: path starts at line 1)
 - If content is not relevant, say "No relevant findings" briefly
-- Be specific and actionable - readers should find the exact location"""
+- Be specific and actionable - readers should find the exact location
+- If uncertain about a finding, use MEDIUM or LOW confidence"""
 
     AGGREGATION_PROMPT = """You are an expert at synthesizing information from multiple sources.
 Your task is to combine findings into a coherent, well-organized response.
@@ -341,29 +355,52 @@ Your task is to combine findings into a coherent, well-organized response.
 CRITICAL: PRESERVE ALL SPECIFIC DETAILS
 - Keep ALL file:line references (e.g., `src/auth.py:42`)
 - Keep ALL code snippets exactly as provided
+- Keep ALL confidence levels [Confidence: HIGH/MEDIUM/LOW]
 - Keep ALL severity ratings and categories
 - Do NOT generalize specific findings into vague summaries
 
+CONFIDENCE HANDLING:
+- Group findings by confidence level (HIGH first, then MEDIUM, then LOW)
+- LOW confidence findings should be labeled "Verify Manually"
+- If a finding is in dead code (#if false, etc.), keep it LOW confidence
+
 Output Format:
 ## Summary
-Brief overview of findings count and categories
+Brief overview: X high-confidence, Y medium-confidence, Z low-confidence findings
 
-## Findings
+## High Confidence Findings
+These findings are verified and in active code.
 
-### [Category 1]
-**file.py:LINE** - Description
+### [Category]
+**file.py:LINE** [Confidence: HIGH] - Description
 ```language
 actual code snippet
 ```
 
-### [Category 2]
-...
+## Medium Confidence Findings
+These findings need additional verification.
+
+### [Category]
+**file.py:LINE** [Confidence: MEDIUM] - Description
+```language
+actual code snippet
+```
+
+## Low Confidence Findings (Verify Manually)
+These may be false positives (dead code, unverified lines, etc.)
+
+### [Category]
+**file.py:LINE** [Confidence: LOW - reason] - Description
+```language
+actual code snippet
+```
 
 Guidelines:
-- Group similar findings by category/severity
+- Group similar findings by category within each confidence level
 - Remove exact duplicates only (same file, same line, same issue)
 - Preserve unique findings even if similar
-- If findings conflict, note the discrepancy with both locations"""
+- If findings conflict, note the discrepancy with both locations
+- Dead code findings (#if false, #if DEBUG) should always be LOW confidence"""
 
     def __init__(
         self,
