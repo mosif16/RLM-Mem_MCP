@@ -21,9 +21,117 @@ from typing import Any, Callable
 from io import StringIO
 import sys
 
-import anthropic
+from openai import OpenAI
 
 from .config import RLMConfig
+
+
+# Dangerous attribute names that could be used for sandbox escapes
+FORBIDDEN_ATTRIBUTES = frozenset({
+    '__class__', '__base__', '__bases__', '__subclasses__',
+    '__mro__', '__globals__', '__builtins__', '__code__',
+    '__reduce__', '__reduce_ex__', '__getattribute__',
+    '__setattr__', '__delattr__', '__init_subclass__',
+    '__set_name__', '__repr__', '__str__', '__bytes__',
+    '__dict__', '__closure__', '__func__', '__self__',
+    '__module__', '__qualname__', '__annotations__',
+    '__wrapped__', 'gi_frame', 'gi_code', 'f_globals',
+    'f_locals', 'f_builtins', 'co_code', 'func_globals',
+})
+
+# Forbidden function names
+FORBIDDEN_CALLS = frozenset({
+    'eval', 'exec', 'compile', 'open', 'input', '__import__',
+    'getattr', 'setattr', 'delattr', 'globals', 'locals',
+    'vars', 'dir', 'breakpoint', 'exit', 'quit',
+})
+
+
+class UnsafeCodeError(Exception):
+    """Raised when code contains potentially unsafe constructs."""
+    pass
+
+
+class CodeValidator(ast.NodeVisitor):
+    """
+    AST validator to detect potentially dangerous code patterns.
+
+    Blocks:
+    - Access to dunder attributes (__class__, __globals__, etc.)
+    - Dangerous function calls (eval, exec, open, etc.)
+    - Import statements
+    - Attribute chains that could escape sandbox
+    """
+
+    def __init__(self):
+        self.errors: list[str] = []
+
+    def visit_Attribute(self, node: ast.Attribute) -> None:
+        """Check for forbidden attribute access."""
+        if node.attr in FORBIDDEN_ATTRIBUTES:
+            self.errors.append(f"Forbidden attribute access: '{node.attr}'")
+        elif node.attr.startswith('_') and not node.attr.startswith('__'):
+            # Allow single underscore but warn about double underscore
+            pass
+        self.generic_visit(node)
+
+    def visit_Name(self, node: ast.Name) -> None:
+        """Check for forbidden name access."""
+        if node.id in FORBIDDEN_CALLS:
+            self.errors.append(f"Forbidden name: '{node.id}'")
+        self.generic_visit(node)
+
+    def visit_Call(self, node: ast.Call) -> None:
+        """Check for forbidden function calls."""
+        # Check direct calls like eval(), exec()
+        if isinstance(node.func, ast.Name):
+            if node.func.id in FORBIDDEN_CALLS:
+                self.errors.append(f"Forbidden function call: '{node.func.id}'")
+        # Check method calls
+        elif isinstance(node.func, ast.Attribute):
+            if node.func.attr in FORBIDDEN_CALLS:
+                self.errors.append(f"Forbidden method call: '{node.func.attr}'")
+        self.generic_visit(node)
+
+    def visit_Import(self, node: ast.Import) -> None:
+        """Block import statements."""
+        names = ', '.join(alias.name for alias in node.names)
+        self.errors.append(f"Import statements not allowed: 'import {names}'")
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        """Block from...import statements."""
+        self.errors.append(f"Import statements not allowed: 'from {node.module} import ...'")
+
+    def validate(self, code: str) -> tuple[bool, list[str]]:
+        """
+        Validate code for safety.
+
+        Returns:
+            (is_safe, errors) tuple
+        """
+        self.errors = []
+
+        try:
+            tree = ast.parse(code)
+            self.visit(tree)
+        except SyntaxError as e:
+            self.errors.append(f"Syntax error: {e}")
+
+        return len(self.errors) == 0, self.errors
+
+
+def validate_code(code: str) -> tuple[bool, list[str]]:
+    """
+    Validate Python code for sandbox safety.
+
+    Args:
+        code: Python source code to validate
+
+    Returns:
+        (is_safe, errors) tuple
+    """
+    validator = CodeValidator()
+    return validator.validate(code)
 
 
 @dataclass
@@ -116,7 +224,14 @@ Write Python code to answer this. Execute step by step.'''
 
     def __init__(self, config: RLMConfig):
         self.config = config
-        self.client = anthropic.Anthropic(api_key=config.api_key)
+        self.client = OpenAI(
+            api_key=config.api_key,
+            base_url=config.api_base_url,
+            default_headers={
+                "HTTP-Referer": "https://github.com/mosif16/RLM-Mem_MCP",
+                "X-Title": "RLM-Mem MCP Server"
+            }
+        )
         self.state = REPLState()
 
     def initialize(self, content: str) -> None:
@@ -143,13 +258,13 @@ Write Python code to answer this. Execute step by step.'''
             query_id = f"llm_response_{self.state.query_counter}"
 
             try:
-                response = self.client.messages.create(
-                    model=self.config.model,  # Haiku 4.5
+                response = self.client.chat.completions.create(
+                    model=self.config.model,  # Gemini 2.5 Flash
                     max_tokens=max_tokens,
                     messages=[{"role": "user", "content": text}]
                 )
 
-                result = response.content[0].text if response.content else ""
+                result = response.choices[0].message.content if response.choices else ""
 
                 # Store FULL response (paper: variables as buffers)
                 self.state.llm_responses[query_id] = result
@@ -158,7 +273,7 @@ Write Python code to answer this. Execute step by step.'''
                 return result
 
             except Exception as e:
-                error_msg = f"llm_query error: {e}"
+                error_msg = f"llm_query error: {type(e).__name__}: {e}"
                 self.state.llm_responses[query_id] = error_msg
                 return error_msg
 
@@ -166,8 +281,15 @@ Write Python code to answer this. Execute step by step.'''
 
     def _create_safe_globals(self) -> dict[str, Any]:
         """Create a restricted execution environment."""
-        # Allow safe builtins only
+        # Allow safe builtins only - REMOVED dangerous ones:
+        # - getattr, setattr, delattr: can bypass attribute restrictions
+        # - type: can be used for metaclass attacks
+        # - hasattr: internally uses getattr
+        # - eval, exec, compile: code execution
+        # - open, input: I/O operations
+        # - __import__: module imports
         safe_builtins = {
+            # Type constructors (safe)
             "len": len,
             "str": str,
             "int": int,
@@ -177,6 +299,8 @@ Write Python code to answer this. Execute step by step.'''
             "dict": dict,
             "tuple": tuple,
             "set": set,
+            "frozenset": frozenset,
+            # Iteration helpers (safe)
             "range": range,
             "enumerate": enumerate,
             "zip": zip,
@@ -184,16 +308,22 @@ Write Python code to answer this. Execute step by step.'''
             "filter": filter,
             "sorted": sorted,
             "reversed": reversed,
+            # Aggregation (safe)
             "min": min,
             "max": max,
             "sum": sum,
             "any": any,
             "all": all,
+            "abs": abs,
+            "round": round,
+            # Output (safe)
             "print": print,
+            # Type checking (safe - isinstance doesn't allow attribute access)
             "isinstance": isinstance,
-            "type": type,
-            "hasattr": hasattr,
-            "getattr": getattr,
+            # String operations
+            "ord": ord,
+            "chr": chr,
+            "repr": repr,
         }
 
         return {
@@ -215,6 +345,13 @@ Write Python code to answer this. Execute step by step.'''
         Returns:
             (output, success) tuple
         """
+        # SECURITY: Validate code with AST analysis BEFORE execution
+        is_safe, validation_errors = validate_code(code)
+        if not is_safe:
+            error_msg = "Code rejected for security reasons:\n" + "\n".join(f"  - {e}" for e in validation_errors)
+            self.state.output_history.append(error_msg)
+            return error_msg, False
+
         self.state.code_history.append(code)
 
         exec_globals = self._create_safe_globals()
@@ -285,15 +422,17 @@ Write Python code to answer: {query}"""
         messages = [{"role": "user", "content": initial_msg}]
 
         for iteration in range(max_iterations):
-            # Orchestrating LLM (Sonnet) generates code
-            response = self.client.messages.create(
+            # Orchestrating LLM generates code
+            response = self.client.chat.completions.create(
                 model=self.config.aggregator_model,
                 max_tokens=4000,
-                system=system,
-                messages=messages
+                messages=[
+                    {"role": "system", "content": system},
+                    *messages
+                ]
             )
 
-            assistant_msg = response.content[0].text if response.content else ""
+            assistant_msg = response.choices[0].message.content if response.choices else ""
 
             # Extract code blocks
             code_blocks = self._extract_code_blocks(assistant_msg)
