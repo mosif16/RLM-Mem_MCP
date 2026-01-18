@@ -44,9 +44,11 @@ from mcp.types import (
 
 from .config import get_config, RLMConfig, ServerConfig
 from .file_collector import FileCollector
-from .rlm_processor import RLMProcessor
+from .rlm_processor import RLMProcessor, SemanticCache, ProgressEvent
 from .cache_manager import CacheManager
 from .utils import get_memory_monitor, get_metrics_collector
+from .result_verifier import ResultVerifier, BatchVerifier
+from .project_analyzer import ProjectAnalyzer
 
 
 # Input validation constants
@@ -93,6 +95,9 @@ _server_config: ServerConfig | None = None
 _file_collector: FileCollector | None = None
 _rlm_processor: RLMProcessor | None = None
 _cache_manager: CacheManager | None = None
+_semantic_cache: SemanticCache | None = None
+_result_verifier: ResultVerifier | None = None
+_project_analyzer: ProjectAnalyzer | None = None
 
 # Memory store with inverted tag index for O(1) lookups
 _memory_store: dict[str, Any] = {}
@@ -105,17 +110,21 @@ _shutdown_event: asyncio.Event | None = None
 _memory_monitor = get_memory_monitor(max_bytes=2_000_000_000)  # 2GB limit
 
 
-def get_instances() -> tuple[RLMConfig, ServerConfig, FileCollector, RLMProcessor, CacheManager]:
+def get_instances() -> tuple[RLMConfig, ServerConfig, FileCollector, RLMProcessor, CacheManager, SemanticCache, ResultVerifier, ProjectAnalyzer]:
     """Get or create singleton instances."""
     global _rlm_config, _server_config, _file_collector, _rlm_processor, _cache_manager
+    global _semantic_cache, _result_verifier, _project_analyzer
 
     if _rlm_config is None:
         _rlm_config, _server_config = get_config()
         _cache_manager = CacheManager(_rlm_config)
         _file_collector = FileCollector(_rlm_config)
         _rlm_processor = RLMProcessor(_rlm_config, _cache_manager)
+        _semantic_cache = SemanticCache(similarity_threshold=0.85, max_size=100)
+        _result_verifier = ResultVerifier(strict_mode=False)
+        _project_analyzer = ProjectAnalyzer()
 
-    return _rlm_config, _server_config, _file_collector, _rlm_processor, _cache_manager
+    return _rlm_config, _server_config, _file_collector, _rlm_processor, _cache_manager, _semantic_cache, _result_verifier, _project_analyzer
 
 
 async def cleanup_resources() -> None:
@@ -292,7 +301,7 @@ def create_server() -> Server:
 
 
 async def handle_rlm_analyze(arguments: dict[str, Any]) -> list[TextContent]:
-    """Handle rlm_analyze tool call."""
+    """Handle rlm_analyze tool call with semantic caching and result verification."""
     start_time = time.time()
 
     query = arguments.get("query", "")
@@ -322,7 +331,7 @@ async def handle_rlm_analyze(arguments: dict[str, Any]) -> list[TextContent]:
         if not is_valid:
             return [TextContent(type="text", text=f"Error: invalid path '{path}': {error}")]
 
-    rlm_config, _, file_collector, rlm_processor, _ = get_instances()
+    rlm_config, _, file_collector, rlm_processor, _, semantic_cache, result_verifier, project_analyzer = get_instances()
 
     # Validate config
     errors = rlm_config.validate()
@@ -340,23 +349,55 @@ async def handle_rlm_analyze(arguments: dict[str, Any]) -> list[TextContent]:
             error_msg += f": {'; '.join(collection.errors)}"
         return [TextContent(type="text", text=error_msg)]
 
+    # Check semantic cache for similar query
+    context_summary = ", ".join(f.relative_path for f in collection.files[:50])
+    cached_response, similarity = semantic_cache.get_similar(query, context_summary)
+
+    if cached_response:
+        _log_timing("semantic_cache:hit", start_time, similarity=similarity)
+        output = f"## Cached Result (similarity: {similarity:.2f})\n\n{cached_response}"
+        return [TextContent(type="text", text=output)]
+
+    # Analyze project for context
+    project_info = project_analyzer.analyze(collection)
+    _log_timing("project_analysis", start_time, project_type=project_info.project_type)
+
     # Analyze query and use decomposition for broad queries
     query_analysis = rlm_processor.analyze_query_quality(query)
     _log_timing("query_analysis", start_time, is_broad=query_analysis["is_broad"], query_type=query_analysis["query_type"])
 
+    # Progress callback that logs to stderr for visibility
+    def progress_log(msg: str) -> None:
+        import sys
+        print(f"[RLM Progress] {msg}", file=sys.stderr)
+
     # Process with RLM (auto-decompose if broad)
     _log_timing("rlm_process:start", start_time)
-    result = await rlm_processor.process_with_decomposition(query, collection)
+    result = await rlm_processor.process_with_decomposition(query, collection, progress_callback=progress_log)
     _log_timing("rlm_process:complete", start_time, chunks=len(result.chunk_results))
 
     # Format output
     output = rlm_processor.format_result(result)
 
-    return [TextContent(type="text", text=output)]
+    # Verify findings and add verification summary
+    verified_output, verification_stats = result_verifier.verify_findings(output, collection)
+    _log_timing("verification", start_time,
+                verified=verification_stats.verified_files,
+                invalid=verification_stats.invalid_lines)
+
+    # Cache the result for future similar queries
+    semantic_cache.set(query, context_summary, verified_output)
+
+    # Add project context if relevant
+    if project_info.key_files:
+        project_context = f"\n\n## Project Context\n- Type: {project_info.project_type}\n- Key files from docs: {', '.join(project_info.key_files[:10])}"
+        verified_output += project_context
+
+    return [TextContent(type="text", text=verified_output)]
 
 
 async def handle_rlm_query_text(arguments: dict[str, Any]) -> list[TextContent]:
-    """Handle rlm_query_text tool call."""
+    """Handle rlm_query_text tool call with result verification."""
     start_time = time.time()
 
     query = arguments.get("query", "")
@@ -375,12 +416,21 @@ async def handle_rlm_query_text(arguments: dict[str, Any]) -> list[TextContent]:
     if len(text) > MAX_TEXT_LENGTH:
         return [TextContent(type="text", text=f"Error: text too long ({len(text)} > {MAX_TEXT_LENGTH} chars)")]
 
-    rlm_config, _, file_collector, rlm_processor, _ = get_instances()
+    rlm_config, _, file_collector, rlm_processor, _, semantic_cache, result_verifier, _ = get_instances()
 
     # Validate config
     errors = rlm_config.validate()
     if errors:
         return [TextContent(type="text", text=f"Configuration error: {'; '.join(errors)}")]
+
+    # Check semantic cache
+    context_summary = f"text:{len(text)}chars"
+    cached_response, similarity = semantic_cache.get_similar(query, context_summary)
+
+    if cached_response:
+        _log_timing("semantic_cache:hit", start_time, similarity=similarity)
+        output = f"## Cached Result (similarity: {similarity:.2f})\n\n{cached_response}"
+        return [TextContent(type="text", text=output)]
 
     # Create collection from text (use async version)
     collection = await file_collector.collect_text_async(text, "input_text")
@@ -393,12 +443,15 @@ async def handle_rlm_query_text(arguments: dict[str, Any]) -> list[TextContent]:
     # Format output
     output = rlm_processor.format_result(result)
 
+    # Cache result
+    semantic_cache.set(query, context_summary, output)
+
     return [TextContent(type="text", text=output)]
 
 
 async def handle_rlm_status(arguments: dict[str, Any]) -> list[TextContent]:
-    """Handle rlm_status tool call."""
-    rlm_config, server_config, file_collector, rlm_processor, _ = get_instances()
+    """Handle rlm_status tool call with semantic cache stats."""
+    rlm_config, server_config, file_collector, rlm_processor, _, semantic_cache, _, _ = get_instances()
 
     # Get memory and metrics stats
     memory_stats = _memory_monitor.get_stats()
@@ -421,6 +474,7 @@ async def handle_rlm_status(arguments: dict[str, Any]) -> list[TextContent]:
         "performance": {
             "token_cache": file_collector.get_cache_stats(),
             "processor": rlm_processor.get_stats(),
+            "semantic_cache": semantic_cache.get_stats(),
             "metrics": metrics_stats,
         },
         "resources": {

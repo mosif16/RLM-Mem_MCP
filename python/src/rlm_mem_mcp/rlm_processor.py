@@ -38,6 +38,7 @@ import tiktoken
 from .config import RLMConfig
 from .cache_manager import CacheManager
 from .file_collector import CollectionResult
+from .incremental_cache import IncrementalCache, get_incremental_cache
 
 
 # Performance tuning constants
@@ -54,16 +55,28 @@ RATE_LIMIT_REQUESTS_PER_MINUTE = 60  # Max requests per minute
 RATE_LIMIT_TOKENS_PER_MINUTE = 100_000  # Max tokens per minute
 
 # Query quality detection - patterns that indicate overly broad queries
+# NOTE: These patterns should NOT have $ anchor - we want partial matching
 BROAD_QUERY_PATTERNS = [
-    r"^(audit|check|review|analyze|find)\s+(everything|all|the\s+codebase|this\s+codebase)$",
-    r"^find\s+(all\s+)?(problems|issues|bugs)$",
-    r"^(security\s+)?audit$",
-    r"^check\s+security$",
-    r"^review\s+code$",
-    r"^summarize$",
+    # Audit/review patterns (no $ anchor for partial matching)
+    r"^(audit|check|review|analyze|find)\s+(everything|all|the\s+codebase|this\s+codebase)",
+    r"^find\s+(all\s+)?(problems|issues|bugs)",
+    r"^(security\s+)?audit",
+    r"^check\s+(for\s+)?security",
+    r"^review\s+(the\s+)?code",
+    r"^summarize",
+    # Common vague patterns
+    r"^find\s+security\s+(issues|problems|vulnerabilities)$",
+    r"^(look\s+for|search\s+for)\s+(issues|problems|bugs)",
+    r"^what.*wrong",
+    r"^any\s+(issues|problems|bugs)",
+    # iOS/Swift specific broad patterns
+    r"^find\s+(force\s+)?unwraps?$",
+    r"^check\s+(for\s+)?(memory\s+)?leaks?$",
+    r"^find\s+swift\s+(issues|problems)$",
+    r"^review\s+(ios|swift)\s+code$",
 ]
 
-# Decomposition templates for broad query types
+# Enhanced decomposition templates with file hints for smarter targeting
 QUERY_DECOMPOSITIONS = {
     "security": [
         "Find INJECTION vulnerabilities: SQL injection via string concatenation, command injection via subprocess/os.system/exec, code injection via eval/exec. For each: file:line, code snippet, severity.",
@@ -81,7 +94,68 @@ QUERY_DECOMPOSITIONS = {
         "Map DEPENDENCIES: which modules import which, external dependencies used.",
         "Find ARCHITECTURAL concerns: circular dependencies, god classes, tight coupling.",
     ],
+    "ios": [
+        "Find FORCE UNWRAPS: Look for '!' used for force unwrapping optionals (NOT '!=' comparisons). Match patterns like 'variable!.method', 'try!', 'as!'. For each: file:line, code snippet, risk level.",
+        "Find MEMORY LEAKS: Look for closures missing [weak self], strong reference cycles, retain cycles in delegates. For each: file:line, code snippet.",
+        "Find THREAD SAFETY: Main thread violations (UI updates from background), missing DispatchQueue.main. For each: file:line, code snippet.",
+        "Find HARDCODED STRINGS: Hardcoded URLs, API endpoints, user-facing strings not in Localizable.strings. For each: file:line, code snippet.",
+    ],
 }
+
+# V2: Enhanced decomposition with file hints for targeted analysis
+QUERY_DECOMPOSITIONS_V2 = {
+    "security": {
+        "sub_queries": [
+            "Find INJECTION: SQL via string concat, command via subprocess/exec",
+            "Find SECRETS: hardcoded API keys, passwords, tokens",
+            "Find AUTH issues: missing checks, weak sessions",
+            "Find DATA exposure: logging sensitive data, insecure storage",
+        ],
+        "file_hints": ["auth", "login", "session", "api", "database", "secret", "credential", "password"],
+    },
+    "ios_app": {
+        "sub_queries": [
+            "Find StoreKit/IAP integration in *Manager.swift and *Service.swift",
+            "Find UI components in *View.swift and *ViewController.swift",
+            "Find data models in *Model.swift and Core Data files",
+            "Find extension targets in *Extension directories",
+        ],
+        "file_hints": ["View", "Controller", "Manager", "Model", "Extension", "Widget", "StoreKit", "Subscription"],
+    },
+    "quality": {
+        "sub_queries": [
+            "Find functions over 50 lines",
+            "Find deeply nested code (3+ levels)",
+            "Find error handling issues",
+        ],
+        "file_hints": [],  # Applies to all files
+    },
+    "architecture": {
+        "sub_queries": [
+            "Map all modules and their purposes",
+            "Map dependencies between modules",
+            "Find architectural concerns",
+        ],
+        "file_hints": [],  # Applies to all files
+    },
+}
+
+
+@dataclass
+class ProgressEvent:
+    """Structured progress event for streaming updates."""
+    event_type: str  # "start", "file_collected", "chunk_analyzed", "finding_verified", "complete", "error"
+    message: str
+    progress_percent: float
+    details: dict = field(default_factory=dict)
+
+    def to_dict(self) -> dict:
+        return {
+            "event_type": self.event_type,
+            "message": self.message,
+            "progress_percent": self.progress_percent,
+            "details": self.details,
+        }
 
 
 @dataclass
@@ -311,6 +385,200 @@ class LLMResponseCache:
         self._cache.clear()
 
 
+class SemanticCache:
+    """
+    Cache with semantic similarity matching.
+
+    Uses embeddings to find similar queries instead of exact hash matching.
+    This dramatically improves cache hit rates for RLM workloads where
+    queries are similar but not identical.
+    """
+
+    def __init__(
+        self,
+        similarity_threshold: float = 0.85,
+        max_size: int = 100,
+        ttl_seconds: int = 3600
+    ):
+        self.similarity_threshold = similarity_threshold
+        self.max_size = max_size
+        self.ttl_seconds = ttl_seconds
+        self._cache: dict[str, tuple[str, list[float], float, str]] = {}  # key -> (response, embedding, timestamp, query_summary)
+        self._embedder = None
+        self._hits = 0
+        self._misses = 0
+        self._embedding_available = False
+
+        # Try to initialize embedder
+        self._init_embedder()
+
+    def _init_embedder(self) -> None:
+        """Initialize the sentence transformer for embeddings."""
+        try:
+            from sentence_transformers import SentenceTransformer
+            # Use a small, fast model - good balance of speed and quality
+            self._embedder = SentenceTransformer('all-MiniLM-L6-v2')
+            self._embedding_available = True
+        except ImportError:
+            # sentence-transformers not installed, fall back to simple matching
+            self._embedding_available = False
+        except Exception:
+            self._embedding_available = False
+
+    def _get_embedding(self, text: str) -> list[float] | None:
+        """Get embedding for text. Returns None if embeddings unavailable."""
+        if not self._embedding_available or self._embedder is None:
+            return None
+
+        try:
+            # Truncate to avoid memory issues
+            text = text[:2000]
+            embedding = self._embedder.encode(text)
+            return embedding.tolist()
+        except Exception:
+            return None
+
+    def _cosine_similarity(self, a: list[float], b: list[float]) -> float:
+        """Compute cosine similarity between two vectors."""
+        if len(a) != len(b):
+            return 0.0
+
+        dot_product = sum(x * y for x, y in zip(a, b))
+        norm_a = sum(x * x for x in a) ** 0.5
+        norm_b = sum(x * x for x in b) ** 0.5
+
+        if norm_a == 0 or norm_b == 0:
+            return 0.0
+
+        return dot_product / (norm_a * norm_b)
+
+    def _make_key_text(self, query: str, context_summary: str) -> str:
+        """Create text for embedding from query and context."""
+        return f"{query}\n---\n{context_summary[:500]}"
+
+    def get_similar(self, query: str, context_summary: str) -> tuple[str | None, float]:
+        """
+        Find cached response with similar query+context.
+
+        Args:
+            query: The user's query
+            context_summary: Summary of the file context (e.g., file list)
+
+        Returns:
+            (cached_response, similarity_score) - response is None if no match found
+        """
+        key_text = self._make_key_text(query, context_summary)
+
+        # Try embedding-based search first
+        if self._embedding_available:
+            query_embedding = self._get_embedding(key_text)
+            if query_embedding:
+                return self._search_by_embedding(query_embedding)
+
+        # Fall back to simple keyword matching
+        return self._search_by_keywords(query)
+
+    def _search_by_embedding(self, query_embedding: list[float]) -> tuple[str | None, float]:
+        """Search cache using embedding similarity."""
+        best_match = None
+        best_similarity = 0.0
+        now = time.time()
+
+        expired_keys = []
+        for key, (response, cached_embedding, timestamp, _) in self._cache.items():
+            # Check expiration
+            if now - timestamp > self.ttl_seconds:
+                expired_keys.append(key)
+                continue
+
+            similarity = self._cosine_similarity(query_embedding, cached_embedding)
+            if similarity > best_similarity and similarity >= self.similarity_threshold:
+                best_similarity = similarity
+                best_match = response
+
+        # Clean up expired entries
+        for key in expired_keys:
+            del self._cache[key]
+
+        if best_match:
+            self._hits += 1
+        else:
+            self._misses += 1
+
+        return best_match, best_similarity
+
+    def _search_by_keywords(self, query: str) -> tuple[str | None, float]:
+        """Fallback: search cache using keyword matching."""
+        query_words = set(query.lower().split())
+        if len(query_words) < 2:
+            self._misses += 1
+            return None, 0.0
+
+        best_match = None
+        best_score = 0.0
+        now = time.time()
+
+        for key, (response, _, timestamp, cached_query) in self._cache.items():
+            if now - timestamp > self.ttl_seconds:
+                continue
+
+            cached_words = set(cached_query.lower().split())
+            if len(cached_words) < 2:
+                continue
+
+            # Jaccard similarity
+            intersection = len(query_words & cached_words)
+            union = len(query_words | cached_words)
+            score = intersection / union if union > 0 else 0
+
+            if score > best_score and score >= 0.7:  # Higher threshold for keyword matching
+                best_score = score
+                best_match = response
+
+        if best_match:
+            self._hits += 1
+        else:
+            self._misses += 1
+
+        return best_match, best_score
+
+    def set(self, query: str, context_summary: str, response: str) -> None:
+        """Cache a response with its query embedding."""
+        key_text = self._make_key_text(query, context_summary)
+
+        # Get embedding
+        embedding = self._get_embedding(key_text) or []
+
+        # Create unique key
+        key = hashlib.sha256(key_text.encode()).hexdigest()[:16]
+
+        # Remove oldest if at capacity
+        while len(self._cache) >= self.max_size:
+            oldest_key = next(iter(self._cache))
+            del self._cache[oldest_key]
+
+        self._cache[key] = (response, embedding, time.time(), query)
+
+    def get_stats(self) -> dict[str, Any]:
+        """Get cache statistics."""
+        total = self._hits + self._misses
+        return {
+            "hits": self._hits,
+            "misses": self._misses,
+            "hit_rate": self._hits / total if total > 0 else 0,
+            "size": len(self._cache),
+            "max_size": self.max_size,
+            "embedding_available": self._embedding_available,
+            "similarity_threshold": self.similarity_threshold,
+        }
+
+    def clear(self) -> None:
+        """Clear the cache."""
+        self._cache.clear()
+        self._hits = 0
+        self._misses = 0
+
+
 class RLMProcessor:
     """
     Recursive Language Model processor.
@@ -435,7 +703,8 @@ Guidelines:
     def __init__(
         self,
         config: RLMConfig | None = None,
-        cache_manager: CacheManager | None = None
+        cache_manager: CacheManager | None = None,
+        incremental_cache: IncrementalCache | None = None
     ):
         self.config = config or RLMConfig()
         self.cache_manager = cache_manager  # Keep for interface compatibility
@@ -465,6 +734,9 @@ Guidelines:
         self._rate_limiter = RateLimiter()
         self._api_call_count = 0
         self._cache_hit_count = 0
+
+        # Incremental file cache for skipping unchanged files
+        self._incremental_cache = incremental_cache or get_incremental_cache()
 
     async def close(self) -> None:
         """Close the HTTP client and cleanup resources."""
@@ -517,7 +789,9 @@ Guidelines:
 
         # Detect query type
         query_type = "general"
-        if any(kw in query_lower for kw in ["security", "vulnerab", "injection", "xss", "csrf", "secret", "password", "auth"]):
+        if any(kw in query_lower for kw in ["swift", "ios", "xcode", "unwrap", "swiftui", "uikit", "storekit", "widget"]):
+            query_type = "ios"
+        elif any(kw in query_lower for kw in ["security", "vulnerab", "injection", "xss", "csrf", "secret", "password", "auth"]):
             query_type = "security"
         elif any(kw in query_lower for kw in ["quality", "code smell", "refactor", "clean", "duplicate", "complexity"]):
             query_type = "quality"
@@ -882,11 +1156,23 @@ Guidelines:
 
             processing_time = int((time.time() - start_time) * 1000)
 
+            # Create ChunkResult entries from REPL iterations for progress tracking
+            chunk_results = []
+            for i, resp in enumerate(all_responses):
+                chunk_results.append(ChunkResult(
+                    chunk_id=i,
+                    content_preview=f"REPL iteration {i+1}",
+                    response=resp[:500] if resp else "",
+                    token_count=self.count_tokens(resp) if resp else 0,
+                    relevance_score=1.0,  # REPL responses are always relevant
+                    processing_time_ms=processing_time // max(len(all_responses), 1),
+                ))
+
             return RLMResult(
                 query=query,
-                scope=scope,
+                scope=f"{scope} (REPL mode: {len(all_responses)} iterations)",
                 response=response,
-                chunk_results=[],
+                chunk_results=chunk_results,
                 total_tokens_processed=collection.total_tokens,
                 total_api_calls=len(all_responses),
                 cache_hits=0,
@@ -1183,4 +1469,77 @@ Guidelines:
             "response_cache": self._response_cache.get_stats(),
             "circuit_breaker": self._circuit_breaker.get_status(),
             "rate_limiter": self._rate_limiter.get_stats(),
+            "incremental_cache": self._incremental_cache.get_stats().to_dict(),
         }
+
+    def get_cached_file_analysis(
+        self,
+        file_path: str,
+        content: str,
+        query: str
+    ) -> str | None:
+        """
+        Get cached analysis for a file if available and unchanged.
+
+        Args:
+            file_path: The file path
+            content: Current file content
+            query: The analysis query
+
+        Returns:
+            Cached analysis result if valid, None if cache miss
+        """
+        cached = self._incremental_cache.get_cached_analysis(file_path, content, query)
+        if cached:
+            return cached.result
+        return None
+
+    def cache_file_analysis(
+        self,
+        file_path: str,
+        content: str,
+        query: str,
+        result: str,
+        confidence: float = 1.0
+    ) -> None:
+        """
+        Cache an analysis result for a file.
+
+        Args:
+            file_path: The file path
+            content: The file content
+            query: The analysis query
+            result: The analysis result
+            confidence: Confidence in the result (0.0-1.0)
+        """
+        self._incremental_cache.cache_analysis(
+            file_path, content, query, result, confidence
+        )
+
+    def get_changed_files(
+        self,
+        collection: CollectionResult
+    ) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+        """
+        Partition collected files into changed and unchanged.
+
+        Args:
+            collection: The file collection
+
+        Returns:
+            (changed_files, unchanged_files) where each is list of (path, content)
+        """
+        files = [(f.relative_path, f.content) for f in collection.files]
+        return self._incremental_cache.get_changed_files(files)
+
+    def invalidate_cache(self, path: str | None = None) -> int:
+        """
+        Invalidate incremental cache entries.
+
+        Args:
+            path: Specific path to invalidate, or None for all
+
+        Returns:
+            Number of entries invalidated
+        """
+        return self._incremental_cache.invalidate(path)

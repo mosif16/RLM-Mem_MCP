@@ -40,6 +40,7 @@ from .content_analyzer import (
     DeadCodeRegion,
     Confidence,
 )
+from .fallback_analyzer import FallbackAnalyzer
 
 
 # Dangerous attribute names that could be used for sandbox escapes
@@ -80,14 +81,21 @@ def attempt_syntax_repair(code: str, error: SyntaxError) -> tuple[str | None, st
         (repaired_code, repair_description) - repaired_code is None if repair failed
     """
     error_msg = str(error).lower()
+    repairs = []
 
-    # Handle unterminated triple-quoted strings
+    # 1. Remove markdown code fences (very common LLM mistake)
+    if code.startswith("```") or "```python" in code or "```\n" in code:
+        # Remove opening fence
+        code = re.sub(r'^```(?:python|py)?\s*\n?', '', code)
+        # Remove closing fence
+        code = re.sub(r'\n?```\s*$', '', code)
+        repairs.append("Removed markdown code fences")
+
+    # 2. Handle unterminated triple-quoted strings
     if "unterminated triple-quoted string" in error_msg or "unterminated string" in error_msg:
         # Count triple quotes to see if we're missing closers
         triple_double = code.count('"""')
         triple_single = code.count("'''")
-
-        repairs = []
 
         # If odd number of triple double quotes, add closing one
         if triple_double % 2 == 1:
@@ -99,10 +107,7 @@ def attempt_syntax_repair(code: str, error: SyntaxError) -> tuple[str | None, st
             code = code.rstrip() + "\n'''"
             repairs.append("Added missing ''' at end")
 
-        if repairs:
-            return code, "; ".join(repairs)
-
-    # Handle unterminated regular strings
+    # 3. Handle unterminated regular strings
     if "eol while scanning string literal" in error_msg:
         lines = code.split('\n')
         if error.lineno and error.lineno <= len(lines):
@@ -110,10 +115,86 @@ def attempt_syntax_repair(code: str, error: SyntaxError) -> tuple[str | None, st
             # Simple heuristic: if line has odd number of quotes, add one
             if line.count('"') % 2 == 1:
                 lines[error.lineno - 1] = line + '"'
-                return '\n'.join(lines), f'Added missing " at line {error.lineno}'
+                code = '\n'.join(lines)
+                repairs.append(f'Added missing " at line {error.lineno}')
             elif line.count("'") % 2 == 1:
                 lines[error.lineno - 1] = line + "'"
-                return '\n'.join(lines), f"Added missing ' at line {error.lineno}"
+                code = '\n'.join(lines)
+                repairs.append(f"Added missing ' at line {error.lineno}")
+
+    # 4. Handle missing colons after def/if/for/while/class/try/except/with
+    if "expected ':'" in error_msg or "invalid syntax" in error_msg:
+        lines = code.split('\n')
+        if error.lineno and error.lineno <= len(lines):
+            line = lines[error.lineno - 1]
+            # Check if line looks like a statement that needs a colon
+            needs_colon_pattern = r'^(\s*)(def|if|elif|else|for|while|class|try|except|finally|with|async\s+def|async\s+for|async\s+with)\b.*[^:]\s*$'
+            if re.match(needs_colon_pattern, line):
+                lines[error.lineno - 1] = line.rstrip() + ':'
+                code = '\n'.join(lines)
+                repairs.append(f'Added missing : at line {error.lineno}')
+
+    # 5. Handle missing parentheses in print (Python 2 to 3 migration)
+    if "missing parentheses in call to 'print'" in error_msg:
+        # Convert print x to print(x)
+        code = re.sub(r'\bprint\s+([^(\n]+)', r'print(\1)', code)
+        repairs.append("Added parentheses to print statements")
+
+    # 6. Handle f-string with backslash (common error)
+    if "f-string expression part cannot include a backslash" in error_msg:
+        # Replace \n inside f-strings with a workaround
+        # This is a simplified fix - complex cases may still fail
+        lines = code.split('\n')
+        for i, line in enumerate(lines):
+            if 'f"' in line or "f'" in line:
+                # Extract f-string parts and fix backslashes
+                # Simple approach: suggest using a variable
+                if '\\n' in line or '\\t' in line:
+                    lines[i] = f"# FIXME: f-string with backslash needs refactoring\n{line}"
+                    repairs.append(f"Marked problematic f-string at line {i+1}")
+        code = '\n'.join(lines)
+
+    # 7. Handle indentation errors
+    if "unexpected indent" in error_msg or "expected an indented block" in error_msg:
+        lines = code.split('\n')
+        if error.lineno and error.lineno <= len(lines):
+            # Try to fix by normalizing indentation
+            # This is a heuristic - may not always work
+            repaired = False
+            if "expected an indented block" in error_msg:
+                # Add a pass statement if block is empty
+                prev_line = lines[error.lineno - 2] if error.lineno > 1 else ""
+                if prev_line.rstrip().endswith(':'):
+                    indent = len(prev_line) - len(prev_line.lstrip()) + 4
+                    lines.insert(error.lineno - 1, ' ' * indent + 'pass  # Auto-added')
+                    code = '\n'.join(lines)
+                    repairs.append(f'Added pass statement at line {error.lineno}')
+                    repaired = True
+
+    # 8. Handle incomplete list/dict/tuple (missing closing bracket)
+    if "unexpected eof" in error_msg or "eof while scanning" in error_msg:
+        open_parens = code.count('(') - code.count(')')
+        open_brackets = code.count('[') - code.count(']')
+        open_braces = code.count('{') - code.count('}')
+
+        if open_parens > 0:
+            code = code.rstrip() + ')' * open_parens
+            repairs.append(f'Added {open_parens} missing )')
+        if open_brackets > 0:
+            code = code.rstrip() + ']' * open_brackets
+            repairs.append(f'Added {open_brackets} missing ]')
+        if open_braces > 0:
+            code = code.rstrip() + '}' * open_braces
+            repairs.append(f'Added {open_braces} missing }}')
+
+    # 9. Remove trailing ellipsis (LLM sometimes adds ... to indicate continuation)
+    if code.rstrip().endswith('...') and '...' not in error_msg:
+        code = code.rstrip()[:-3].rstrip()
+        if not code.endswith(':'):  # Don't break valid code
+            repairs.append("Removed trailing ellipsis")
+
+    if repairs:
+        return code, "; ".join(repairs)
 
     return None, "Could not auto-repair"
 
@@ -244,6 +325,39 @@ class RLMReplEnvironment:
     - All Python string operations available
     """
 
+    @staticmethod
+    def sanitize_query(query: str) -> str:
+        """
+        Sanitize user query to prevent format string issues and clean markdown.
+
+        This prevents:
+        - Curly braces breaking .format() calls
+        - Markdown formatting confusing the LLM code generation
+        - Special characters causing syntax errors in generated code
+        """
+        # Escape curly braces to prevent .format() issues
+        query = query.replace("{", "{{").replace("}", "}}")
+
+        # Convert markdown formatting to plain text equivalents
+        import re
+        # Remove bold/italic markers
+        query = re.sub(r'\*\*([^*]+)\*\*', r'\1', query)  # **bold** -> bold
+        query = re.sub(r'\*([^*]+)\*', r'\1', query)      # *italic* -> italic
+        query = re.sub(r'__([^_]+)__', r'\1', query)      # __bold__ -> bold
+        query = re.sub(r'_([^_]+)_', r'\1', query)        # _italic_ -> italic
+
+        # Convert markdown headers to plain text
+        query = re.sub(r'^#+\s*', '', query, flags=re.MULTILINE)  # # Header -> Header
+
+        # Remove backticks but keep content
+        query = re.sub(r'`([^`]+)`', r'\1', query)  # `code` -> code
+        query = re.sub(r'```[^\n]*\n?', '', query)  # Remove code fence markers
+
+        # Normalize whitespace
+        query = re.sub(r'\n{3,}', '\n\n', query)  # Max 2 newlines
+
+        return query.strip()
+
     # System prompt matching the paper's approach - with anti-hallucination measures
     SYSTEM_PROMPT = '''You are an RLM (Recursive Language Model) analyzing REAL code via a Python REPL.
 
@@ -255,6 +369,27 @@ The `prompt` variable contains ACTUAL source code files. You must:
 - Include EXACT file paths, LINE NUMBERS, and code snippets from the prompt
 - NEVER generate example/simulated/hypothetical findings
 - ALWAYS assign a CONFIDENCE LEVEL to each finding
+
+## CRITICAL: Code Execution Rules
+
+**ALWAYS initialize variables before using them.** Each code block runs independently.
+
+WRONG (will cause NameError):
+```python
+findings.append(x)  # NameError: 'findings' not defined!
+```
+
+CORRECT:
+```python
+findings = []  # Initialize first!
+findings.append(x)
+```
+
+**Common variables you MUST initialize:**
+- `findings = []` before appending findings
+- `output = ""` before building output strings
+- `results = []` before collecting results
+- `files = []` before storing file lists
 
 ## Environment
 
@@ -277,7 +412,36 @@ The `prompt` variable contains ACTUAL source code files. You must:
 6. `is_implemented(filepath, function_name)` - Check if a function is actually implemented (not a stub).
    Returns: dict with 'is_implemented', 'has_body', 'is_stub', 'confidence', 'reason'
 
-7. `FINAL_ANSWER` - Set this to your final response with REAL findings.
+7. `batch_verify(findings)` - EFFICIENT batch verification for multiple findings.
+   Pass a list of {{'file': path, 'line': num, 'pattern': regex}} dicts.
+   Returns: list of verification results (more efficient than calling verify_line repeatedly!)
+   USE THIS when you have 5+ findings to verify.
+
+8. `find_swift_issues(file_path, issue_types)` - Swift-specific issue finder.
+   issue_types: ["retain_cycle", "force_unwrap", "actor_isolation", "swiftui"]
+   Returns: list of issues with file, line, type, description, confidence
+   Example: `issues = find_swift_issues("PaywallView.swift", ["retain_cycle", "force_unwrap"])`
+
+9. `analyze_file(file_path, analysis_type)` - Deep analysis using sub-LLM.
+   analysis_type: "security", "quality", or "architecture"
+   Returns: Detailed analysis from sub-LLM
+   Example: `analysis = analyze_file("AuthManager.swift", "security")`
+
+10. `search_pattern(pattern, file_filter)` - Fast regex search across all files.
+    file_filter: Optional extension filter like ".swift"
+    Returns: list of {{'file', 'line', 'content', 'match'}} dicts
+    Example: `matches = search_pattern(r'api.?key', '.swift')`
+
+11. `FINAL_ANSWER` - Set this to your final response with REAL findings.
+
+## PRE-INITIALIZED VARIABLES (ready to use)
+
+These variables are already initialized - you can append to them directly:
+- `findings = []` - Append your findings here
+- `results = []` - Append results here
+- `issues = []` - Append issues here
+- `files = []` - Store file paths here
+- `output = ""` - Build output strings here
 
 ## CONFIDENCE LEVELS (REQUIRED)
 
@@ -465,15 +629,49 @@ Start by discovering files, checking for dead code regions, then use verificatio
 
                 # Validation: Check for signs of hallucinated/simulated output
                 hallucination_markers = [
+                    # Original markers
                     "example:", "for example,", "hypothetically",
                     "let's say", "imagine", "suppose", "would be like",
-                    "simulated", "demonstration", "sample output"
+                    "simulated", "demonstration", "sample output",
+                    # Extended markers for better detection
+                    "might look like", "could be something like",
+                    "typical implementation", "usually looks like",
+                    "generic", "placeholder", "dummy",
+                    "here's what", "here is what", "would typically",
+                    "commonly seen", "a common pattern", "pseudo",
+                    "illustrative", "conceptual", "theoretical"
                 ]
                 result_lower = result.lower()
+                has_hallucination_warning = False
                 for marker in hallucination_markers:
                     if marker in result_lower:
                         result = f"[WARNING: Response may contain simulated content]\n\n{result}"
+                        has_hallucination_warning = True
                         break
+
+                # Validate line number references - flag suspiciously high or invalid ones
+                line_refs = re.findall(r':(\d+)\b', result)
+                invalid_lines = []
+                for line_ref in line_refs:
+                    line_num = int(line_ref)
+                    # Flag suspiciously high line numbers (most files < 5000 lines)
+                    if line_num > 5000:
+                        invalid_lines.append(line_num)
+
+                if invalid_lines and not has_hallucination_warning:
+                    result = f"[VERIFY: Contains high line numbers that may be inaccurate: {invalid_lines[:5]}]\n\n{result}"
+
+                # Check for file paths that don't exist in actual files
+                file_refs = re.findall(r'([a-zA-Z0-9_/\-\.]+\.[a-z]{1,5}):', result)
+                unverified_files = []
+                for file_ref in file_refs:
+                    # Check if this file path exists in our actual files (fuzzy match)
+                    if not any(file_ref in actual_file or actual_file.endswith(file_ref) for actual_file in actual_files):
+                        unverified_files.append(file_ref)
+
+                if unverified_files and len(unverified_files) <= 5:
+                    unique_unverified = list(set(unverified_files))[:3]
+                    result += f"\n\n[NOTE: These file references could not be verified: {unique_unverified}]"
 
                 # Store FULL response (paper: variables as buffers)
                 self.state.llm_responses[query_id] = result
@@ -493,6 +691,62 @@ Start by discovering files, checking for dead code regions, then use verificatio
         import re
         files = re.findall(r'### File: ([^\n]+)', self.state.prompt)
         return files
+
+    def _build_categorized_file_index(self, files: list[str]) -> str:
+        """
+        Build a categorized file index for better LLM context.
+
+        Categories files by type to help LLM find relevant files quickly.
+        """
+        categories = {
+            "Views/UI": [],
+            "Models/Data": [],
+            "Services/Managers": [],
+            "Extensions/Widgets": [],
+            "Tests": [],
+            "Config": [],
+            "Other": [],
+        }
+
+        for f in files:
+            f_lower = f.lower()
+            categorized = False
+
+            # Check for extensions/widgets first (high priority)
+            if "extension" in f_lower or "widget" in f_lower:
+                categories["Extensions/Widgets"].append(f)
+                categorized = True
+            elif "view" in f_lower or "controller" in f_lower or "screen" in f_lower or "ui" in f_lower:
+                categories["Views/UI"].append(f)
+                categorized = True
+            elif "model" in f_lower or "entity" in f_lower or "schema" in f_lower:
+                categories["Models/Data"].append(f)
+                categorized = True
+            elif "service" in f_lower or "manager" in f_lower or "provider" in f_lower or "handler" in f_lower:
+                categories["Services/Managers"].append(f)
+                categorized = True
+            elif "test" in f_lower or "spec" in f_lower or "_test" in f_lower:
+                categories["Tests"].append(f)
+                categorized = True
+            elif any(ext in f for ext in [".json", ".yaml", ".yml", ".toml", ".plist", ".xml", ".env"]):
+                categories["Config"].append(f)
+                categorized = True
+
+            if not categorized:
+                categories["Other"].append(f)
+
+        # Build formatted output
+        parts = []
+        for category, cat_files in categories.items():
+            if cat_files:
+                parts.append(f"\n### {category} ({len(cat_files)} files)")
+                # Show up to 25 files per category
+                for f in cat_files[:25]:
+                    parts.append(f"  - {f}")
+                if len(cat_files) > 25:
+                    parts.append(f"  ... and {len(cat_files) - 25} more in this category")
+
+        return "\n".join(parts)
 
     def _create_extract_with_lines_function(self) -> Callable[[str], str]:
         """Create the extract_with_lines helper function for line-numbered extraction."""
@@ -702,6 +956,400 @@ Start by discovering files, checking for dead code regions, then use verificatio
 
         return is_implemented
 
+    def _create_batch_verify_function(self) -> Callable[[list[dict]], list[dict]]:
+        """Create the batch_verify helper function for efficient multi-finding verification."""
+
+        def batch_verify(findings: list[dict]) -> list[dict]:
+            """
+            Verify multiple findings at once (more efficient than one-by-one).
+
+            Args:
+                findings: List of dicts with 'file', 'line', and optionally 'pattern'
+
+            Returns:
+                List of verification results with 'is_valid', 'actual_content', 'in_dead_code', 'confidence', 'reason'
+            """
+            results = []
+
+            # Group by file for efficiency
+            from collections import defaultdict
+            by_file = defaultdict(list)
+            for i, f in enumerate(findings):
+                by_file[f.get('file', '')].append((i, f))
+
+            # Process each file once
+            parts = self.state.prompt.split("### File:")
+
+            for filepath, file_findings in by_file.items():
+                # Find file content
+                content = None
+                actual_filepath = None
+
+                for part in parts[1:]:
+                    lines = part.split("\n")
+                    if not lines:
+                        continue
+                    file_path = lines[0].strip()
+                    if filepath in file_path or file_path.endswith(filepath):
+                        content = "\n".join(lines[1:])
+                        actual_filepath = file_path
+                        break
+
+                if content is None:
+                    # File not found - mark all findings for this file as invalid
+                    for idx, finding in file_findings:
+                        results.append({
+                            'index': idx,
+                            'is_valid': False,
+                            'actual_content': None,
+                            'in_dead_code': False,
+                            'confidence': 'LOW',
+                            'reason': f"File not found: {filepath}"
+                        })
+                    continue
+
+                # Get dead code regions once per file
+                if actual_filepath not in self.state.dead_code_regions:
+                    self.state.dead_code_regions[actual_filepath] = find_dead_code_regions(content, actual_filepath)
+
+                dead_regions = self.state.dead_code_regions[actual_filepath]
+                content_lines = content.split('\n')
+
+                # Verify each finding in this file
+                for idx, finding in file_findings:
+                    line_num = finding.get('line', 0)
+                    pattern = finding.get('pattern')
+
+                    if line_num < 1 or line_num > len(content_lines):
+                        results.append({
+                            'index': idx,
+                            'is_valid': False,
+                            'actual_content': None,
+                            'in_dead_code': False,
+                            'confidence': 'LOW',
+                            'reason': f"Line {line_num} out of range (file has {len(content_lines)} lines)"
+                        })
+                        continue
+
+                    actual_content = content_lines[line_num - 1]
+                    in_dead_code, condition = is_line_in_dead_code(line_num, dead_regions)
+
+                    # Check pattern if provided
+                    pattern_matches = True
+                    if pattern:
+                        pattern_matches = bool(re.search(pattern, actual_content, re.IGNORECASE))
+
+                    # Determine confidence
+                    if in_dead_code:
+                        confidence = 'LOW'
+                        reason = f"Line is in dead code block ({condition})"
+                    elif not pattern_matches and pattern:
+                        confidence = 'LOW'
+                        reason = "Pattern not found on line"
+                    else:
+                        confidence = 'HIGH'
+                        reason = "Verified in active code"
+
+                    results.append({
+                        'index': idx,
+                        'is_valid': pattern_matches,
+                        'actual_content': actual_content,
+                        'in_dead_code': in_dead_code,
+                        'confidence': confidence,
+                        'reason': reason
+                    })
+
+            # Sort by original index
+            results.sort(key=lambda x: x.get('index', 0))
+            return results
+
+        return batch_verify
+
+    def _create_swift_analyzer_function(self) -> Callable:
+        """Create a Swift-specific issue finder."""
+        prompt = self.state.prompt
+        llm_query = self._create_llm_query_function()
+
+        def find_swift_issues(file_path: str, issue_types: list[str] | None = None) -> list[dict]:
+            """
+            Find Swift-specific issues in a file.
+
+            Args:
+                file_path: Path to the Swift file
+                issue_types: Optional list of issue types to check:
+                    - "retain_cycle": Closures missing [weak self]
+                    - "force_unwrap": Force unwraps (!)
+                    - "actor_isolation": @MainActor and Sendable issues
+                    - "swiftui": SwiftUI lifecycle issues
+
+            Returns:
+                List of issues with file, line, type, description, confidence
+            """
+            # Extract the file content
+            pattern = f"### File: [^\\n]*{re.escape(file_path.split('/')[-1])}[^\\n]*\\n"
+            match = re.search(pattern, prompt)
+            if not match:
+                return [{"error": f"File not found: {file_path}"}]
+
+            start = match.end()
+            end_match = re.search(r"\n### File:", prompt[start:])
+            end = start + end_match.start() if end_match else len(prompt)
+            content = prompt[start:end]
+
+            issues = []
+            lines = content.split('\n')
+
+            # Default to all issue types
+            if not issue_types:
+                issue_types = ["retain_cycle", "force_unwrap", "actor_isolation", "swiftui"]
+
+            for line_num, line in enumerate(lines, 1):
+                # Retain cycle detection
+                if "retain_cycle" in issue_types:
+                    if re.search(r'\{\s*(?!\[(?:weak|unowned)\s+self\]).*\bself\.', line):
+                        if not re.search(r'\[weak\s+self\]|\[unowned\s+self\]', line):
+                            issues.append({
+                                "file": file_path,
+                                "line": line_num,
+                                "type": "retain_cycle",
+                                "code": line.strip(),
+                                "description": "Closure captures self - consider [weak self]",
+                                "confidence": "MEDIUM"
+                            })
+
+                # Force unwrap detection (excluding !=)
+                if "force_unwrap" in issue_types:
+                    if re.search(r'\w!(?!=)\s*[.\[]', line) or re.search(r'\btry!\s+', line):
+                        issues.append({
+                            "file": file_path,
+                            "line": line_num,
+                            "type": "force_unwrap",
+                            "code": line.strip(),
+                            "description": "Force unwrap or try! - handle optionals safely",
+                            "confidence": "HIGH"
+                        })
+
+                # Actor isolation
+                if "actor_isolation" in issue_types:
+                    if re.search(r'DispatchQueue\.main\.async', line):
+                        issues.append({
+                            "file": file_path,
+                            "line": line_num,
+                            "type": "actor_isolation",
+                            "code": line.strip(),
+                            "description": "Consider @MainActor instead of DispatchQueue.main",
+                            "confidence": "LOW"
+                        })
+
+                # SwiftUI lifecycle
+                if "swiftui" in issue_types:
+                    if re.search(r'@ObservedObject\s+var\s+\w+\s*=', line):
+                        issues.append({
+                            "file": file_path,
+                            "line": line_num,
+                            "type": "swiftui",
+                            "code": line.strip(),
+                            "description": "@ObservedObject with default - use @StateObject",
+                            "confidence": "HIGH"
+                        })
+
+            return issues
+
+        return find_swift_issues
+
+    def _create_file_analyzer_function(self) -> Callable:
+        """Create a general file analyzer using sub-LLM with intelligent chunking."""
+        llm_query = self._create_llm_query_function()
+        extract_with_lines = self._create_extract_with_lines_function()
+
+        # Maximum chars per chunk for sub-LLM context (conservative to leave room for prompts)
+        MAX_CHUNK_CHARS = 6000
+        # Overlap between chunks to maintain context
+        CHUNK_OVERLAP_LINES = 20
+
+        def chunk_content(content: str, max_chars: int = MAX_CHUNK_CHARS) -> list[tuple[str, int, int]]:
+            """
+            Split content into overlapping chunks for analysis.
+
+            Args:
+                content: Line-numbered content to chunk
+                max_chars: Maximum characters per chunk
+
+            Returns:
+                List of (chunk_content, start_line, end_line) tuples
+            """
+            if len(content) <= max_chars:
+                # Content fits in one chunk
+                lines = content.split('\n')
+                return [(content, 1, len(lines))]
+
+            chunks = []
+            lines = content.split('\n')
+            current_chunk_lines = []
+            current_chunk_chars = 0
+            chunk_start_line = 1
+
+            for i, line in enumerate(lines, 1):
+                line_with_newline = line + '\n'
+
+                if current_chunk_chars + len(line_with_newline) > max_chars and current_chunk_lines:
+                    # Save current chunk
+                    chunk_content = '\n'.join(current_chunk_lines)
+                    chunk_end_line = i - 1
+                    chunks.append((chunk_content, chunk_start_line, chunk_end_line))
+
+                    # Start new chunk with overlap
+                    overlap_start = max(0, len(current_chunk_lines) - CHUNK_OVERLAP_LINES)
+                    current_chunk_lines = current_chunk_lines[overlap_start:]
+                    chunk_start_line = i - len(current_chunk_lines)
+                    current_chunk_chars = sum(len(l) + 1 for l in current_chunk_lines)
+
+                current_chunk_lines.append(line)
+                current_chunk_chars += len(line_with_newline)
+
+            # Don't forget the last chunk
+            if current_chunk_lines:
+                chunk_content = '\n'.join(current_chunk_lines)
+                chunks.append((chunk_content, chunk_start_line, len(lines)))
+
+            return chunks
+
+        def analyze_file(file_path: str, analysis_type: str = "security") -> str:
+            """
+            Analyze a file using the sub-LLM for semantic understanding.
+
+            For large files, automatically chunks content and aggregates results.
+
+            Args:
+                file_path: Path to the file to analyze
+                analysis_type: Type of analysis - "security", "quality", "architecture"
+
+            Returns:
+                Analysis results from sub-LLM (aggregated if chunked)
+            """
+            content = extract_with_lines(file_path)
+            if not content or "not found" in content.lower():
+                return f"File not found: {file_path}"
+
+            # Get chunks (may be just one for small files)
+            chunks = chunk_content(content)
+
+            prompts_template = {
+                "security": """Analyze this code for security issues:
+{content}
+
+Look for: hardcoded secrets, injection vulnerabilities, authentication issues, data exposure.
+For each issue: specify exact line number, code snippet, severity (HIGH/MEDIUM/LOW).
+Note: This is lines {start_line}-{end_line} of the file.""",
+
+                "quality": """Analyze this code for quality issues:
+{content}
+
+Look for: complex functions, missing error handling, code duplication, unclear naming.
+For each issue: specify exact line number and recommendation.
+Note: This is lines {start_line}-{end_line} of the file.""",
+
+                "architecture": """Analyze this code for architectural issues:
+{content}
+
+Look for: tight coupling, missing abstractions, violation of SOLID principles.
+Describe the file's role and any concerns.
+Note: This is lines {start_line}-{end_line} of the file."""
+            }
+
+            template = prompts_template.get(analysis_type, prompts_template["security"])
+
+            if len(chunks) == 1:
+                # Single chunk - simple case
+                chunk_content_str, start_line, end_line = chunks[0]
+                prompt = template.format(
+                    content=chunk_content_str,
+                    start_line=start_line,
+                    end_line=end_line
+                )
+                return llm_query(prompt)
+
+            # Multiple chunks - analyze each and aggregate
+            all_findings = []
+            for i, (chunk_content_str, start_line, end_line) in enumerate(chunks, 1):
+                prompt = template.format(
+                    content=chunk_content_str,
+                    start_line=start_line,
+                    end_line=end_line
+                )
+                chunk_result = llm_query(prompt)
+
+                # Only include if there are actual findings
+                if chunk_result and "no " not in chunk_result.lower()[:50]:
+                    all_findings.append(f"### Chunk {i} (lines {start_line}-{end_line}):\n{chunk_result}")
+
+            if not all_findings:
+                return f"No {analysis_type} issues found in {file_path}"
+
+            # Aggregate findings
+            if len(all_findings) == 1:
+                return all_findings[0]
+
+            aggregated = f"## Analysis of {file_path} ({len(chunks)} chunks analyzed)\n\n"
+            aggregated += "\n\n".join(all_findings)
+
+            # If many findings, ask LLM to deduplicate
+            if len(all_findings) > 2:
+                dedup_prompt = f"""Deduplicate and organize these findings from analyzing {file_path}:
+
+{aggregated}
+
+Remove duplicates (same line, same issue). Keep all unique findings with their line numbers."""
+
+                return llm_query(dedup_prompt, max_tokens=4000)
+
+            return aggregated
+
+        return analyze_file
+
+    def _create_pattern_search_function(self) -> Callable:
+        """Create a pattern search function that returns structured results."""
+        prompt = self.state.prompt
+
+        def search_pattern(pattern: str, file_filter: str | None = None) -> list[dict]:
+            """
+            Search for a regex pattern across all files.
+
+            Args:
+                pattern: Regex pattern to search for
+                file_filter: Optional file extension filter (e.g., ".swift")
+
+            Returns:
+                List of matches with file, line, content
+            """
+            results = []
+            current_file = None
+            line_num = 0
+
+            for line in prompt.split('\n'):
+                if line.startswith("### File:"):
+                    current_file = line.replace("### File:", "").strip()
+                    line_num = 0
+                    continue
+
+                line_num += 1
+
+                if current_file and (not file_filter or current_file.endswith(file_filter)):
+                    try:
+                        if re.search(pattern, line, re.IGNORECASE):
+                            results.append({
+                                "file": current_file,
+                                "line": line_num,
+                                "content": line.strip()[:200],
+                                "match": re.search(pattern, line, re.IGNORECASE).group(0)
+                            })
+                    except re.error:
+                        pass
+
+            return results[:100]  # Limit results
+
+        return search_pattern
+
     def _create_safe_globals(self) -> dict[str, Any]:
         """Create a restricted execution environment."""
         # Allow safe builtins only - REMOVED dangerous ones:
@@ -749,6 +1397,19 @@ Start by discovering files, checking for dead code regions, then use verificatio
             "repr": repr,
         }
 
+        # Pre-initialize common variables to prevent NameError
+        pre_initialized = {
+            "findings": [],
+            "results": [],
+            "output": "",
+            "issues": [],
+            "files": [],
+            "errors": [],
+        }
+
+        # Merge with existing state variables (state takes precedence)
+        all_variables = {**pre_initialized, **self.state.variables}
+
         return {
             "__builtins__": safe_builtins,
             "prompt": self.state.prompt,
@@ -757,9 +1418,14 @@ Start by discovering files, checking for dead code regions, then use verificatio
             "verify_line": self._create_verify_line_function(),
             "check_dead_code": self._create_check_dead_code_function(),
             "is_implemented": self._create_is_implemented_function(),
+            "batch_verify": self._create_batch_verify_function(),
+            # Swift-specific helpers
+            "find_swift_issues": self._create_swift_analyzer_function(),
+            "analyze_file": self._create_file_analyzer_function(),
+            "search_pattern": self._create_pattern_search_function(),
             "re": re,  # Regex support
             "FINAL_ANSWER": None,
-            **self.state.variables
+            **all_variables
         }
 
     def execute_code(self, code: str, allow_repair: bool = True) -> tuple[str, bool]:
@@ -789,9 +1455,17 @@ Start by discovering files, checking for dead code regions, then use verificatio
                         if success:
                             return f"[Auto-repaired: {repair_desc}]\n{output}", True
 
-            error_msg = "Code rejected for security reasons:\n" + "\n".join(f"  - {e}" for e in validation_errors)
-            if syntax_error:
-                error_msg += "\n\nHint: Check that all strings (especially triple-quoted ones) are properly closed."
+            # Differentiate between syntax errors and security violations
+            if syntax_error and all("Syntax error" in e for e in validation_errors):
+                error_msg = "Code has syntax errors (LLM generated invalid Python):\n"
+                error_msg += "\n".join(f"  - {e}" for e in validation_errors)
+                error_msg += "\n\nThis is a code generation issue, not a security issue."
+                error_msg += "\nHint: The LLM may have included markdown or special characters in the code."
+            elif syntax_error:
+                error_msg = "Code validation failed:\n" + "\n".join(f"  - {e}" for e in validation_errors)
+                error_msg += "\n\nNote: Some issues are syntax errors, others may be security-related."
+            else:
+                error_msg = "Code rejected for security reasons:\n" + "\n".join(f"  - {e}" for e in validation_errors)
             self.state.output_history.append(error_msg)
             return error_msg, False
 
@@ -847,31 +1521,43 @@ Start by discovering files, checking for dead code regions, then use verificatio
         Returns:
             The final answer
         """
+        # Sanitize query to prevent format string issues and clean markdown
+        safe_query = self.sanitize_query(query)
+
         system = self.SYSTEM_PROMPT.format(
-            query=query,
+            query=safe_query,
             char_count=len(self.state.prompt)
         )
 
         # Extract actual file list to ground the LLM in reality
         actual_files = self._extract_file_list()
-        file_list_preview = "\n".join(f"  - {f}" for f in actual_files[:30])
-        if len(actual_files) > 30:
-            file_list_preview += f"\n  ... and {len(actual_files) - 30} more files"
+
+        # Build categorized file index for better discovery
+        categorized_index = self._build_categorized_file_index(actual_files)
 
         # Initial message showing REAL file paths (grounds the LLM)
         initial_msg = f"""REPL ready. `prompt` contains {len(self.state.prompt):,} characters of REAL source code.
 
-## ACTUAL FILES IN PROMPT ({len(actual_files)} files):
-{file_list_preview}
+## CATEGORIZED FILE INDEX ({len(actual_files)} files):
+{categorized_index}
+
+## Quick File Search
+To find specific files, use: `[f for f in files if 'keyword' in f.lower()]`
+Example: `[f for f in files if 'widget' in f.lower() or 'extension' in f.lower()]`
+
+## Important Patterns to Check
+- **Extensions/Widgets**: App extensions, widget targets, share extensions
+- **Paywall/Subscription**: Payment, subscription, StoreKit files
+- **Auth/Security**: Login, authentication, session management
 
 ## Content Preview (first 500 chars):
 ```
 {self.state.prompt[:500]}
 ```
 
-These are REAL files. Analyze them to answer: {query}
+These are REAL files. Analyze them to answer: {safe_query}
 
-Start by exploring the actual content with Python code."""
+Start by exploring the actual content with Python code. Use the categorized index above to find relevant files."""
 
         messages = [{"role": "user", "content": initial_msg}]
 
@@ -879,6 +1565,10 @@ Start by exploring the actual content with Python code."""
         max_consecutive_failures = 3
 
         for iteration in range(max_iterations):
+            # Log progress to stderr so users see activity
+            import sys
+            print(f"[REPL] Iteration {iteration + 1}/{max_iterations} - Generating code...", file=sys.stderr)
+
             # Orchestrating LLM generates code
             response = self.client.chat.completions.create(
                 model=self.config.aggregator_model,
@@ -922,6 +1612,7 @@ Start by exploring the actual content with Python code."""
                 continue
 
             # Execute code blocks
+            print(f"[REPL] Iteration {iteration + 1} - Executing {len(code_blocks)} code block(s)...", file=sys.stderr)
             outputs = []
             any_success = False
             for code in code_blocks:
@@ -938,11 +1629,11 @@ Start by exploring the actual content with Python code."""
             if not any_success:
                 consecutive_failures += 1
                 if consecutive_failures >= max_consecutive_failures:
-                    # Too many failures - return what we have
-                    if self.state.output_history:
-                        return f"Analysis incomplete (code execution failed). Partial findings:\n\n" + \
-                               "\n".join(self.state.output_history[-5:])
-                    return "Analysis failed - code execution errors. Try a more specific query."
+                    # Too many failures - use fallback analyzer
+                    return self._run_fallback_analysis(
+                        query,
+                        f"Code execution failed {consecutive_failures} times consecutively"
+                    )
             else:
                 consecutive_failures = 0
 
@@ -961,7 +1652,13 @@ Start by exploring the actual content with Python code."""
             })
 
         # Return best available answer
-        return self.state.final_answer or self.state.output_history[-1] if self.state.output_history else "No answer generated"
+        if self.state.final_answer:
+            return self.state.final_answer
+        if self.state.output_history:
+            return self.state.output_history[-1]
+
+        # No answer from REPL - use fallback
+        return self._run_fallback_analysis(query, "Max iterations reached without result")
 
     def _extract_code_blocks(self, text: str) -> list[str]:
         """Extract Python code blocks from text."""
@@ -976,4 +1673,45 @@ Start by exploring the actual content with Python code."""
     def get_execution_history(self) -> list[tuple[str, str]]:
         """Get (code, output) history."""
         return list(zip(self.state.code_history, self.state.output_history))
+
+    def _run_fallback_analysis(self, query: str, reason: str) -> str:
+        """
+        Run fallback pattern-based analysis when REPL execution fails.
+
+        This provides graceful degradation - always returns useful results
+        even when the LLM code execution doesn't work.
+
+        Args:
+            query: The original query
+            reason: Why we're falling back
+
+        Returns:
+            Markdown-formatted analysis results
+        """
+        fallback = FallbackAnalyzer()
+        result = fallback.analyze(
+            content=self.state.prompt,
+            query=query,
+            fallback_reason=reason
+        )
+
+        # Build output
+        output_parts = [result.to_markdown()]
+
+        # Add any successful LLM sub-responses (these are valuable even if REPL failed)
+        if self.state.llm_responses:
+            output_parts.append("\n\n---\n## 📋 Partial Analysis (LLM sub-responses before failure)")
+            for key, response in list(self.state.llm_responses.items())[:5]:
+                if response and len(response) > 50:  # Only include substantive responses
+                    output_parts.append(f"\n**{key[:60]}:**")
+                    output_parts.append(f"```\n{response[:800]}\n```")
+
+        # Add any partial execution output
+        successful_outputs = [o for o in self.state.output_history if o.strip() and "Error:" not in o[:20]]
+        if successful_outputs:
+            output_parts.append("\n\n---\n## Successful REPL Executions (before failure)")
+            for i, output in enumerate(successful_outputs[-3:], 1):
+                output_parts.append(f"\n**Execution {i}:**\n```\n{output[:500]}\n```")
+
+        return "\n".join(output_parts)
 
