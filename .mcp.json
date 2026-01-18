@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "rlm": {
+      "type": "stdio",
+      "command": "python",
+      "args": ["-m", "rlm_mem_mcp.server"],
+      "cwd": "${workspaceFolder}/python/src",
+      "env": {
+        "ANTHROPIC_API_KEY": "${ANTHROPIC_API_KEY}",
+        "RLM_MODEL": "claude-sonnet-4-5-20241022",
+        "RLM_USE_CACHE": "true",
+        "RLM_CACHE_TTL": "5m"
+      }
+    }
+  }
+}

@@ -1,0 +1,23 @@
+# RLM-Mem MCP Server Dependencies
+# Based on arXiv:2512.24601 and Anthropic MCP Best Practices
+
+# MCP SDK for Python
+mcp>=1.0.0
+
+# RLM Library (Recursive Language Models)
+rlm>=0.1.0
+
+# Anthropic SDK with prompt caching support
+anthropic>=0.39.0
+
+# Token counting
+tiktoken>=0.8.0
+
+# Async support
+aiofiles>=24.1.0
+
+# Configuration
+python-dotenv>=1.0.0
+
+# Type checking
+pydantic>=2.9.0

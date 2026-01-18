@@ -1,0 +1,64 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "rlm-mem-mcp"
+version = "1.0.0"
+description = "MCP Server implementing RLM (Recursive Language Model) for ultimate context management with Claude"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+keywords = ["mcp", "claude", "anthropic", "rlm", "context-management", "prompt-caching"]
+authors = [
+    { name = "RLM-Mem MCP Contributors" }
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "mcp>=1.0.0",
+    "anthropic>=0.39.0",
+    "tiktoken>=0.8.0",
+    "aiofiles>=24.1.0",
+    "python-dotenv>=1.0.0",
+    "pydantic>=2.9.0",
+]
+
+[project.optional-dependencies]
+rlm = ["rlm>=0.1.0"]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+    "black>=24.0.0",
+    "ruff>=0.8.0",
+    "mypy>=1.13.0",
+]
+
+[project.scripts]
+rlm-mcp-server = "rlm_mem_mcp.server:main"
+
+[project.urls]
+Homepage = "https://github.com/mosif16/RLM-Mem_MCP"
+Repository = "https://github.com/mosif16/RLM-Mem_MCP"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/rlm_mem_mcp"]
+
+[tool.black]
+line-length = 100
+target-version = ["py310", "py311", "py312"]
+
+[tool.ruff]
+line-length = 100
+select = ["E", "F", "I", "N", "W", "UP"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
