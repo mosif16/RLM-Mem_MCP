@@ -21,7 +21,7 @@ load_dotenv()
 
 
 # Default model (OpenRouter model ID)
-DEFAULT_MODEL = "google/gemini-2.5-flash"
+DEFAULT_MODEL = "google/gemini-2.5-flash-lite"
 
 
 @dataclass
