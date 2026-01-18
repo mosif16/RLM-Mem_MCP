@@ -12,6 +12,12 @@ From the paper (see Figure 1):
 - Final answer via: print(FINAL_ANSWER)
 
 This preserves ALL data - nothing is summarized or lost.
+
+Improvements (based on user feedback):
+- Dead code detection (#if false, #if DEBUG, etc.)
+- Confidence levels for findings (HIGH/MEDIUM/LOW)
+- Line number verification before reporting
+- Implementation detection (body vs signature)
 """
 
 import re
@@ -24,6 +30,16 @@ import sys
 from openai import OpenAI
 
 from .config import RLMConfig
+from .content_analyzer import (
+    find_dead_code_regions,
+    is_line_in_dead_code,
+    verify_line_reference,
+    check_implementation_status,
+    annotate_content_with_dead_code,
+    generate_confidence_guidance,
+    DeadCodeRegion,
+    Confidence,
+)
 
 
 # Dangerous attribute names that could be used for sandbox escapes
@@ -52,6 +68,56 @@ class UnsafeCodeError(Exception):
     pass
 
 
+def attempt_syntax_repair(code: str, error: SyntaxError) -> tuple[str | None, str]:
+    """
+    Attempt to automatically repair common syntax errors in LLM-generated code.
+
+    Args:
+        code: The code with syntax error
+        error: The SyntaxError that was raised
+
+    Returns:
+        (repaired_code, repair_description) - repaired_code is None if repair failed
+    """
+    error_msg = str(error).lower()
+
+    # Handle unterminated triple-quoted strings
+    if "unterminated triple-quoted string" in error_msg or "unterminated string" in error_msg:
+        # Count triple quotes to see if we're missing closers
+        triple_double = code.count('"""')
+        triple_single = code.count("'''")
+
+        repairs = []
+
+        # If odd number of triple double quotes, add closing one
+        if triple_double % 2 == 1:
+            code = code.rstrip() + '\n"""'
+            repairs.append('Added missing """ at end')
+
+        # If odd number of triple single quotes, add closing one
+        if triple_single % 2 == 1:
+            code = code.rstrip() + "\n'''"
+            repairs.append("Added missing ''' at end")
+
+        if repairs:
+            return code, "; ".join(repairs)
+
+    # Handle unterminated regular strings
+    if "eol while scanning string literal" in error_msg:
+        lines = code.split('\n')
+        if error.lineno and error.lineno <= len(lines):
+            line = lines[error.lineno - 1]
+            # Simple heuristic: if line has odd number of quotes, add one
+            if line.count('"') % 2 == 1:
+                lines[error.lineno - 1] = line + '"'
+                return '\n'.join(lines), f'Added missing " at line {error.lineno}'
+            elif line.count("'") % 2 == 1:
+                lines[error.lineno - 1] = line + "'"
+                return '\n'.join(lines), f"Added missing ' at line {error.lineno}"
+
+    return None, "Could not auto-repair"
+
+
 class CodeValidator(ast.NodeVisitor):
     """
     AST validator to detect potentially dangerous code patterns.
@@ -65,6 +131,7 @@ class CodeValidator(ast.NodeVisitor):
 
     def __init__(self):
         self.errors: list[str] = []
+        self.syntax_error: SyntaxError | None = None
 
     def visit_Attribute(self, node: ast.Attribute) -> None:
         """Check for forbidden attribute access."""
@@ -110,17 +177,19 @@ class CodeValidator(ast.NodeVisitor):
             (is_safe, errors) tuple
         """
         self.errors = []
+        self.syntax_error = None
 
         try:
             tree = ast.parse(code)
             self.visit(tree)
         except SyntaxError as e:
+            self.syntax_error = e
             self.errors.append(f"Syntax error: {e}")
 
         return len(self.errors) == 0, self.errors
 
 
-def validate_code(code: str) -> tuple[bool, list[str]]:
+def validate_code(code: str) -> tuple[bool, list[str], SyntaxError | None]:
     """
     Validate Python code for sandbox safety.
 
@@ -128,10 +197,11 @@ def validate_code(code: str) -> tuple[bool, list[str]]:
         code: Python source code to validate
 
     Returns:
-        (is_safe, errors) tuple
+        (is_safe, errors, syntax_error) tuple - syntax_error is set if a SyntaxError occurred
     """
     validator = CodeValidator()
-    return validator.validate(code)
+    is_safe, errors = validator.validate(code)
+    return is_safe, errors, validator.syntax_error
 
 
 @dataclass
@@ -159,6 +229,9 @@ class REPLState:
     # Final answer (set when FINAL_ANSWER is assigned)
     final_answer: str | None = None
 
+    # Dead code regions detected in the content (for validation)
+    dead_code_regions: dict[str, list[DeadCodeRegion]] = field(default_factory=dict)
+
 
 class RLMReplEnvironment:
     """
@@ -181,6 +254,7 @@ The `prompt` variable contains ACTUAL source code files. You must:
 - Report ONLY findings that exist in the actual content
 - Include EXACT file paths, LINE NUMBERS, and code snippets from the prompt
 - NEVER generate example/simulated/hypothetical findings
+- ALWAYS assign a CONFIDENCE LEVEL to each finding
 
 ## Environment
 
@@ -193,21 +267,58 @@ The `prompt` variable contains ACTUAL source code files. You must:
 3. `extract_with_lines(filepath)` - Extract file content WITH line numbers.
    Returns formatted string: "1: first line\\n2: second line\\n..."
 
-4. `FINAL_ANSWER` - Set this to your final response with REAL findings.
+4. `verify_line(filepath, line_num, expected_pattern)` - VERIFY a line exists and contains expected content.
+   Returns: dict with 'is_valid', 'actual_content', 'in_dead_code', 'confidence', 'reason'
+   USE THIS before reporting any finding to avoid false positives!
+
+5. `check_dead_code(filepath)` - Check if file has dead code regions (#if false, #if DEBUG, etc.)
+   Returns: list of dead code regions with start_line, end_line, condition
+
+6. `is_implemented(filepath, function_name)` - Check if a function is actually implemented (not a stub).
+   Returns: dict with 'is_implemented', 'has_body', 'is_stub', 'confidence', 'reason'
+
+7. `FINAL_ANSWER` - Set this to your final response with REAL findings.
+
+## CONFIDENCE LEVELS (REQUIRED)
+
+Every finding MUST have a confidence level:
+
+**[Confidence: HIGH]** - Use when:
+- Code is in active (non-conditional) blocks
+- Line verified with verify_line()
+- Function has real implementation (check with is_implemented())
+
+**[Confidence: MEDIUM]** - Use when:
+- Code context unclear
+- Cannot verify reachability
+- Implementation status uncertain
+
+**[Confidence: LOW]** - Use when:
+- Code is in #if false, #if DEBUG blocks (check with check_dead_code())
+- Line couldn't be verified
+- Function is a stub or unimplemented
+- Finding based on signature only
 
 ## CRITICAL OUTPUT FORMAT
 
 All findings MUST include:
 - **File:Line** format: `path/to/file.py:42`
+- **[Confidence: HIGH/MEDIUM/LOW]** with reason if LOW
 - **Code snippet**: The actual code from the file
 - **Context**: What the issue is
 
 Example finding format:
 ```
-**src/auth.py:156**
+**src/auth.py:156** [Confidence: HIGH]
 Issue: Hardcoded API key
 ```python
 API_KEY = "sk-1234567890abcdef"  # Line 156
+```
+
+**src/legacy.swift:42** [Confidence: LOW - in #if false block]
+Issue: Potential hardcoded secret (DEAD CODE - not compiled)
+```swift
+let key = "test-key"  # Line 42
 ```
 ```
 
@@ -222,32 +333,60 @@ API_KEY = "sk-1234567890abcdef"  # Line 156
        print(f"  - {{f}}")
    ```
 
-2. **Extract files WITH LINE NUMBERS**:
+2. **Check for dead code regions BEFORE analyzing**:
+   ```python
+   # Check each file for conditional compilation blocks
+   for f in files[:10]:
+       dead_regions = check_dead_code(f)
+       if dead_regions:
+           print(f"{{f}}: {{len(dead_regions)}} dead code regions")
+           for r in dead_regions:
+               print(f"  Lines {{r['start_line']}}-{{r['end_line']}}: {{r['condition']}}")
+   ```
+
+3. **Extract files WITH LINE NUMBERS**:
    ```python
    # Use the helper to get line-numbered content
    content = extract_with_lines("path/to/file.py")
    print(content[:2000])  # Shows "1: line1\\n2: line2\\n..."
    ```
 
-3. **Analyze with llm_query (include line numbers)**:
+4. **VERIFY findings before reporting**:
    ```python
-   # Send line-numbered content for analysis
-   content = extract_with_lines("src/main.py")
-   result = llm_query(f"""Analyze this code. For each finding, report:
-   - Exact line number
-   - The code on that line
-   - What the issue is
-
-   Code:
-   {{content[:15000]}}""")
-   print(result)
+   # Always verify line references!
+   result = verify_line("src/auth.py", 42, r"API_KEY|secret|password")
+   if result['is_valid'] and not result['in_dead_code']:
+       print(f"CONFIRMED: Line 42 contains: {{result['actual_content']}}")
+       confidence = "HIGH"
+   elif result['in_dead_code']:
+       print(f"WARNING: Line 42 is in dead code block")
+       confidence = "LOW"
+   else:
+       print(f"NOT FOUND: {{result['reason']}}")
    ```
 
-4. **Compile findings with file:line references**:
+5. **Check implementation status for function findings**:
+   ```python
+   # Don't report "function returns NotImplemented" if it's actually implemented
+   status = is_implemented("src/api.py", "process_request")
+   if status['is_stub']:
+       print(f"WARNING: Function is a stub - {{status['reason']}}")
+   elif status['is_implemented']:
+       print(f"Function is fully implemented with {{status['body_lines']}} lines")
+   ```
+
+6. **Compile findings with confidence levels**:
    ```python
    FINAL_ANSWER = f"""## Analysis of {{len(files)}} files
 
-   {{result}}
+   ### High Confidence Findings
+   {{high_confidence_findings}}
+
+   ### Medium Confidence Findings
+   {{medium_confidence_findings}}
+
+   ### Low Confidence Findings (verify manually)
+   {{low_confidence_findings}}
 
    Files analyzed: {{', '.join(analyzed_files)}}"""
    ```
@@ -256,14 +395,17 @@ API_KEY = "sk-1234567890abcdef"  # Line 156
 
 - ONLY report file paths that appear in `prompt`
 - ONLY quote code that exists in `prompt`
-- ALWAYS include line numbers (use extract_with_lines helper)
+- ALWAYS verify line numbers with verify_line() before reporting
+- ALWAYS check for dead code with check_dead_code()
+- ALWAYS assign confidence levels (HIGH/MEDIUM/LOW)
+- If a finding is in dead code (#if false, etc.), mark as LOW confidence
 - If no issues found, say "No issues found" - don't invent examples
-- Every finding MUST have format: `filepath:line_number`
+- Every finding MUST have format: `filepath:line_number [Confidence: X]`
 
 ## Query
 {query}
 
-Start by discovering what files are in the prompt, then use extract_with_lines() to analyze them with line numbers.'''
+Start by discovering files, checking for dead code regions, then use verification helpers before reporting findings.'''
 
     def __init__(self, config: RLMConfig):
         self.config = config
@@ -397,6 +539,169 @@ Start by discovering what files are in the prompt, then use extract_with_lines()
 
         return extract_with_lines
 
+    def _create_verify_line_function(self) -> Callable[[str, int, str | None], dict]:
+        """Create the verify_line helper function for line verification."""
+
+        def verify_line(filepath: str, line_num: int, expected_pattern: str | None = None) -> dict:
+            """
+            Verify that a line number reference is valid and contains expected content.
+
+            Args:
+                filepath: Path to the file
+                line_num: Line number to verify (1-indexed)
+                expected_pattern: Optional regex pattern expected on that line
+
+            Returns:
+                dict with 'is_valid', 'actual_content', 'in_dead_code', 'confidence', 'reason'
+            """
+            # Find the file content
+            content = None
+            actual_filepath = None
+
+            parts = self.state.prompt.split("### File:")
+            for part in parts[1:]:
+                lines = part.split("\n")
+                if not lines:
+                    continue
+                file_path = lines[0].strip()
+                if filepath in file_path or file_path.endswith(filepath):
+                    content = "\n".join(lines[1:])
+                    actual_filepath = file_path
+                    break
+
+            if content is None:
+                return {
+                    'is_valid': False,
+                    'actual_content': None,
+                    'in_dead_code': False,
+                    'confidence': 'LOW',
+                    'reason': f"File not found: {filepath}"
+                }
+
+            # Get or compute dead code regions for this file
+            if actual_filepath not in self.state.dead_code_regions:
+                self.state.dead_code_regions[actual_filepath] = find_dead_code_regions(content, actual_filepath)
+
+            # Use the content analyzer
+            result = verify_line_reference(
+                content,
+                actual_filepath,
+                line_num,
+                expected_pattern,
+                self.state.dead_code_regions[actual_filepath]
+            )
+
+            return {
+                'is_valid': result.is_valid,
+                'actual_content': result.actual_content,
+                'in_dead_code': result.in_dead_code,
+                'confidence': result.confidence.value,
+                'reason': result.reason
+            }
+
+        return verify_line
+
+    def _create_check_dead_code_function(self) -> Callable[[str], list[dict]]:
+        """Create the check_dead_code helper function for dead code detection."""
+
+        def check_dead_code(filepath: str) -> list[dict]:
+            """
+            Check if a file has dead code regions (#if false, #if DEBUG, etc.)
+
+            Args:
+                filepath: Path to the file
+
+            Returns:
+                List of dead code regions with start_line, end_line, condition
+            """
+            # Find the file content
+            content = None
+            actual_filepath = None
+
+            parts = self.state.prompt.split("### File:")
+            for part in parts[1:]:
+                lines = part.split("\n")
+                if not lines:
+                    continue
+                file_path = lines[0].strip()
+                if filepath in file_path or file_path.endswith(filepath):
+                    content = "\n".join(lines[1:])
+                    actual_filepath = file_path
+                    break
+
+            if content is None:
+                return []
+
+            # Get or compute dead code regions
+            if actual_filepath not in self.state.dead_code_regions:
+                self.state.dead_code_regions[actual_filepath] = find_dead_code_regions(content, actual_filepath)
+
+            # Convert to dicts for REPL
+            return [
+                {
+                    'start_line': r.start_line,
+                    'end_line': r.end_line,
+                    'condition': r.condition,
+                    'language': r.language
+                }
+                for r in self.state.dead_code_regions[actual_filepath]
+            ]
+
+        return check_dead_code
+
+    def _create_is_implemented_function(self) -> Callable[[str, str], dict]:
+        """Create the is_implemented helper function for checking function implementation."""
+
+        def is_implemented(filepath: str, function_name: str) -> dict:
+            """
+            Check if a function is actually implemented (not just a stub).
+
+            Args:
+                filepath: Path to the file
+                function_name: Name of function to check
+
+            Returns:
+                dict with 'is_implemented', 'has_body', 'is_stub', 'body_lines', 'confidence', 'reason'
+            """
+            # Find the file content
+            content = None
+            actual_filepath = None
+
+            parts = self.state.prompt.split("### File:")
+            for part in parts[1:]:
+                lines = part.split("\n")
+                if not lines:
+                    continue
+                file_path = lines[0].strip()
+                if filepath in file_path or file_path.endswith(filepath):
+                    content = "\n".join(lines[1:])
+                    actual_filepath = file_path
+                    break
+
+            if content is None:
+                return {
+                    'is_implemented': False,
+                    'has_body': False,
+                    'is_stub': False,
+                    'body_lines': 0,
+                    'confidence': 'LOW',
+                    'reason': f"File not found: {filepath}"
+                }
+
+            # Use the content analyzer
+            status = check_implementation_status(content, function_name, actual_filepath)
+
+            return {
+                'is_implemented': status.is_implemented,
+                'has_body': status.has_body,
+                'is_stub': status.is_stub,
+                'body_lines': status.body_lines,
+                'confidence': status.confidence.value,
+                'reason': status.reason
+            }
+
+        return is_implemented
+
     def _create_safe_globals(self) -> dict[str, Any]:
         """Create a restricted execution environment."""
         # Allow safe builtins only - REMOVED dangerous ones:
@@ -449,25 +754,44 @@ Start by discovering what files are in the prompt, then use extract_with_lines()
             "prompt": self.state.prompt,
             "llm_query": self._create_llm_query_function(),
             "extract_with_lines": self._create_extract_with_lines_function(),
+            "verify_line": self._create_verify_line_function(),
+            "check_dead_code": self._create_check_dead_code_function(),
+            "is_implemented": self._create_is_implemented_function(),
             "re": re,  # Regex support
             "FINAL_ANSWER": None,
             **self.state.variables
         }
 
-    def execute_code(self, code: str) -> tuple[str, bool]:
+    def execute_code(self, code: str, allow_repair: bool = True) -> tuple[str, bool]:
         """
         Execute Python code in the sandboxed REPL environment.
 
         Args:
             code: Python code to execute
+            allow_repair: If True, attempt to repair common syntax errors
 
         Returns:
             (output, success) tuple
         """
         # SECURITY: Validate code with AST analysis BEFORE execution
-        is_safe, validation_errors = validate_code(code)
+        is_safe, validation_errors, syntax_error = validate_code(code)
+
         if not is_safe:
+            # Attempt syntax repair if it's a syntax error
+            if syntax_error and allow_repair:
+                repaired_code, repair_desc = attempt_syntax_repair(code, syntax_error)
+                if repaired_code:
+                    # Re-validate repaired code
+                    is_repaired_safe, repaired_errors, _ = validate_code(repaired_code)
+                    if is_repaired_safe:
+                        # Recursively execute repaired code (but don't allow further repair)
+                        output, success = self.execute_code(repaired_code, allow_repair=False)
+                        if success:
+                            return f"[Auto-repaired: {repair_desc}]\n{output}", True
+
             error_msg = "Code rejected for security reasons:\n" + "\n".join(f"  - {e}" for e in validation_errors)
+            if syntax_error:
+                error_msg += "\n\nHint: Check that all strings (especially triple-quoted ones) are properly closed."
             self.state.output_history.append(error_msg)
             return error_msg, False
 
