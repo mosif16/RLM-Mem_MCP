@@ -1,0 +1,91 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# Secrets and API keys - CRITICAL
+.env
+.env.local
+.env.*.local
+*.env
+.envrc
+secrets.json
+credentials.json
+**/secrets/
+**/credentials/
+*.pem
+*.key
+*.crt
+
+# API keys patterns
+*api_key*
+*apikey*
+*API_KEY*
+*APIKEY*
+*secret*
+*SECRET*
+*.secret
+
+# Claude Code sessions (contain session data)
+.claude/sessions/
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.temp
+
+# Jupyter
+.ipynb_checkpoints/
+
+# mypy
+.mypy_cache/
+
+# Distribution
+*.tar.gz
+*.zip
