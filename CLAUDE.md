@@ -34,7 +34,36 @@ This means: **Your query drives the code the LLM writes to search the content.**
 - Quick lookups in known locations
 - Simple file operations
 
+## ⚠️ RLM Behavior Notes
+
+**RLM now auto-handles broad queries** by decomposing them into focused sub-queries.
+
+| Feature | Behavior |
+|---------|----------|
+| Broad queries ("audit everything") | Auto-decomposed into 3-4 focused queries |
+| Truncated responses | Auto-detected and continued |
+| Code execution failures | Retried up to 3 times with recovery |
+| Relevance threshold | Dynamically adjusted based on query specificity |
+
+### Still Requires Manual Verification
+
+Even with these improvements, ~40-60% of findings benefit from Grep/Read verification:
+- **False positives** can still occur (test code flagged as vulnerable, etc.)
+- **Context matters** - RLM can't understand business logic
+- **Dead code detection** - Now includes confidence levels (HIGH/MEDIUM/LOW)
+
 ## Query Construction Rules (CRITICAL)
+
+### Anti-Patterns to Avoid
+
+These query patterns consistently fail or produce unreliable results:
+
+| ❌ AVOID | Why It Fails | ✅ INSTEAD |
+|----------|--------------|------------|
+| "audit this codebase" | Too broad - LLM doesn't know what to look for | Run 3-4 focused queries (security, architecture, quality) |
+| "find all problems" | Undefined scope - returns nothing or false positives | "Find X, Y, Z issues with file:line output" |
+| "check everything for security" | Overloaded - code generation gets truncated | One query per vulnerability class |
+| "summarize and also find bugs and review architecture" | Multiple unrelated goals - partial results | Separate queries for each goal |
 
 ### Rule 1: Be Exhaustively Specific
 
@@ -104,6 +133,56 @@ Find code quality issues:
 4. Missing type hints on public functions
 5. TODO/FIXME/HACK comments (list with context)
 ```
+
+## Verification Workflow (REQUIRED)
+
+**Every RLM finding must be verified.** RLM surfaces candidates; you confirm them.
+
+### Standard Verification Steps
+
+```
+1. RLM_ANALYZE → Get list of potential issues with file:line references
+2. GREP → Search for the specific pattern RLM flagged
+3. READ → Examine the actual code in context
+4. CONFIRM/REJECT → Mark as real issue or false positive
+```
+
+### Example Workflow
+
+```bash
+# Step 1: RLM finds potential SQL injection
+rlm_analyze("Find SQL injection: string concatenation in queries", ["./src"])
+# Result: "Potential SQLi in src/db/users.py:45 - query built with f-string"
+
+# Step 2: Verify with Grep
+Grep("f\"SELECT.*{", path="./src/db")
+# Result: Confirms pattern exists in users.py:45
+
+# Step 3: Read the actual code
+Read("./src/db/users.py", offset=40, limit=15)
+# Result: See full context - is it actually user input? Parameterized elsewhere?
+
+# Step 4: Verdict
+# Real issue: Report with evidence
+# False positive: Note why (e.g., "input is sanitized at line 38")
+```
+
+### Verification Priority
+
+| RLM Confidence | Verification Effort |
+|----------------|---------------------|
+| "Definitely found X at file:line" | Quick Grep to confirm |
+| "Possibly X in file" | Grep + Read full function |
+| "May have X patterns" | Read + trace data flow |
+| "No findings" | Run narrower queries, don't trust "clean bill" |
+
+### Common False Positives
+
+RLM often flags these incorrectly:
+- **Already-implemented features** marked as "missing"
+- **Test code** flagged as "vulnerable" (intentional test cases)
+- **Commented-out code** reported as active
+- **Type-safe patterns** misidentified as injection risks
 
 ## Available Tools
 
