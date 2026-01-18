@@ -2,23 +2,23 @@
 RLM Processor for RLM-Mem MCP Server
 
 Implements the Recursive Language Model (RLM) technique from arXiv:2512.24601.
-This processor handles:
-1. Chunking large inputs
-2. Recursive sub-queries
-3. Response aggregation
-4. Memory of key findings
 
-The key insight from RLM: store large content OUTSIDE the model's context,
-then have the model write queries to peek at chunks and aggregate findings.
+THE KEY INSIGHT (from the paper):
+- Content is stored as a VARIABLE in a Python REPL (NOT in LLM context)
+- The LLM writes CODE to examine portions of the content
+- Sub-LLM responses are stored in VARIABLES (NOT summarized)
+- Full data is PRESERVED - the LLM can access any part at any time
+
+This is NOT summarization! The data is kept intact and accessible.
+
+Processing modes:
+1. REPL Mode (TRUE RLM): LLM writes code to examine content stored as variable
+2. Agent SDK Mode: Uses subagents for parallel processing
+3. Built-in Mode: Sequential chunk processing (fallback)
 
 Models Used:
-- Claude Haiku 4.5 (default): Fast, efficient chunk processing
-  - Included in Claude Max subscription at no additional API cost
-  - Perfect for relevance scoring and chunk analysis
-- Claude Sonnet: Used for complex final aggregation when needed
-
-When Claude Agent SDK is available, this processor uses subagents for
-parallel chunk processing. Otherwise, falls back to sequential API calls.
+- Claude Haiku 4.5: Sub-LLM queries via llm_query() (fast, free with Max)
+- Claude Sonnet: Orchestration - writing code to examine content
 """
 
 import asyncio
@@ -278,10 +278,10 @@ Guidelines:
         """
         Process a query against collected content using RLM technique.
 
-        Processing order:
-        1. Try Claude Agent SDK with subagents (if available and enabled)
-        2. Try official RLM library (if available)
-        3. Fall back to built-in sequential processing
+        Processing order (TRUE RLM first):
+        1. REPL Mode - Content as variable, LLM writes code (TRUE RLM from paper)
+        2. Agent SDK Mode - Subagents for parallel processing
+        3. Built-in Mode - Sequential chunk processing (fallback)
 
         Args:
             query: The query/question to answer
@@ -299,7 +299,48 @@ Guidelines:
         if progress_callback:
             progress_callback(f"Processing {scope}...")
 
-        # Try Agent SDK pipeline first (uses Haiku 4.5 for efficiency)
+        # Get combined content
+        content = collection.get_combined_content(include_headers=True)
+
+        # 1. Try TRUE RLM (REPL-based) - content as variable, LLM writes code
+        try:
+            from .repl_environment import RLMReplEnvironment
+
+            if progress_callback:
+                progress_callback("Using TRUE RLM: Content as variable, LLM writes code...")
+
+            repl = RLMReplEnvironment(self.config)
+            repl.initialize(content)
+
+            # Run the REPL session
+            response = await repl.run_rlm_session(query)
+
+            # Get all preserved sub-responses (NOT summarized!)
+            all_responses = repl.get_all_responses()
+
+            processing_time = int((time.time() - start_time) * 1000)
+
+            return RLMResult(
+                query=query,
+                scope=scope,
+                response=response,
+                chunk_results=[],
+                total_tokens_processed=collection.total_tokens,
+                total_api_calls=len(all_responses),
+                cache_hits=0,
+                processing_time_ms=processing_time,
+                truncated=False,
+                error=None
+            )
+
+        except ImportError:
+            if progress_callback:
+                progress_callback("REPL environment not available, trying alternatives...")
+        except Exception as e:
+            if progress_callback:
+                progress_callback(f"REPL mode failed: {e}, trying alternatives...")
+
+        # 2. Try Agent SDK pipeline (uses subagents)
         if self.config.use_agent_sdk:
             try:
                 from .agent_pipeline import RLMAgentPipeline
@@ -307,31 +348,30 @@ Guidelines:
                 pipeline = RLMAgentPipeline(self.config, self.cache_manager)
                 if pipeline.is_available:
                     if progress_callback:
-                        progress_callback("Using Claude Agent SDK with Haiku 4.5...")
+                        progress_callback("Using Claude Agent SDK with subagents...")
 
                     agent_result = await pipeline.process(query, collection, progress_callback)
 
-                    # Convert AgentPipelineResult to RLMResult
                     return RLMResult(
                         query=agent_result.query,
                         scope=agent_result.scope,
                         response=agent_result.response,
-                        chunk_results=[],  # Agent SDK handles internally
+                        chunk_results=[],
                         total_tokens_processed=agent_result.total_tokens,
                         total_api_calls=agent_result.chunks_processed,
-                        cache_hits=0,  # Agent SDK handles caching
+                        cache_hits=0,
                         processing_time_ms=agent_result.processing_time_ms,
                         truncated=False,
                         error=agent_result.error
                     )
             except ImportError:
                 if progress_callback:
-                    progress_callback("Agent SDK not available, using fallback...")
+                    progress_callback("Agent SDK not available...")
             except Exception as e:
                 if progress_callback:
-                    progress_callback(f"Agent SDK failed: {e}, using fallback...")
+                    progress_callback(f"Agent SDK failed: {e}...")
 
-        # Check if we can use the official RLM library
+        # 3. Check if we can use the official RLM library
         if self._rlm_available and collection.total_tokens > 50000:
             try:
                 return await self._process_with_rlm_library(
@@ -339,9 +379,9 @@ Guidelines:
                 )
             except Exception as e:
                 if progress_callback:
-                    progress_callback(f"RLM library failed, using fallback: {e}")
+                    progress_callback(f"RLM library failed: {e}")
 
-        # Use our built-in RLM implementation with Haiku 4.5
+        # 4. Fall back to built-in sequential processing
         if progress_callback:
             progress_callback(f"Using built-in processor with {self.config.model}...")
 
