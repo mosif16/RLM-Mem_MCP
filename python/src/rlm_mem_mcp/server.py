@@ -340,9 +340,13 @@ async def handle_rlm_analyze(arguments: dict[str, Any]) -> list[TextContent]:
             error_msg += f": {'; '.join(collection.errors)}"
         return [TextContent(type="text", text=error_msg)]
 
-    # Process with RLM
+    # Analyze query and use decomposition for broad queries
+    query_analysis = rlm_processor.analyze_query_quality(query)
+    _log_timing("query_analysis", start_time, is_broad=query_analysis["is_broad"], query_type=query_analysis["query_type"])
+
+    # Process with RLM (auto-decompose if broad)
     _log_timing("rlm_process:start", start_time)
-    result = await rlm_processor.process(query, collection)
+    result = await rlm_processor.process_with_decomposition(query, collection)
     _log_timing("rlm_process:complete", start_time, chunks=len(result.chunk_results))
 
     # Format output
@@ -381,9 +385,9 @@ async def handle_rlm_query_text(arguments: dict[str, Any]) -> list[TextContent]:
     # Create collection from text (use async version)
     collection = await file_collector.collect_text_async(text, "input_text")
 
-    # Process with RLM
+    # Process with RLM (auto-decompose if broad)
     _log_timing("rlm_process:start", start_time)
-    result = await rlm_processor.process(query, collection)
+    result = await rlm_processor.process_with_decomposition(query, collection)
     _log_timing("rlm_process:complete", start_time)
 
     # Format output

@@ -53,6 +53,36 @@ EARLY_TERMINATION_THRESHOLD = 0.9  # Stop if relevance exceeds this
 RATE_LIMIT_REQUESTS_PER_MINUTE = 60  # Max requests per minute
 RATE_LIMIT_TOKENS_PER_MINUTE = 100_000  # Max tokens per minute
 
+# Query quality detection - patterns that indicate overly broad queries
+BROAD_QUERY_PATTERNS = [
+    r"^(audit|check|review|analyze|find)\s+(everything|all|the\s+codebase|this\s+codebase)$",
+    r"^find\s+(all\s+)?(problems|issues|bugs)$",
+    r"^(security\s+)?audit$",
+    r"^check\s+security$",
+    r"^review\s+code$",
+    r"^summarize$",
+]
+
+# Decomposition templates for broad query types
+QUERY_DECOMPOSITIONS = {
+    "security": [
+        "Find INJECTION vulnerabilities: SQL injection via string concatenation, command injection via subprocess/os.system/exec, code injection via eval/exec. For each: file:line, code snippet, severity.",
+        "Find HARDCODED SECRETS: API keys, passwords, tokens, private keys in source code. Look for patterns like 'api_key=', 'password=', 'secret=', 'token='. For each: file:line, code snippet.",
+        "Find AUTH/ACCESS issues: missing authentication checks, broken access controls, session management flaws. For each: file:line, code snippet.",
+        "Find DATA EXPOSURE: sensitive data logging, unencrypted storage, insecure transmission. For each: file:line, code snippet.",
+    ],
+    "quality": [
+        "Find CODE QUALITY issues: functions over 50 lines, deeply nested code (3+ levels), duplicate logic. For each: file:line, description.",
+        "Find ERROR HANDLING issues: bare except clauses, swallowed exceptions, missing try/except around I/O. For each: file:line, code snippet.",
+        "Find TYPE SAFETY issues: missing type hints on public functions, unsafe type coercion. For each: file:line, description.",
+    ],
+    "architecture": [
+        "Map MODULES: list all modules/packages, their single-line purpose, main entry points.",
+        "Map DEPENDENCIES: which modules import which, external dependencies used.",
+        "Find ARCHITECTURAL concerns: circular dependencies, god classes, tight coupling.",
+    ],
+}
+
 
 @dataclass
 class ChunkResult:
@@ -461,6 +491,124 @@ Guidelines:
             return 0
         return len(self.encoder.encode(text))
 
+    def analyze_query_quality(self, query: str) -> dict[str, Any]:
+        """
+        Analyze query quality and detect if it's too broad.
+
+        Returns dict with:
+        - is_broad: True if query is too vague
+        - query_type: Detected type (security, quality, architecture, general)
+        - suggested_decomposition: List of focused sub-queries if broad
+        - relevance_threshold: Adjusted threshold for this query type
+        """
+        import re
+        query_lower = query.lower().strip()
+
+        # Check for broad query patterns
+        is_broad = False
+        for pattern in BROAD_QUERY_PATTERNS:
+            if re.match(pattern, query_lower, re.IGNORECASE):
+                is_broad = True
+                break
+
+        # Also check for very short queries (likely too vague)
+        if len(query_lower.split()) <= 3 and not any(c in query_lower for c in [':', '-', '(', ')']):
+            is_broad = True
+
+        # Detect query type
+        query_type = "general"
+        if any(kw in query_lower for kw in ["security", "vulnerab", "injection", "xss", "csrf", "secret", "password", "auth"]):
+            query_type = "security"
+        elif any(kw in query_lower for kw in ["quality", "code smell", "refactor", "clean", "duplicate", "complexity"]):
+            query_type = "quality"
+        elif any(kw in query_lower for kw in ["architecture", "structure", "module", "depend", "design", "pattern"]):
+            query_type = "architecture"
+
+        # Get suggested decomposition for broad queries
+        suggested_decomposition = []
+        if is_broad and query_type in QUERY_DECOMPOSITIONS:
+            suggested_decomposition = QUERY_DECOMPOSITIONS[query_type]
+        elif is_broad:
+            # Default decomposition for general broad queries
+            suggested_decomposition = QUERY_DECOMPOSITIONS.get("security", [])[:2] + \
+                                     QUERY_DECOMPOSITIONS.get("quality", [])[:1]
+
+        # Adjust relevance threshold based on query specificity
+        # Broad queries need lower threshold to catch more potential issues
+        if is_broad:
+            relevance_threshold = 0.15  # Much lower for broad queries
+        elif len(query.split()) < 10:
+            relevance_threshold = 0.25  # Slightly lower for shorter queries
+        else:
+            relevance_threshold = 0.3  # Normal threshold for specific queries
+
+        return {
+            "is_broad": is_broad,
+            "query_type": query_type,
+            "suggested_decomposition": suggested_decomposition,
+            "relevance_threshold": relevance_threshold,
+            "original_query": query,
+        }
+
+    async def process_with_decomposition(
+        self,
+        query: str,
+        collection: CollectionResult,
+        progress_callback: Callable[[str], None] | None = None
+    ) -> RLMResult:
+        """
+        Process query with automatic decomposition for broad queries.
+
+        If query is too broad, decomposes into focused sub-queries and
+        aggregates results.
+        """
+        analysis = self.analyze_query_quality(query)
+
+        if not analysis["is_broad"] or not analysis["suggested_decomposition"]:
+            # Query is specific enough, process normally
+            return await self.process(query, collection, progress_callback)
+
+        if progress_callback:
+            progress_callback(f"Query is broad - decomposing into {len(analysis['suggested_decomposition'])} focused queries...")
+
+        # Process each sub-query
+        all_results = []
+        for i, sub_query in enumerate(analysis["suggested_decomposition"]):
+            if progress_callback:
+                progress_callback(f"Processing sub-query {i+1}/{len(analysis['suggested_decomposition'])}: {sub_query[:50]}...")
+
+            result = await self.process(sub_query, collection, progress_callback)
+            if result.response and "No relevant" not in result.response and "No findings" not in result.response:
+                all_results.append({
+                    "query": sub_query,
+                    "response": result.response,
+                    "chunks_processed": len(result.chunk_results),
+                })
+
+        # Aggregate all sub-query results
+        if not all_results:
+            return RLMResult(
+                query=query,
+                scope=f"Decomposed into {len(analysis['suggested_decomposition'])} sub-queries",
+                response="No findings from any sub-query. The codebase may be clean for the checked categories, or try more specific queries.",
+                total_tokens_processed=collection.total_tokens,
+            )
+
+        # Combine results
+        combined_response = f"## Analysis Results (Decomposed Query)\n\n"
+        combined_response += f"Original query \"{query}\" was broad, so it was decomposed into {len(analysis['suggested_decomposition'])} focused queries.\n\n"
+
+        for result in all_results:
+            combined_response += f"### {result['query'][:60]}...\n\n"
+            combined_response += result['response'] + "\n\n---\n\n"
+
+        return RLMResult(
+            query=query,
+            scope=f"Decomposed: {len(all_results)}/{len(analysis['suggested_decomposition'])} sub-queries had findings",
+            response=combined_response,
+            total_tokens_processed=collection.total_tokens,
+        )
+
     async def count_tokens_async(self, text: str) -> int:
         """Count tokens without blocking event loop."""
         if not text:
@@ -758,8 +906,15 @@ Guidelines:
         if progress_callback:
             progress_callback(f"Using built-in processor with {self.config.model}...")
 
+        # Get dynamic relevance threshold based on query analysis
+        query_analysis = self.analyze_query_quality(query)
+        relevance_threshold = query_analysis["relevance_threshold"]
+
+        if progress_callback and relevance_threshold != 0.3:
+            progress_callback(f"Using adjusted relevance threshold: {relevance_threshold}")
+
         return await self._process_builtin(
-            query, collection, scope, start_time, progress_callback
+            query, collection, scope, start_time, progress_callback, relevance_threshold
         )
 
     async def _process_builtin(
@@ -768,7 +923,8 @@ Guidelines:
         collection: CollectionResult,
         scope: str,
         start_time: float,
-        progress_callback: Callable[[str], None] | None
+        progress_callback: Callable[[str], None] | None,
+        relevance_threshold: float = 0.3  # Can be overridden by query analysis
     ) -> RLMResult:
         """Process using built-in RLM implementation."""
         result = RLMResult(query=query, scope=scope, response="")
@@ -793,9 +949,9 @@ Guidelines:
                 self.count_tokens(c) for c in chunks
             )
 
-            # Filter to relevant chunks
+            # Filter to relevant chunks using dynamic threshold
             relevant_results = [
-                r for r in chunk_results if r.relevance_score >= 0.3
+                r for r in chunk_results if r.relevance_score >= relevance_threshold
             ]
 
             if not relevant_results:
