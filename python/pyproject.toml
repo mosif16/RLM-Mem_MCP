@@ -5,11 +5,10 @@ build-backend = "hatchling.build"
 [project]
 name = "rlm-mem-mcp"
 version = "1.0.0"
-description = "MCP Server implementing RLM (Recursive Language Model) for ultimate context management with Claude"
-readme = "README.md"
+description = "MCP Server implementing RLM (Recursive Language Model) for ultimate context management via OpenRouter"
 requires-python = ">=3.10"
 license = "MIT"
-keywords = ["mcp", "claude", "anthropic", "rlm", "context-management", "prompt-caching"]
+keywords = ["mcp", "rlm", "context-management", "openrouter", "gemini"]
 authors = [
     { name = "RLM-Mem MCP Contributors" }
 ]
@@ -24,9 +23,11 @@ classifiers = [
 ]
 dependencies = [
     "mcp>=1.0.0",
-    "anthropic>=0.39.0",
+    "openai>=1.0.0",
     "tiktoken>=0.8.0",
     "aiofiles>=24.1.0",
+    "aiosqlite>=0.20.0",
+    "httpx>=0.27.0",
     "python-dotenv>=1.0.0",
     "pydantic>=2.9.0",
 ]
@@ -62,3 +63,10 @@ select = ["E", "F", "I", "N", "W", "UP"]
 [tool.mypy]
 python_version = "3.10"
 strict = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short"

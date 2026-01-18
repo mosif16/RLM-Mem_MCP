@@ -19,7 +19,7 @@ import asyncio
 from dataclasses import dataclass
 from typing import Any, AsyncIterator, Callable
 
-from .config import RLMConfig, resolve_model
+from .config import RLMConfig
 from .file_collector import CollectionResult
 from .cache_manager import CacheManager
 
@@ -54,6 +54,11 @@ class RLMAgentPipeline:
     4. Leverages prompt caching for repeated system prompts
 
     Optimized for Claude Max subscription where Haiku calls are included.
+
+    Performance Optimizations:
+    - Cached subagent definitions (created once per instance)
+    - Batch relevance scoring support
+    - File list mode for RAG-style processing
     """
 
     def __init__(
@@ -70,6 +75,9 @@ class RLMAgentPipeline:
         self._ClaudeAgentOptions = None
         self._AgentDefinition = None
 
+        # Cached subagent definitions (created once)
+        self._cached_subagent_definitions: dict[str, Any] | None = None
+
         try:
             from claude_agent_sdk import query, ClaudeAgentOptions, AgentDefinition
             self._agent_sdk_available = True
@@ -85,19 +93,24 @@ class RLMAgentPipeline:
         return self._agent_sdk_available
 
     def _create_subagent_definitions(self) -> dict[str, Any]:
-        """Create subagent definitions for the pipeline."""
+        """Create subagent definitions for the pipeline (cached)."""
+        # Return cached definitions if available
+        if self._cached_subagent_definitions is not None:
+            return self._cached_subagent_definitions
+
         if not self._AgentDefinition:
             return {}
 
-        return {
-            # Relevance scorer - fast assessment using Haiku
+        definitions = {
+            # Relevance scorer - fast assessment using Haiku (supports batch)
             "relevance-scorer": self._AgentDefinition(
                 description=(
                     "Quickly scores content chunks for relevance to a query. "
+                    "Supports BATCH scoring: pass multiple file paths comma-separated. "
                     "Use this to filter which chunks need deeper analysis."
                 ),
-                prompt="""You are a relevance scorer. Given a query and content chunk,
-output ONLY a relevance score from 0.0 to 1.0.
+                prompt="""You are a relevance scorer. Given a query and content/file paths,
+output relevance scores from 0.0 to 1.0.
 
 Scoring guide:
 - 0.0-0.2: Completely irrelevant
@@ -106,7 +119,12 @@ Scoring guide:
 - 0.7-0.8: Quite relevant
 - 0.9-1.0: Highly relevant
 
-Output format: Just the number, nothing else.""",
+For BATCH scoring (multiple files), output one line per file:
+file_path: score
+
+For single items, output just the number.
+
+Be fast and concise - this is for filtering, not detailed analysis.""",
                 tools=["Read"],
                 model="haiku"  # Fast Haiku for scoring
             ),
@@ -152,6 +170,10 @@ Output a cohesive analysis that addresses the original query.""",
                 model="sonnet"  # Sonnet for complex aggregation
             ),
         }
+
+        # Cache the definitions for future calls
+        self._cached_subagent_definitions = definitions
+        return definitions
 
     async def process(
         self,
@@ -261,6 +283,65 @@ Output a cohesive analysis that addresses the original query.""",
         collection: CollectionResult
     ) -> str:
         """Build the orchestration prompt for the agent pipeline."""
+
+        # Use RAG-style approach for large collections
+        use_rag_style = collection.file_count > 20 or collection.total_tokens > 50000
+
+        if use_rag_style:
+            return self._build_rag_style_prompt(query, collection)
+        else:
+            return self._build_full_content_prompt(query, content, collection)
+
+    def _build_rag_style_prompt(
+        self,
+        query: str,
+        collection: CollectionResult
+    ) -> str:
+        """Build RAG-style prompt with file list (for large collections)."""
+
+        file_summaries = collection.get_file_summaries()
+
+        return f"""You are an RLM (Recursive Language Model) orchestrator analyzing a codebase.
+
+## Query
+{query}
+
+## Available Files ({collection.file_count} files, ~{collection.total_tokens:,} tokens)
+
+{file_summaries}
+
+## Your Process (RAG-Style)
+
+1. **Select Relevant Files**: Based on the file names and summaries above, identify which
+   files are most likely relevant to the query. Use the `relevance-scorer` subagent to
+   batch-score files if needed.
+
+2. **Read & Analyze**: Use the Read tool to fetch content of relevant files, then use
+   the `chunk-analyzer` subagent to extract detailed findings.
+
+3. **Aggregate Results**: Use the `aggregator` subagent to synthesize findings.
+
+## Batch Relevance Scoring
+
+To efficiently score multiple files, provide a comma-separated list of file paths to evaluate.
+Example: "src/auth.py, src/login.py, src/session.py"
+
+## Instructions
+
+1. Review the file list above
+2. Identify the 5-10 most likely relevant files for: "{query}"
+3. Read and analyze those files
+4. Aggregate findings into a comprehensive response
+
+Begin your analysis now."""
+
+    def _build_full_content_prompt(
+        self,
+        query: str,
+        content: str,
+        collection: CollectionResult
+    ) -> str:
+        """Build full content prompt (for smaller collections)."""
 
         # Truncate content if too large for the prompt
         max_content_chars = 50000  # ~12k tokens
