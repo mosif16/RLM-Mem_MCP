@@ -189,14 +189,15 @@ def create_server() -> Server:
                         },
                         "scan_mode": {
                             "type": "string",
-                            "enum": ["auto", "ios", "security", "quality", "all"],
+                            "enum": ["auto", "ios", "ios-strict", "security", "quality", "all"],
                             "description": (
                                 "Pre-configured scan mode. Options:\n"
                                 "• 'auto' (default): Auto-detect based on query and file types\n"
-                                "• 'ios': Run all iOS/Swift scanners (force unwraps, weak self, @MainActor, etc.)\n"
-                                "• 'security': Run all security scanners (secrets, injection, XSS, etc.)\n"
+                                "• 'ios': Run iOS/Swift scanners (security + crash issues)\n"
+                                "• 'ios-strict': iOS scan with HIGH confidence only (minimal noise)\n"
+                                "• 'security': Run security scanners (secrets, injection, XSS)\n"
                                 "• 'quality': Run code quality scanners (long functions, TODOs)\n"
-                                "• 'all': Run all available scanners"
+                                "• 'all': Run all scanners including quality checks"
                             ),
                         },
                         "min_confidence": {
@@ -204,9 +205,16 @@ def create_server() -> Server:
                             "enum": ["LOW", "MEDIUM", "HIGH"],
                             "description": (
                                 "Minimum confidence level for findings. Options:\n"
-                                "• 'LOW' (default): Include all findings\n"
-                                "• 'MEDIUM': Filter out low-confidence noise\n"
+                                "• 'LOW': Include all findings (comprehensive but noisy)\n"
+                                "• 'MEDIUM' (default): Filter out low-confidence noise\n"
                                 "• 'HIGH': Only high-confidence, verified findings"
+                            ),
+                        },
+                        "include_quality": {
+                            "type": "boolean",
+                            "description": (
+                                "Include code quality checks (long functions, TODOs). "
+                                "Default: false. Quality checks are excluded by default to focus on bugs/security."
                             ),
                         },
                     },
@@ -329,6 +337,159 @@ def create_server() -> Server:
             return [TextContent(type="text", text=f"Error: {str(e)}")]
 
     return server
+
+
+# =============================================================================
+# LITERAL SEARCH DETECTION AND FAST-PATH
+# =============================================================================
+# These functions detect when a query is looking for literal strings (grep-like)
+# and bypass the LLM routing for faster, more accurate results.
+
+
+import re as _re
+
+
+def _extract_quoted_strings(query: str) -> list[str]:
+    """
+    Extract quoted strings from a query.
+
+    Handles both single and double quotes:
+    - "tasks-main" -> tasks-main
+    - 'task tracking' -> task tracking
+
+    Returns:
+        List of strings found in quotes
+    """
+    # Match both single and double quoted strings
+    pattern = r'["\']([^"\']+)["\']'
+    matches = _re.findall(pattern, query)
+    return matches
+
+
+def _is_literal_search_query(query: str) -> tuple[bool, list[str]]:
+    """
+    Detect if a query is asking for literal string search.
+
+    Indicators of literal search:
+    1. Contains quoted strings ("foo", 'bar')
+    2. Uses search keywords: "find files", "search for", "grep", "containing", "mentioning"
+    3. NOT asking for analysis/audit/review/security
+
+    Returns:
+        (is_literal_search, list_of_search_terms)
+    """
+    query_lower = query.lower()
+
+    # Extract quoted strings
+    quoted_strings = _extract_quoted_strings(query)
+
+    if not quoted_strings:
+        return False, []
+
+    # Keywords that indicate literal search intent
+    search_keywords = [
+        "find files", "find all files", "search for", "grep", "containing",
+        "mentioning", "with the string", "that contain", "that mention",
+        "where is", "which files", "what files", "list files",
+        "files with", "files containing", "files mentioning",
+        "related to", "references to", "uses of"
+    ]
+
+    # Keywords that indicate analysis intent (NOT literal search)
+    analysis_keywords = [
+        "security", "audit", "vulnerab", "injection", "xss",
+        "memory leak", "retain cycle", "force unwrap",
+        "code quality", "refactor", "bug", "issue", "problem"
+    ]
+
+    # Check for analysis keywords - if present, it's not a pure literal search
+    has_analysis_intent = any(kw in query_lower for kw in analysis_keywords)
+
+    # Check for search keywords
+    has_search_intent = any(kw in query_lower for kw in search_keywords)
+
+    # If we have quoted strings AND search keywords AND NOT analysis keywords
+    # -> This is a literal search
+    if quoted_strings and has_search_intent and not has_analysis_intent:
+        return True, quoted_strings
+
+    # If we have quoted strings but no analysis keywords and query is short
+    # -> Likely a literal search
+    if quoted_strings and not has_analysis_intent and len(query.split()) < 15:
+        return True, quoted_strings
+
+    return False, []
+
+
+def _perform_literal_search(content: str, search_terms: list[str]) -> str:
+    """
+    Perform grep-like literal search on content.
+
+    This is the fast-path that bypasses LLM routing entirely.
+
+    Args:
+        content: The combined file content (with ### File: headers)
+        search_terms: List of literal strings to search for
+
+    Returns:
+        Formatted search results
+    """
+    results = []
+    current_file = "unknown"
+    line_number = 0
+
+    # Track findings per search term
+    findings: dict[str, list[dict]] = {term: [] for term in search_terms}
+
+    for line in content.split('\n'):
+        line_number += 1
+
+        # Track current file from headers
+        if line.startswith("### File:"):
+            current_file = line.replace("### File:", "").strip()
+            line_number = 0  # Reset for new file
+            continue
+
+        # Check each search term (case-insensitive)
+        line_lower = line.lower()
+        for term in search_terms:
+            if term.lower() in line_lower:
+                findings[term].append({
+                    "file": current_file,
+                    "line": line_number,
+                    "content": line.strip()[:200]  # Truncate long lines
+                })
+
+    # Format results
+    output_parts = ["## Literal Search Results\n"]
+    total_matches = 0
+
+    for term, matches in findings.items():
+        total_matches += len(matches)
+        output_parts.append(f"\n### \"{term}\" ({len(matches)} matches)\n")
+
+        if not matches:
+            output_parts.append("No matches found.\n")
+        else:
+            # Group by file
+            by_file: dict[str, list[dict]] = {}
+            for match in matches:
+                file = match["file"]
+                if file not in by_file:
+                    by_file[file] = []
+                by_file[file].append(match)
+
+            for file, file_matches in by_file.items():
+                output_parts.append(f"\n**{file}**\n")
+                for m in file_matches[:10]:  # Limit per file
+                    output_parts.append(f"  Line {m['line']}: `{m['content']}`\n")
+                if len(file_matches) > 10:
+                    output_parts.append(f"  ... and {len(file_matches) - 10} more matches\n")
+
+    output_parts.append(f"\n---\n*Total: {total_matches} matches across {len(search_terms)} search term(s)*\n")
+    output_parts.append("*Tip: Use native Grep tool for better performance on literal searches.*\n")
+
+    return "".join(output_parts)
 
 
 # Tool routing prompt for LLM-based auto-routing
@@ -571,28 +732,88 @@ def _format_tool_results(
     all_results: list[ToolResult],
     tools_run: list[str]
 ) -> tuple[str, list[ToolResult]]:
-    """Format tool results into markdown output."""
+    """Format tool results into markdown output with severity grouping."""
     if not all_results:
         return "", []
 
-    # Format results
-    output_parts = [f"## Structured Tool Results (LLM-Routed: {', '.join(tools_run)})\n"]
+    # Count findings by severity
+    severity_counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0}
+    confidence_counts = {"HIGH": 0, "MEDIUM": 0, "LOW": 0}
     total_findings = 0
-    high_confidence_findings = 0
 
     for result in all_results:
-        if result.findings:
-            output_parts.append(result.to_markdown())
-            output_parts.append("\n---\n")
-            total_findings += result.count
-            high_confidence_findings += len(result.high_confidence)
+        for finding in result.findings:
+            total_findings += 1
+            sev = finding.severity.value if hasattr(finding.severity, 'value') else str(finding.severity)
+            conf = finding.confidence.value if hasattr(finding.confidence, 'value') else str(finding.confidence)
+            severity_counts[sev] = severity_counts.get(sev, 0) + 1
+            confidence_counts[conf] = confidence_counts.get(conf, 0) + 1
 
     if total_findings == 0:
-        return f"## Structured Tool Results\n\n**Tools Run**: {', '.join(tools_run)}\n**Findings**: None\n", all_results
+        return f"## Scan Results\n\n**Tools Run**: {', '.join(tools_run)}\n**Findings**: None - code looks clean!\n", all_results
 
-    # Add summary at top
-    summary = f"**Summary**: {total_findings} findings ({high_confidence_findings} high confidence) from {len(tools_run)} tools\n\n"
-    output_parts.insert(1, summary)
+    # Build severity summary
+    output_parts = [f"## Scan Results\n"]
+
+    # Severity breakdown (actionable summary)
+    summary_lines = []
+    if severity_counts["CRITICAL"] > 0:
+        summary_lines.append(f"🔴 **Critical**: {severity_counts['CRITICAL']} (fix immediately)")
+    if severity_counts["HIGH"] > 0:
+        summary_lines.append(f"🟠 **High**: {severity_counts['HIGH']} (fix soon)")
+    if severity_counts["MEDIUM"] > 0:
+        summary_lines.append(f"🟡 **Medium**: {severity_counts['MEDIUM']} (review when possible)")
+    if severity_counts["LOW"] > 0:
+        summary_lines.append(f"🟢 **Low**: {severity_counts['LOW']} (minor issues)")
+    if severity_counts["INFO"] > 0:
+        summary_lines.append(f"ℹ️ **Info**: {severity_counts['INFO']} (informational)")
+
+    output_parts.append("\n".join(summary_lines))
+    output_parts.append(f"\n\n**Total**: {total_findings} findings | **High confidence**: {confidence_counts['HIGH']}\n")
+    output_parts.append(f"**Tools**: {', '.join(tools_run)}\n")
+    output_parts.append("\n---\n")
+
+    # Group findings by severity (Critical/High first)
+    critical_high = []
+    medium_low = []
+
+    for result in all_results:
+        for finding in result.findings:
+            sev = finding.severity.value if hasattr(finding.severity, 'value') else str(finding.severity)
+            if sev in ("CRITICAL", "HIGH"):
+                critical_high.append((result.tool_name, finding))
+            else:
+                medium_low.append((result.tool_name, finding))
+
+    # Output critical/high findings first
+    if critical_high:
+        output_parts.append("\n### Critical & High Priority\n")
+        for tool_name, finding in critical_high:
+            conf = finding.confidence.value if hasattr(finding.confidence, 'value') else str(finding.confidence)
+            sev = finding.severity.value if hasattr(finding.severity, 'value') else str(finding.severity)
+            output_parts.append(f"**{finding.file}:{finding.line}** [{sev}] [{conf} confidence]\n")
+            output_parts.append(f"  {finding.issue}\n")
+            if finding.code:
+                output_parts.append(f"  ```\n  {finding.code[:150]}\n  ```\n")
+            if finding.fix:
+                output_parts.append(f"  💡 Fix: {finding.fix}\n")
+            output_parts.append("\n")
+
+    # Output medium/low findings (collapsed if many)
+    if medium_low:
+        if len(medium_low) > 10:
+            output_parts.append(f"\n### Medium & Low Priority ({len(medium_low)} findings)\n")
+            output_parts.append("<details><summary>Click to expand</summary>\n\n")
+            for tool_name, finding in medium_low[:20]:  # Limit to 20
+                output_parts.append(f"- **{finding.file}:{finding.line}**: {finding.issue}\n")
+            if len(medium_low) > 20:
+                output_parts.append(f"\n*... and {len(medium_low) - 20} more*\n")
+            output_parts.append("\n</details>\n")
+        else:
+            output_parts.append(f"\n### Medium & Low Priority\n")
+            for tool_name, finding in medium_low:
+                conf = finding.confidence.value if hasattr(finding.confidence, 'value') else str(finding.confidence)
+                output_parts.append(f"- **{finding.file}:{finding.line}** [{conf}]: {finding.issue}\n")
 
     return "\n".join(output_parts), all_results
 
@@ -649,14 +870,46 @@ def _run_structured_tools_for_query_type(
     return _format_tool_results(all_results, tools_run)
 
 
+async def _write_progress(session_id: str, event_type: str, message: str, progress: float, details: dict = None):
+    """L4: Write progress event to memory store for client polling."""
+    global _memory_store, _tag_index
+    import uuid
+
+    if not session_id:
+        return
+
+    progress_data = {
+        "event_type": event_type,
+        "message": message,
+        "progress_percent": progress,
+        "timestamp": time.time(),
+        "details": details or {}
+    }
+
+    key = f"progress:{session_id}"
+    _memory_store[key] = {
+        "value": json.dumps(progress_data),
+        "tags": ["progress", "active"],
+        "timestamp": time.time()
+    }
+    # Update tag index
+    for tag in ["progress", "active"]:
+        _tag_index[tag].add(key)
+
+
 async def handle_rlm_analyze(arguments: dict[str, Any]) -> list[TextContent]:
     """Handle rlm_analyze tool call with semantic caching and result verification."""
+    import uuid
     start_time = time.time()
+
+    # L4: Generate session ID for progress tracking
+    session_id = arguments.get("session_id") or str(uuid.uuid4())[:8]
 
     query = arguments.get("query", "")
     paths = arguments.get("paths", [])
-    scan_mode = arguments.get("scan_mode", "auto")  # auto, ios, security, quality, all
-    min_confidence = arguments.get("min_confidence", "LOW")  # LOW, MEDIUM, HIGH
+    scan_mode = arguments.get("scan_mode", "auto")  # auto, ios, ios-strict, security, quality, all
+    min_confidence = arguments.get("min_confidence", "MEDIUM")  # LOW, MEDIUM, HIGH (default MEDIUM to reduce noise)
+    include_quality = arguments.get("include_quality", False)  # Include code style checks
 
     # Input validation
     if not query:
@@ -689,10 +942,16 @@ async def handle_rlm_analyze(arguments: dict[str, Any]) -> list[TextContent]:
     if errors:
         return [TextContent(type="text", text=f"Configuration error: {'; '.join(errors)}")]
 
+    # L4: Start progress tracking
+    await _write_progress(session_id, "start", "Starting analysis...", 0, {"query": query[:100], "paths": paths})
+
     # Collect files using async method
     _log_timing("file_collection:start", start_time, path_count=len(paths))
     collection = await file_collector.collect_paths_async(paths)
     _log_timing("file_collection:complete", start_time, file_count=collection.file_count)
+
+    # L4: Progress after file collection
+    await _write_progress(session_id, "files_collected", f"Collected {collection.file_count} files", 20, {"file_count": collection.file_count})
 
     if collection.file_count == 0:
         error_msg = "No matching files found"
@@ -717,10 +976,41 @@ async def handle_rlm_analyze(arguments: dict[str, Any]) -> list[TextContent]:
     query_analysis = rlm_processor.analyze_query_quality(query)
     _log_timing("query_analysis", start_time, is_broad=query_analysis["is_broad"], query_type=query_analysis["query_type"])
 
+    # L3: Auto-select scan_mode based on detected query type when mode is "auto"
+    detected_type = query_analysis["query_type"]
+    if scan_mode == "auto" and detected_type != "general":
+        # Map query types to scan modes
+        type_to_scan_mode = {
+            "ios": "ios",
+            "security": "security",
+            "quality": "quality",
+        }
+        if detected_type in type_to_scan_mode:
+            scan_mode = type_to_scan_mode[detected_type]
+            print(f"[RLM] Auto-selected scan_mode='{scan_mode}' based on query type '{detected_type}'", file=sys.stderr)
+
+    # Get combined content early for fast-path checks
+    content = collection.get_combined_content(include_headers=True)
+
+    # ===== FAST-PATH: LITERAL SEARCH =====
+    # Check if this is a literal string search (grep-like query with quoted strings)
+    # If so, bypass all LLM routing and perform direct search
+    is_literal, search_terms = _is_literal_search_query(query)
+    if is_literal and search_terms:
+        _log_timing("literal_search:detected", start_time, terms=search_terms)
+        print(f"[RLM] Literal search detected: {search_terms}", file=sys.stderr)
+
+        # Perform fast grep-like search
+        literal_result = _perform_literal_search(content, search_terms)
+        processing_time = int((time.time() - start_time) * 1000)
+
+        literal_result += f"\n*Scanned {collection.file_count} files in {processing_time}ms (literal search fast-path)*"
+
+        return [TextContent(type="text", text=literal_result)]
+
     # ===== DOUBLE-LAYER AUTO-ROUTING =====
     # Layer 1: LLM decides which tools to run (intelligent routing)
     # Layer 2: Structured tools execute deterministically (reliable execution)
-    content = collection.get_combined_content(include_headers=True)
 
     # Handle explicit scan_mode
     if scan_mode != "auto":
@@ -728,19 +1018,31 @@ async def handle_rlm_analyze(arguments: dict[str, Any]) -> list[TextContent]:
         tools = StructuredTools(content)
 
         if scan_mode == "ios":
-            structured_results = tools.run_ios_scan(min_confidence=min_confidence)
+            structured_results = tools.run_ios_scan(
+                min_confidence=min_confidence,
+                include_quality=include_quality
+            )
             tools_to_run = ["ios_scan"]
+        elif scan_mode == "ios-strict":
+            # iOS-strict: only security/crash issues, no quality, HIGH confidence
+            structured_results = tools.run_ios_scan(
+                min_confidence="HIGH",
+                include_quality=False
+            )
+            tools_to_run = ["ios_scan (strict)"]
         elif scan_mode == "security":
-            structured_results = tools.run_security_scan(min_confidence=min_confidence)
+            structured_results = tools.run_security_scan(
+                min_confidence=min_confidence,
+                include_quality=include_quality
+            )
             tools_to_run = ["security_scan"]
         elif scan_mode == "quality":
             structured_results = tools.run_quality_scan(min_confidence=min_confidence)
             tools_to_run = ["quality_scan"]
         elif scan_mode == "all":
             structured_results = (
-                tools.run_ios_scan(min_confidence=min_confidence) +
-                tools.run_security_scan(min_confidence=min_confidence) +
-                tools.run_quality_scan(min_confidence=min_confidence)
+                tools.run_ios_scan(min_confidence=min_confidence, include_quality=True) +
+                tools.run_security_scan(min_confidence=min_confidence, include_quality=False)
             )
             tools_to_run = ["ios_scan", "security_scan", "quality_scan"]
         else:
@@ -787,7 +1089,14 @@ async def handle_rlm_analyze(arguments: dict[str, Any]) -> list[TextContent]:
         if high_conf_findings >= 3 or total_findings >= 10:
             return [TextContent(type="text", text=structured_output)]
 
-    # Progress callback that logs to stderr for visibility
+    # L4: Progress before RLM processing
+    await _write_progress(session_id, "analyzing", "Running RLM analysis...", 50, {"scan_mode": scan_mode})
+
+    # Progress callback that logs to stderr and memory store
+    async def progress_log_async(msg: str) -> None:
+        import sys
+        print(f"[RLM Progress] {msg}", file=sys.stderr)
+
     def progress_log(msg: str) -> None:
         import sys
         print(f"[RLM Progress] {msg}", file=sys.stderr)
@@ -796,6 +1105,9 @@ async def handle_rlm_analyze(arguments: dict[str, Any]) -> list[TextContent]:
     _log_timing("rlm_process:start", start_time)
     result = await rlm_processor.process_with_decomposition(query, collection, progress_callback=progress_log)
     _log_timing("rlm_process:complete", start_time, chunks=len(result.chunk_results))
+
+    # L4: Progress after RLM processing
+    await _write_progress(session_id, "verifying", "Verifying findings...", 80, {"chunks_processed": len(result.chunk_results)})
 
     # Format output
     output = rlm_processor.format_result(result)
@@ -819,6 +1131,12 @@ async def handle_rlm_analyze(arguments: dict[str, Any]) -> list[TextContent]:
         final_output = structured_output + "\n\n---\n\n## Additional LLM Analysis\n\n" + verified_output
     else:
         final_output = verified_output
+
+    # L4: Progress complete
+    await _write_progress(session_id, "complete", "Analysis complete", 100, {
+        "duration_ms": int((time.time() - start_time) * 1000),
+        "session_id": session_id
+    })
 
     return [TextContent(type="text", text=final_output)]
 
@@ -878,11 +1196,17 @@ async def handle_rlm_query_text(arguments: dict[str, Any]) -> list[TextContent]:
 
 async def handle_rlm_status(arguments: dict[str, Any]) -> list[TextContent]:
     """Handle rlm_status tool call with semantic cache stats."""
+    from .rlm_processor import get_trajectory_logger, get_model_selector
+
     rlm_config, server_config, file_collector, rlm_processor, _, semantic_cache, _, _ = get_instances()
 
     # Get memory and metrics stats
     memory_stats = _memory_monitor.get_stats()
     metrics_stats = get_metrics_collector().get_stats()
+
+    # L12: Get trajectory logger stats
+    trajectory_logger = get_trajectory_logger()
+    model_selector = get_model_selector()
 
     status = {
         "server": {
@@ -907,6 +1231,10 @@ async def handle_rlm_status(arguments: dict[str, Any]) -> list[TextContent]:
         "resources": {
             "memory": memory_stats,
         },
+        # L12: Trajectory logging for debugging
+        "recent_trajectories": trajectory_logger.get_recent(5),
+        # L10: Model selector stats
+        "model_selector": model_selector.get_stats(),
     }
 
     # Add warnings if memory is high
@@ -958,7 +1286,7 @@ async def handle_memory_store(arguments: dict[str, Any]) -> list[TextContent]:
     if key not in _memory_store and len(_memory_store) >= MAX_MEMORY_ENTRIES:
         return [TextContent(type="text", text=f"Error: memory store full ({MAX_MEMORY_ENTRIES} entries max)")]
 
-    _, _, file_collector, _, _ = get_instances()
+    rlm_config, server_config, file_collector, rlm_processor, cache_manager, semantic_cache, result_verifier, project_analyzer = get_instances()
 
     # Remove old tags from index if key exists
     if key in _memory_store:

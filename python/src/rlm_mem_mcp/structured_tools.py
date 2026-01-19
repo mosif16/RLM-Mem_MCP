@@ -26,6 +26,7 @@ class Confidence(Enum):
     HIGH = "HIGH"
     MEDIUM = "MEDIUM"
     LOW = "LOW"
+    FILTERED = "FILTERED"  # L11: For false positives
 
 
 class Severity(Enum):
@@ -62,6 +63,64 @@ class Finding:
 
     def __str__(self) -> str:
         return f"**{self.file}:{self.line}** [{self.confidence.value}] - {self.issue}\n```\n{self.code}\n```"
+
+
+@dataclass
+class AnalysisContext:
+    """L11: Context for confidence calculation."""
+    in_dead_code: bool = False
+    in_test_file: bool = False
+    line_verified: bool = True
+    is_comment: bool = False
+    pattern_match_only: bool = True
+    has_semantic_verification: bool = False
+    multiple_indicators: bool = False
+
+
+def calculate_confidence(finding: Finding, context: AnalysisContext) -> Confidence:
+    """
+    L11: Apply standardized confidence criteria.
+
+    Scoring:
+    - Start at 100 (HIGH)
+    - Deduct for uncertainty factors
+    - Boost for verification factors
+    - Map final score to confidence level
+    """
+    score = 100
+
+    # Deductions
+    if context.in_dead_code:
+        score -= 50  # Dead code = likely false positive
+
+    if context.in_test_file:
+        score -= 30  # Test code = intentional patterns
+
+    if not context.line_verified:
+        score -= 20  # Can't verify exact line
+
+    if context.is_comment:
+        score -= 40  # Commented code
+
+    if context.pattern_match_only:
+        score -= 10  # No semantic verification
+
+    # Boosts
+    if context.has_semantic_verification:
+        score += 20  # LLM verified this finding
+
+    if context.multiple_indicators:
+        score += 15  # Multiple patterns match
+
+    # Map to confidence level
+    if score >= 80:
+        return Confidence.HIGH
+    elif score >= 50:
+        return Confidence.MEDIUM
+    elif score >= 20:
+        return Confidence.LOW
+    else:
+        return Confidence.FILTERED
 
 
 @dataclass
@@ -263,6 +322,59 @@ class StructuredTools:
             i += 1
 
         return in_string
+
+    def _extract_unwrapped_var(self, line: str, match) -> str | None:
+        """Extract the variable name being force unwrapped."""
+        # Get the matched text
+        if hasattr(match, 'group'):
+            matched = match.group(0)
+        else:
+            return None
+
+        # For patterns like "variable!", extract "variable"
+        if matched.endswith('!'):
+            var_name = matched[:-1].strip()
+            # Handle property access like self.property!
+            if '.' in var_name:
+                var_name = var_name.split('.')[-1]
+            return var_name if var_name.isidentifier() else None
+
+        return None
+
+    def _is_guarded_unwrap(self, filepath: str, line_num: int, var_name: str) -> bool:
+        """
+        Check if a variable is guarded by if-let/guard-let in preceding lines.
+
+        Looks back up to 15 lines for patterns like:
+        - if let varName = ...
+        - guard let varName = ...
+        - if varName != nil
+        - guard varName != nil
+        """
+        lines = self._get_file_lines(filepath)
+        if not lines:
+            return False
+
+        # Look back up to 15 lines
+        start_line = max(0, line_num - 15)
+
+        guard_patterns = [
+            rf'\bif\s+let\s+{re.escape(var_name)}\s*=',
+            rf'\bguard\s+let\s+{re.escape(var_name)}\s*=',
+            rf'\bif\s+{re.escape(var_name)}\s*!=\s*nil',
+            rf'\bguard\s+{re.escape(var_name)}\s*!=\s*nil',
+            rf'\bif\s+let\s+\w+\s*=\s*{re.escape(var_name)}\b',  # if let x = varName
+            rf'\bguard\s+let\s+\w+\s*=\s*{re.escape(var_name)}\b',  # guard let x = varName
+        ]
+
+        for i in range(start_line, line_num - 1):
+            if i < len(lines):
+                check_line = lines[i]
+                for pattern in guard_patterns:
+                    if re.search(pattern, check_line):
+                        return True
+
+        return False
 
     def _is_string_literal_pattern(self, line: str) -> bool:
         """
@@ -684,6 +796,12 @@ class StructuredTools:
                 # Lower confidence for common safe patterns that we didn't filter
                 if any(safe in line for safe in ['.first!', '.last!', 'Bundle.main', 'FileManager.default']):
                     confidence = Confidence.MEDIUM
+
+                # Check if this unwrap is guarded by if-let/guard-let in preceding lines
+                var_name = self._extract_unwrapped_var(line, match)
+                if var_name and self._is_guarded_unwrap(filepath, line_num, var_name):
+                    confidence = Confidence.LOW
+                    issue = f"{issue} (appears guarded - verify manually)"
 
                 result.findings.append(Finding(
                     file=filepath,
@@ -1240,6 +1358,127 @@ class StructuredTools:
         result.summary = f"Found {len(result.findings)} potential @MainActor issues"
         return result
 
+    def find_keychain_issues(self) -> ToolResult:
+        """
+        Find Keychain security issues in iOS/macOS code.
+
+        Searches for:
+        - SecItemAdd/Update without accessibility settings
+        - SecItemCopyMatching result not checked
+        - Biometric auth without fallback
+        - Hardcoded Keychain service/account names
+        """
+        result = ToolResult(tool_name="Keychain Security Scanner", files_scanned=len(self.files))
+
+        patterns = [
+            # SecItemAdd without kSecAttrAccessible
+            (r'''SecItemAdd\s*\([^)]+\)''',
+             "SecItemAdd - verify kSecAttrAccessible is set", Severity.MEDIUM, "keychain_accessibility"),
+
+            # SecItemUpdate without checking result
+            (r'''SecItemUpdate\s*\([^)]+\)\s*(?!\s*==|\s*!=|\s*,\s*&)''',
+             "SecItemUpdate result not checked", Severity.HIGH, "keychain_error"),
+
+            # SecItemCopyMatching without result check
+            (r'''SecItemCopyMatching\s*\([^)]+\)\s*\n\s*(?!if|guard|switch|let\s+status)''',
+             "SecItemCopyMatching - verify status is checked", Severity.MEDIUM, "keychain_error"),
+
+            # LAContext without fallback handling
+            (r'''LAContext\(\)\.evaluatePolicy[^}]*\{[^}]*(?!fallback|password|deviceOwnerAuthentication)''',
+             "Biometric auth may need fallback for devices without biometrics", Severity.LOW, "biometric"),
+
+            # Hardcoded Keychain identifiers (potential issue for obfuscation)
+            (r'''kSecAttrService[^,]*["'][a-zA-Z0-9_.]+["']''',
+             "Hardcoded Keychain service name - consider obfuscation for sensitive apps", Severity.LOW, "keychain_hardcode"),
+
+            # Storing sensitive data without Keychain (should use Keychain)
+            (r'''(?:password|token|secret|apiKey|api_key)\s*=\s*["'][^"']+["']''',
+             "Sensitive value may be hardcoded - use Keychain for runtime secrets", Severity.HIGH, "hardcoded_secret"),
+        ]
+
+        for pattern, issue, severity, category in patterns:
+            matches = self._search_pattern(pattern, file_filter=".swift")
+            for filepath, line_num, line, match in matches:
+                if self._is_in_comment(line, filepath):
+                    continue
+
+                # Check context for kSecAttrAccessible
+                confidence = Confidence.MEDIUM
+                if "kSecAttrAccessible" in line:
+                    continue  # Already has accessibility
+
+                result.findings.append(Finding(
+                    file=filepath,
+                    line=line_num,
+                    code=line[:200],
+                    issue=issue,
+                    confidence=confidence,
+                    severity=severity,
+                    fix="Use Keychain with proper kSecAttrAccessible setting",
+                    category=category,
+                ))
+
+        result.summary = f"Found {len(result.findings)} Keychain security issues"
+        return result
+
+    def find_cloudkit_sync_issues(self) -> ToolResult:
+        """
+        Find CloudKit sync pattern issues.
+
+        Searches for:
+        - CKModifyRecordsOperation without proper error handling
+        - Missing server change token persistence
+        - Subscription setup without error recovery
+        - Operations without QoS settings
+        """
+        result = ToolResult(tool_name="CloudKit Sync Scanner", files_scanned=len(self.files))
+
+        patterns = [
+            # CKModifyRecordsOperation without completion handlers
+            (r'''CKModifyRecordsOperation\s*\([^)]*\)(?![^}]*(?:perRecordSaveBlock|modifyRecordsResultBlock|completionBlock))''',
+             "CKModifyRecordsOperation may be missing result handlers", Severity.HIGH, "cloudkit_handler"),
+
+            # fetchDatabaseChanges without token persistence
+            (r'''fetchDatabaseChanges[^}]*serverChangeToken[^}]*(?!UserDefaults|save|store|persist|NSUbiquitousKeyValueStore)''',
+             "Server change token should be persisted", Severity.MEDIUM, "cloudkit_token"),
+
+            # CKOperation without qualityOfService
+            (r'''CK\w+Operation\s*\([^)]*\)[^}]*(?!qualityOfService)''',
+             "CKOperation without explicit QoS - may affect performance", Severity.LOW, "cloudkit_qos"),
+
+            # Missing CKError handling
+            (r'''\.perform\([^)]*\)\s*\{[^}]*(?!CKError|error\s*!=\s*nil|if\s+let\s+error)''',
+             "CloudKit operation may be missing error handling", Severity.MEDIUM, "cloudkit_error"),
+
+            # Record conflicts not handled
+            (r'''CKModifyRecordsOperation[^}]*savePolicy\s*=\s*\.ifServerRecordUnchanged[^}]*(?!serverRecordChanged|CKError)''',
+             "Using ifServerRecordUnchanged without conflict handling", Severity.HIGH, "cloudkit_conflict"),
+
+            # Batch size potentially too large
+            (r'''CKModifyRecordsOperation\s*\(\s*recordsToSave:\s*\w+[^)]*\)(?![^}]*\.{0,50}chunked|\.{0,50}batch)''',
+             "Large batch operations should be chunked (400 record limit)", Severity.LOW, "cloudkit_batch"),
+        ]
+
+        for pattern, issue, severity, category in patterns:
+            matches = self._search_pattern(pattern, file_filter=".swift")
+            for filepath, line_num, line, match in matches:
+                if self._is_in_comment(line, filepath):
+                    continue
+
+                result.findings.append(Finding(
+                    file=filepath,
+                    line=line_num,
+                    code=line[:200],
+                    issue=issue,
+                    confidence=Confidence.MEDIUM,
+                    severity=severity,
+                    fix="Implement proper CloudKit error handling and sync patterns",
+                    category=category,
+                ))
+
+        result.summary = f"Found {len(result.findings)} CloudKit sync issues"
+        return result
+
     def find_stateobject_issues(self) -> ToolResult:
         """
         Find @ObservedObject used where @StateObject should be used.
@@ -1577,22 +1816,23 @@ class StructuredTools:
         ]
 
         # Build pattern for UserDefaults with sensitive keys
+        # Note: Case-insensitive matching is handled by _search_pattern with re.IGNORECASE
         key_pattern = '|'.join(sensitive_keys)
         patterns = [
             # UserDefaults.standard.set with sensitive key
-            (rf'''UserDefaults[^)]*\.set\([^)]*(?i)({key_pattern})''',
+            (rf'''UserDefaults[^)]*\.set\([^)]*({key_pattern})''',
              "Sensitive data in UserDefaults - use Keychain", Severity.CRITICAL),
 
             # UserDefaults storing with sensitive key name
-            (rf'''UserDefaults[^)]*forKey:\s*["'](?i).*({key_pattern})''',
+            (rf'''UserDefaults[^)]*forKey:\s*["'].*({key_pattern})''',
              "Sensitive key in UserDefaults - use Keychain", Severity.CRITICAL),
 
             # @AppStorage with sensitive key
-            (rf'''@AppStorage\s*\(\s*["'](?i).*({key_pattern})''',
+            (rf'''@AppStorage\s*\(\s*["'].*({key_pattern})''',
              "@AppStorage with sensitive data - use Keychain", Severity.CRITICAL),
 
             # Storing in plist/file (not encrypted)
-            (rf'''\.write\([^)]*(?i)({key_pattern})[^)]*toFile:''',
+            (rf'''\.write\([^)]*({key_pattern})[^)]*toFile:''',
              "Sensitive data written to file - encrypt or use Keychain", Severity.HIGH),
         ]
 
@@ -1734,12 +1974,18 @@ class StructuredTools:
 
     # ===== RUN ALL SECURITY =====
 
-    def run_security_scan(self, min_confidence: str = "LOW") -> list[ToolResult]:
+    def run_security_scan(
+        self,
+        min_confidence: str = "MEDIUM",
+        include_quality: bool = False
+    ) -> list[ToolResult]:
         """
         Run all security-related scans.
 
         Args:
             min_confidence: Minimum confidence level ("LOW", "MEDIUM", "HIGH")
+                           Default is MEDIUM to filter noise.
+            include_quality: If True, include code quality checks.
         """
         all_results = [
             self.find_secrets(),
@@ -1751,6 +1997,9 @@ class StructuredTools:
             self.find_input_sanitization_issues(),
         ]
 
+        if include_quality:
+            all_results.extend(self.run_quality_scan(min_confidence="LOW"))
+
         if min_confidence.upper() != "LOW":
             all_results = self._filter_by_confidence(all_results, min_confidence)
 
@@ -1760,7 +2009,10 @@ class StructuredTools:
 
     def run_quality_scan(self, min_confidence: str = "LOW") -> list[ToolResult]:
         """
-        Run all quality-related scans.
+        Run all quality-related scans (style, maintainability).
+
+        Note: Quality scans are excluded from iOS/security scans by default.
+        Use include_quality=True to include them, or run separately.
 
         Args:
             min_confidence: Minimum confidence level ("LOW", "MEDIUM", "HIGH")
@@ -1777,32 +2029,44 @@ class StructuredTools:
 
     # ===== RUN ALL iOS =====
 
-    def run_ios_scan(self, min_confidence: str = "LOW") -> list[ToolResult]:
+    def run_ios_scan(
+        self,
+        min_confidence: str = "MEDIUM",
+        include_quality: bool = False
+    ) -> list[ToolResult]:
         """
         Run all iOS/Swift scans including new checks.
 
         Args:
             min_confidence: Minimum confidence level to include ("LOW", "MEDIUM", "HIGH")
-                           Use "HIGH" to filter out noise, "LOW" for comprehensive scan.
+                           Default is MEDIUM to filter noise. Use "LOW" for comprehensive scan.
+            include_quality: If True, include code quality checks (long functions, TODOs).
+                           Default is False to focus on bugs/security issues.
         """
         all_results = [
+            # Security & crash issues (always included)
             self.find_force_unwraps(),
             self.find_retain_cycles(),
             self.find_main_thread_violations(),
             self.find_weak_self_issues(),
             self.find_cloudkit_issues(),
-            self.find_deprecated_apis(),
+            self.find_cloudkit_sync_issues(),  # New: CloudKit sync patterns
             self.find_swiftdata_issues(),
             self.find_insecure_storage(),
+            self.find_keychain_issues(),  # New: Keychain security
             self.find_input_sanitization_issues(),
             self.find_missing_jailbreak_detection(),
-            # New scanners
             self.find_task_cancellation_issues(),
             self.find_mainactor_issues(),
             self.find_stateobject_issues(),
         ]
 
-        # Filter by confidence if requested
+        # Only include style/quality checks if explicitly requested
+        if include_quality:
+            all_results.append(self.find_deprecated_apis())
+            all_results.extend(self.run_quality_scan(min_confidence="LOW"))
+
+        # Filter by confidence
         if min_confidence.upper() != "LOW":
             all_results = self._filter_by_confidence(all_results, min_confidence)
 
