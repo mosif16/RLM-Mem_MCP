@@ -47,6 +47,67 @@ class RLMConfig:
         default_factory=lambda: int(os.getenv("RLM_OVERLAP_TOKENS", "200"))
     )
 
+    # Dynamic Timeout Configuration
+    base_timeout_seconds: int = field(
+        default_factory=lambda: int(os.getenv("RLM_BASE_TIMEOUT", "120"))
+    )
+    per_file_timeout_seconds: float = field(
+        default_factory=lambda: float(os.getenv("RLM_PER_FILE_TIMEOUT", "2.0"))
+    )
+    max_timeout_seconds: int = field(
+        default_factory=lambda: int(os.getenv("RLM_MAX_TIMEOUT", "600"))
+    )
+    semantic_query_multiplier: float = field(
+        default_factory=lambda: float(os.getenv("RLM_SEMANTIC_MULTIPLIER", "1.5"))
+    )
+
+    # Iteration Limits (configurable per feedback)
+    max_iterations: int = field(
+        default_factory=lambda: int(os.getenv("RLM_MAX_ITERATIONS", "25"))
+    )
+    max_consecutive_failures: int = field(
+        default_factory=lambda: int(os.getenv("RLM_MAX_FAILURES", "3"))
+    )
+
+    def calculate_timeout(
+        self,
+        file_count: int,
+        query_type: str = "pattern",
+        complexity: str = "normal"
+    ) -> int:
+        """
+        Calculate dynamic timeout based on task parameters.
+
+        Args:
+            file_count: Number of files to process
+            query_type: "pattern" (grep-like) or "semantic" (LLM analysis)
+            complexity: "simple", "normal", or "deep"
+
+        Returns:
+            Timeout in seconds
+        """
+        # Base timeout
+        timeout = self.base_timeout_seconds
+
+        # Add per-file time
+        timeout += int(file_count * self.per_file_timeout_seconds)
+
+        # Semantic queries take longer (LLM analysis vs pattern matching)
+        if query_type == "semantic":
+            timeout = int(timeout * self.semantic_query_multiplier)
+
+        # Complexity multipliers
+        complexity_multipliers = {
+            "simple": 0.7,
+            "normal": 1.0,
+            "deep": 1.5,
+            "thorough": 2.0,
+        }
+        timeout = int(timeout * complexity_multipliers.get(complexity, 1.0))
+
+        # Cap at maximum
+        return min(timeout, self.max_timeout_seconds)
+
     # File Collection Configuration
     included_extensions: Set[str] = field(default_factory=lambda: {
         # Code files
@@ -73,9 +134,19 @@ class RLMConfig:
     max_file_size_bytes: int = 1_000_000  # 1MB per file
     max_total_tokens: int = 500_000  # Maximum tokens to process
 
-    # Cache Configuration (for Anthropic API prompt caching)
-    use_cache: bool = field(default_factory=lambda: os.getenv("RLM_USE_CACHE", "true").lower() == "true")
-    cache_ttl: Literal["5m", "1h"] = field(default_factory=lambda: os.getenv("RLM_CACHE_TTL", "5m"))  # type: ignore
+    # OpenRouter Prompt Caching Configuration
+    # Gemini has implicit caching (automatic), but we can extend TTL
+    # Anthropic requires explicit cache_control
+    use_prompt_cache: bool = field(
+        default_factory=lambda: os.getenv("RLM_USE_PROMPT_CACHE", "true").lower() == "true"
+    )
+    prompt_cache_ttl: Literal["5m", "1h"] = field(
+        default_factory=lambda: os.getenv("RLM_PROMPT_CACHE_TTL", "1h")  # type: ignore
+    )
+    # Track cache usage for cost monitoring
+    track_cache_usage: bool = field(
+        default_factory=lambda: os.getenv("RLM_TRACK_CACHE_USAGE", "true").lower() == "true"
+    )
 
     def validate(self) -> list[str]:
         """Validate configuration and return list of errors."""

@@ -1220,6 +1220,14 @@ async def handle_rlm_status(arguments: dict[str, Any]) -> list[TextContent]:
             "api_key_set": bool(rlm_config.api_key),
             "max_result_tokens": rlm_config.max_result_tokens,
             "max_chunk_tokens": rlm_config.max_chunk_tokens,
+            # Dynamic timeout config
+            "base_timeout_seconds": rlm_config.base_timeout_seconds,
+            "max_timeout_seconds": rlm_config.max_timeout_seconds,
+            "max_iterations": rlm_config.max_iterations,
+            # OpenRouter prompt caching config
+            "prompt_cache_enabled": rlm_config.use_prompt_cache,
+            "prompt_cache_ttl": rlm_config.prompt_cache_ttl,
+            "cache_usage_tracking": rlm_config.track_cache_usage,
         },
         "memory_entries": len(_memory_store),
         "performance": {

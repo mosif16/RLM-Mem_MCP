@@ -42,6 +42,12 @@ from .content_analyzer import (
 )
 from .fallback_analyzer import FallbackAnalyzer
 from .structured_tools import StructuredTools, ToolResult, Finding, Confidence as ToolConfidence, Severity
+from .result_verifier import (
+    QueryResultVerifier,
+    QueryVerificationResult,
+    VerificationStatus,
+    verify_query_results,
+)
 
 
 # Dangerous attribute names that could be used for sandbox escapes
@@ -444,8 +450,26 @@ class RLMReplEnvironment:
 
         return query.strip()
 
-    # System prompt - emphasizes using STRUCTURED TOOLS over raw code
+    # System prompt - emphasizes using STRUCTURED TOOLS and VERIFICATION
     SYSTEM_PROMPT = '''You are an RLM analyzing REAL code via Python REPL with STRUCTURED TOOLS.
+
+## CRITICAL: VERIFICATION REQUIRED
+
+Before setting FINAL_ANSWER, you MUST verify your results:
+```python
+result = find_secrets()  # or other tool
+verification = verify_results("{query}", result.to_markdown())
+if verification.status.value == "FAILED":
+    print(verification.guidance)  # See what's missing, try again
+else:
+    FINAL_ANSWER = result.to_markdown()
+```
+
+Results that fail verification will be REJECTED. Requirements:
+- File:line references (e.g., `auth.py:42`)
+- Actual code snippets showing the issue
+- Confidence levels (HIGH/MEDIUM/LOW)
+- Results must match query intent
 
 ## USE STRUCTURED TOOLS (PREFERRED)
 
@@ -467,6 +491,12 @@ result = find_retain_cycles()          # Find closures missing [weak self]
 result = find_main_thread_violations() # Find UI updates off main thread
 ```
 
+### Persistence/State Tools
+```python
+result = find_persistence_patterns()  # Find localStorage, UserDefaults, CoreData usage
+result = find_state_mutations()       # Find state management patterns
+```
+
 ### Quality Tools
 ```python
 result = find_long_functions(max_lines=50)  # Find functions over N lines
@@ -484,21 +514,26 @@ result = find_imports("module")    # Find all imports of a module
 results = run_security_scan()  # Runs all security tools
 results = run_quality_scan()   # Runs all quality tools
 results = run_ios_scan()       # Runs all iOS/Swift tools
+results = run_persistence_scan()  # Runs persistence/state tools
 ```
 
 ### Using Results
 Each tool returns a `ToolResult` with:
-- `result.findings` - List of Finding objects
+- `result.findings` - List of Finding objects with file:line, code, confidence
 - `result.count` - Number of findings
 - `result.high_confidence` - Only HIGH confidence findings
 - `result.to_markdown()` - Formatted output for FINAL_ANSWER
 
 ```python
-# Example workflow
+# CORRECT workflow (with verification)
 result = find_secrets()
 if result.count > 0:
-    print(result.to_markdown())
-    FINAL_ANSWER = result.to_markdown()
+    output = result.to_markdown()
+    verification = verify_results("{query}", output)
+    if verification.status.value != "FAILED":
+        FINAL_ANSWER = output
+    else:
+        print(f"Verification failed: {{verification.guidance}}")
 else:
     FINAL_ANSWER = "No hardcoded secrets found."
 ```
@@ -512,13 +547,13 @@ else:
 
 | Task | Tool |
 |------|------|
-| Security audit | `run_security_scan()` or individual tools |
+| Security audit | `run_security_scan()` |
 | iOS/Swift review | `run_ios_scan()` |
 | Code quality | `run_quality_scan()` |
+| Persistence/state | `run_persistence_scan()` |
 | Find secrets | `find_secrets()` |
 | Force unwraps | `find_force_unwraps()` |
-| SQL injection | `find_sql_injection()` |
-| Architecture map | `map_architecture()` |
+| State patterns | `find_state_mutations()` |
 
 ## Advanced: Custom Search
 
@@ -533,16 +568,18 @@ Or use `llm_query(text)` for semantic analysis of specific code sections.
 
 ## Output
 
-Set `FINAL_ANSWER` with your results:
+ALWAYS verify before setting FINAL_ANSWER:
 ```python
 result = find_secrets()
-FINAL_ANSWER = result.to_markdown()
+output = result.to_markdown()
+verification = verify_results("{query}", output)
+FINAL_ANSWER = output  # Only if verification passed
 ```
 
 ## Query
 {query}
 
-Start by selecting the appropriate tool(s), run them, and set FINAL_ANSWER with the results.'''
+Start by selecting the appropriate tool(s), run them, VERIFY results, then set FINAL_ANSWER.'''
 
     def __init__(self, config: RLMConfig):
         self.config = config
@@ -555,12 +592,128 @@ Start by selecting the appropriate tool(s), run them, and set FINAL_ANSWER with 
             }
         )
         self.state = REPLState()
+        # Cache usage tracking
+        self.cache_stats = {
+            "total_requests": 0,
+            "cache_hits": 0,
+            "cache_writes": 0,
+            "tokens_saved": 0,
+            "cost_saved": 0.0,
+        }
 
     def initialize(self, content: str) -> None:
         """Initialize the REPL with content stored as `prompt` variable."""
         self.state = REPLState(prompt=content)
         self.state.variables["prompt"] = content
         self.state.variables["FINAL_ANSWER"] = None
+
+    def _build_cached_message(self, role: str, content: str, use_cache: bool = True) -> dict:
+        """
+        Build a message with OpenRouter cache control.
+
+        For large content (system prompts, codebase), we add cache_control
+        to enable prompt caching. This significantly reduces costs on
+        repeated queries against the same codebase.
+
+        Args:
+            role: Message role (system, user, assistant)
+            content: Message content
+            use_cache: Whether to add cache control
+
+        Returns:
+            Message dict with optional cache_control
+        """
+        if not use_cache or not self.config.use_prompt_cache:
+            return {"role": role, "content": content}
+
+        # Use multipart content format for cache control
+        # Cache control works best on large, static content
+        return {
+            "role": role,
+            "content": [
+                {
+                    "type": "text",
+                    "text": content,
+                    "cache_control": {
+                        "type": "ephemeral",
+                        "ttl": self.config.prompt_cache_ttl
+                    }
+                }
+            ]
+        }
+
+    def _make_cached_request(
+        self,
+        messages: list[dict],
+        max_tokens: int = 4000,
+        model: str | None = None
+    ) -> tuple[str, dict]:
+        """
+        Make an API request with cache tracking.
+
+        Returns:
+            (response_text, usage_info)
+        """
+        self.cache_stats["total_requests"] += 1
+
+        extra_body = {}
+        if self.config.track_cache_usage:
+            extra_body["usage"] = {"include": True}
+
+        try:
+            response = self.client.chat.completions.create(
+                model=model or self.config.model,
+                max_tokens=max_tokens,
+                messages=messages,
+                extra_body=extra_body if extra_body else None
+            )
+
+            result = response.choices[0].message.content if response.choices else ""
+
+            # Track cache usage if available
+            usage_info = {}
+            if hasattr(response, 'usage') and response.usage:
+                usage = response.usage
+                usage_info = {
+                    "prompt_tokens": getattr(usage, 'prompt_tokens', 0),
+                    "completion_tokens": getattr(usage, 'completion_tokens', 0),
+                    "total_tokens": getattr(usage, 'total_tokens', 0),
+                }
+
+                # Check for cache discount (OpenRouter specific)
+                if hasattr(usage, 'cache_discount'):
+                    usage_info["cache_discount"] = usage.cache_discount
+                    if usage.cache_discount > 0:
+                        self.cache_stats["cache_hits"] += 1
+                        self.cache_stats["tokens_saved"] += int(usage.cache_discount)
+
+                # Check for cache_read_input_tokens (Anthropic style)
+                if hasattr(usage, 'cache_read_input_tokens'):
+                    cache_read = getattr(usage, 'cache_read_input_tokens', 0)
+                    if cache_read > 0:
+                        self.cache_stats["cache_hits"] += 1
+                        usage_info["cache_read_tokens"] = cache_read
+
+                # Check for cache_creation_input_tokens
+                if hasattr(usage, 'cache_creation_input_tokens'):
+                    cache_write = getattr(usage, 'cache_creation_input_tokens', 0)
+                    if cache_write > 0:
+                        self.cache_stats["cache_writes"] += 1
+                        usage_info["cache_write_tokens"] = cache_write
+
+            return result, usage_info
+
+        except Exception as e:
+            return f"Error: {e}", {"error": str(e)}
+
+    def get_cache_stats(self) -> dict:
+        """Get current cache usage statistics."""
+        stats = self.cache_stats.copy()
+        if stats["total_requests"] > 0:
+            stats["cache_hit_rate"] = stats["cache_hits"] / stats["total_requests"]
+        else:
+            stats["cache_hit_rate"] = 0.0
+        return stats
 
     def _create_llm_query_function(self) -> Callable[[str], str]:
         """Create the llm_query function for sub-LLM calls."""
@@ -1398,6 +1551,38 @@ Remove duplicates (same line, same issue). Keep all unique findings with their l
 
         return analyze_file
 
+    def _create_verify_results_function(self) -> Callable:
+        """Create the verify_results function for the REPL guardrail."""
+        content = self.state.prompt
+        files = self._extract_file_list()
+
+        def verify_results(query: str, results: str) -> QueryVerificationResult:
+            """
+            Verify results before setting FINAL_ANSWER.
+
+            This is the GUARDRAIL that ensures results are:
+            1. Aligned with query intent
+            2. Specific (file:line, code, confidence)
+
+            Args:
+                query: The original search query
+                results: The results to verify (from tool.to_markdown())
+
+            Returns:
+                QueryVerificationResult with status, guidance
+
+            Example:
+                result = find_secrets()
+                verification = verify_results("find secrets", result.to_markdown())
+                if verification.status.value != "FAILED":
+                    FINAL_ANSWER = result.to_markdown()
+                else:
+                    print(verification.guidance)  # Fix issues and retry
+            """
+            return verify_query_results(query, results, content, files)
+
+        return verify_results
+
     def _create_pattern_search_function(self) -> Callable:
         """Create a pattern search function that returns structured results."""
         prompt = self.state.prompt
@@ -1557,6 +1742,15 @@ Remove duplicates (same line, same issue). Keep all unique findings with their l
             # Helper to get file list
             "files": tools.files,
 
+            # Persistence/State tools
+            "find_persistence_patterns": tools.find_persistence_patterns,
+            "find_state_mutations": tools.find_state_mutations,
+            "run_persistence_scan": tools.run_persistence_scan,
+
+            # VERIFICATION TOOL (REQUIRED before FINAL_ANSWER)
+            "verify_results": self._create_verify_results_function(),
+            "VerificationStatus": VerificationStatus,
+
             **all_variables
         }
 
@@ -1670,24 +1864,80 @@ Remove duplicates (same line, same issue). Keep all unique findings with their l
         finally:
             sys.stdout = old_stdout
 
+    def _detect_query_type(self, query: str) -> tuple[str, str]:
+        """
+        Detect query type for timeout calculation and routing.
+
+        Returns:
+            (query_type, complexity) - e.g., ("pattern", "normal") or ("semantic", "deep")
+        """
+        query_lower = query.lower()
+
+        # Pattern queries - fast, regex-based
+        pattern_indicators = [
+            "find", "search", "grep", "locate", "list", "count",
+            "force unwrap", "secrets", "todo", "fixme", "import"
+        ]
+
+        # Semantic queries - need LLM analysis
+        semantic_indicators = [
+            "analyze", "explain", "understand", "review", "assess",
+            "architecture", "design", "refactor", "improve", "why",
+            "how does", "what is the purpose", "security audit"
+        ]
+
+        # Complexity indicators
+        deep_indicators = [
+            "thorough", "comprehensive", "all", "every", "complete",
+            "deep", "detailed", "full analysis"
+        ]
+
+        is_semantic = any(ind in query_lower for ind in semantic_indicators)
+        is_deep = any(ind in query_lower for ind in deep_indicators)
+
+        query_type = "semantic" if is_semantic else "pattern"
+        complexity = "deep" if is_deep else ("normal" if is_semantic else "simple")
+
+        return query_type, complexity
+
     async def run_rlm_session(
         self,
         query: str,
-        max_iterations: int = 25  # Increased from 15 to handle complex queries
+        max_iterations: int | None = None  # None = use config default
     ) -> str:
         """
-        Run a complete RLM session.
+        Run a complete RLM session with dynamic timeout.
 
         The orchestrating LLM (Sonnet) writes code iteratively.
         Sub-queries use Haiku 4.5 via llm_query().
 
         Args:
             query: The question to answer
-            max_iterations: Maximum code execution rounds
+            max_iterations: Maximum code execution rounds (None = config default)
 
         Returns:
             The final answer
         """
+        # Use config defaults if not specified
+        if max_iterations is None:
+            max_iterations = self.config.max_iterations
+
+        # Detect query type for dynamic timeout
+        query_type, complexity = self._detect_query_type(query)
+        file_count = len(self._extract_file_list())
+
+        # Calculate dynamic timeout
+        timeout_seconds = self.config.calculate_timeout(
+            file_count=file_count,
+            query_type=query_type,
+            complexity=complexity
+        )
+
+        import sys
+        print(f"[REPL] Query type: {query_type}, complexity: {complexity}", file=sys.stderr)
+        print(f"[REPL] Dynamic timeout: {timeout_seconds}s for {file_count} files", file=sys.stderr)
+        print(f"[REPL] Max iterations: {max_iterations}", file=sys.stderr)
+
         # Sanitize query to prevent format string issues and clean markdown
         safe_query = self.sanitize_query(query)
 
@@ -1704,30 +1954,45 @@ Remove duplicates (same line, same issue). Keep all unique findings with their l
         categorized_index = self._build_categorized_file_index(actual_files)
 
         # Initial message - simplified to emphasize tool usage
-        initial_msg = f"""REPL ready with {len(actual_files)} files ({len(self.state.prompt):,} chars).
+        # Build system message with caching for the large codebase content
+        # The system prompt + codebase index is static and benefits from caching
+        system_content = f"""You are an RLM REPL analyzing code. Use structured tools and VERIFY results before returning.
 
-## Available Files
+## Available Files ({len(actual_files)} files, {len(self.state.prompt):,} chars)
 {categorized_index}
 
-## Quick Start
+## Tools Available
+- Security: find_secrets(), find_sql_injection(), run_security_scan()
+- iOS/Swift: find_force_unwraps(), find_retain_cycles(), run_ios_scan()
+- Persistence: find_persistence_patterns(), find_state_mutations(), run_persistence_scan()
+- Quality: find_long_functions(), find_todos(), run_quality_scan()
+
+## REQUIRED: Verify before returning
 ```python
-# Security scan
-result = run_security_scan()
-print(result[0].to_markdown())  # First tool's results
+result = <tool>()
+verification = verify_results("{safe_query}", result.to_markdown())
+if verification.status.value != "FAILED":
+    FINAL_ANSWER = result.to_markdown()
+```"""
 
-# Or individual tools
-result = find_secrets()
-FINAL_ANSWER = result.to_markdown()
-```
+        # User message with the specific query (changes per request)
+        user_msg = f"""## Query: {safe_query}
 
-## Query: {safe_query}
+Select the appropriate tool(s), run them, verify results, then set FINAL_ANSWER."""
 
-Select the appropriate tool(s) and run them."""
+        # Build messages with cache control on system (static) content
+        messages = [
+            self._build_cached_message("system", system_content, use_cache=True),
+            {"role": "user", "content": user_msg}  # User query changes, don't cache
+        ]
 
-        messages = [{"role": "user", "content": initial_msg}]
+        # Log cache status
+        if self.config.use_prompt_cache:
+            import sys
+            print(f"[REPL] Prompt caching enabled (TTL: {self.config.prompt_cache_ttl})", file=sys.stderr)
 
         consecutive_failures = 0
-        max_consecutive_failures = 3
+        max_consecutive_failures = self.config.max_consecutive_failures
 
         for iteration in range(max_iterations):
             # Log progress to stderr so users see activity

@@ -1972,6 +1972,168 @@ class StructuredTools:
         result.summary = f"Jailbreak detection: {'Present' if has_jailbreak_detection else 'Not found'}"
         return result
 
+    # ===== PERSISTENCE/STATE TOOLS =====
+
+    def find_persistence_patterns(self) -> ToolResult:
+        """
+        Find data persistence patterns in the codebase.
+
+        Searches for:
+        - localStorage/sessionStorage (JavaScript)
+        - UserDefaults/Keychain (iOS)
+        - CoreData/SwiftData/Realm (iOS)
+        - SharedPreferences (Android)
+        - File I/O operations
+        - Database operations
+        """
+        result = ToolResult(tool_name="Persistence Pattern Scanner", files_scanned=len(self.files))
+
+        patterns = [
+            # JavaScript/Web persistence
+            (r'''localStorage\.(get|set|remove)Item''', "localStorage usage", Severity.INFO, ".js"),
+            (r'''sessionStorage\.(get|set|remove)Item''', "sessionStorage usage", Severity.INFO, ".js"),
+            (r'''indexedDB\.open''', "IndexedDB usage", Severity.INFO, ".js"),
+            (r'''\.setItem\(['"]\w+['"]''', "Storage setItem", Severity.INFO, None),
+
+            # iOS persistence
+            (r'''UserDefaults\.(standard\.)?set''', "UserDefaults write", Severity.INFO, ".swift"),
+            (r'''UserDefaults\.(standard\.)?(?:string|integer|bool|data|object)\(forKey:''', "UserDefaults read", Severity.INFO, ".swift"),
+            (r'''@AppStorage\s*\(['"]\w+['"]''', "@AppStorage usage", Severity.INFO, ".swift"),
+            (r'''NSKeyedArchiver\.archive''', "NSKeyedArchiver usage", Severity.MEDIUM, ".swift"),
+            (r'''NSKeyedUnarchiver\.unarchive''', "NSKeyedUnarchiver usage", Severity.MEDIUM, ".swift"),
+            (r'''FileManager\.(default\.)?(?:createFile|write|contents)''', "FileManager I/O", Severity.INFO, ".swift"),
+
+            # CoreData/SwiftData
+            (r'''NSManagedObjectContext''', "CoreData context", Severity.INFO, ".swift"),
+            (r'''@FetchRequest''', "CoreData @FetchRequest", Severity.INFO, ".swift"),
+            (r'''ModelContext''', "SwiftData ModelContext", Severity.INFO, ".swift"),
+            (r'''@Model\s+class''', "SwiftData @Model", Severity.INFO, ".swift"),
+            (r'''@Query\s+var''', "SwiftData @Query", Severity.INFO, ".swift"),
+
+            # Realm
+            (r'''Realm\(\)''', "Realm database", Severity.INFO, ".swift"),
+            (r'''realm\.write''', "Realm write transaction", Severity.INFO, ".swift"),
+
+            # Python persistence
+            (r'''pickle\.(dump|load)''', "Pickle serialization", Severity.MEDIUM, ".py"),
+            (r'''json\.(dump|load)s?\(''', "JSON serialization", Severity.INFO, ".py"),
+            (r'''sqlite3\.connect''', "SQLite connection", Severity.INFO, ".py"),
+            (r'''with open\([^)]+,\s*['"](w|a|wb|ab)['"]''', "File write operation", Severity.INFO, ".py"),
+
+            # General database
+            (r'''\.execute\(['"](INSERT|UPDATE|DELETE)''', "SQL write operation", Severity.INFO, None),
+            (r'''\.query\(['"](SELECT|INSERT|UPDATE)''', "Database query", Severity.INFO, None),
+        ]
+
+        for pattern, issue, severity, file_filter in patterns:
+            matches = self._search_pattern(pattern, file_filter=file_filter)
+            for filepath, line_num, line, match in matches:
+                if self._is_in_comment(line, filepath):
+                    continue
+
+                result.findings.append(Finding(
+                    file=filepath,
+                    line=line_num,
+                    code=line[:200],
+                    issue=issue,
+                    confidence=Confidence.HIGH,
+                    severity=severity,
+                    category="persistence",
+                ))
+
+        result.summary = f"Found {len(result.findings)} persistence patterns"
+        return result
+
+    def find_state_mutations(self) -> ToolResult:
+        """
+        Find state management and mutation patterns.
+
+        Searches for:
+        - React useState/useReducer
+        - SwiftUI @State/@Binding/@Published
+        - Redux/MobX patterns
+        - Observable patterns
+        - Event listeners/handlers
+        """
+        result = ToolResult(tool_name="State Mutation Scanner", files_scanned=len(self.files))
+
+        patterns = [
+            # React state
+            (r'''useState\s*[<(]''', "React useState", Severity.INFO, None),
+            (r'''useReducer\s*\(''', "React useReducer", Severity.INFO, None),
+            (r'''setState\s*\(''', "React setState", Severity.INFO, None),
+            (r'''useContext\s*\(''', "React useContext", Severity.INFO, None),
+
+            # Redux
+            (r'''dispatch\s*\(\s*\{?\s*type:''', "Redux dispatch", Severity.INFO, None),
+            (r'''createSlice\s*\(''', "Redux createSlice", Severity.INFO, None),
+            (r'''useSelector\s*\(''', "Redux useSelector", Severity.INFO, None),
+            (r'''createStore\s*\(''', "Redux createStore", Severity.INFO, None),
+
+            # SwiftUI state
+            (r'''@State\s+(?:private\s+)?var''', "SwiftUI @State", Severity.INFO, ".swift"),
+            (r'''@Binding\s+var''', "SwiftUI @Binding", Severity.INFO, ".swift"),
+            (r'''@Published\s+var''', "Combine @Published", Severity.INFO, ".swift"),
+            (r'''@ObservedObject\s+var''', "SwiftUI @ObservedObject", Severity.INFO, ".swift"),
+            (r'''@StateObject\s+var''', "SwiftUI @StateObject", Severity.INFO, ".swift"),
+            (r'''@EnvironmentObject\s+var''', "SwiftUI @EnvironmentObject", Severity.INFO, ".swift"),
+            (r'''@Environment\s*\(''', "SwiftUI @Environment", Severity.INFO, ".swift"),
+            (r'''@Observable\s+class''', "Observation @Observable", Severity.INFO, ".swift"),
+
+            # Combine/RxSwift
+            (r'''\.sink\s*\{''', "Combine sink subscription", Severity.INFO, ".swift"),
+            (r'''\.assign\s*\(to:''', "Combine assign", Severity.INFO, ".swift"),
+            (r'''PassthroughSubject''', "Combine PassthroughSubject", Severity.INFO, ".swift"),
+            (r'''CurrentValueSubject''', "Combine CurrentValueSubject", Severity.INFO, ".swift"),
+
+            # Event listeners
+            (r'''addEventListener\s*\(['"]\w+['"]''', "Event listener", Severity.INFO, ".js"),
+            (r'''\.on\(['"]\w+['"]''', "Event handler (.on)", Severity.INFO, None),
+            (r'''NotificationCenter\.default\.addObserver''', "NotificationCenter observer", Severity.INFO, ".swift"),
+
+            # MobX
+            (r'''@observable''', "MobX @observable", Severity.INFO, None),
+            (r'''@action''', "MobX @action", Severity.INFO, None),
+            (r'''makeAutoObservable''', "MobX makeAutoObservable", Severity.INFO, None),
+
+            # Vue
+            (r'''ref\s*\(''', "Vue ref()", Severity.INFO, ".vue"),
+            (r'''reactive\s*\(''', "Vue reactive()", Severity.INFO, ".vue"),
+            (r'''computed\s*\(''', "Vue computed()", Severity.INFO, ".vue"),
+        ]
+
+        for pattern, issue, severity, file_filter in patterns:
+            matches = self._search_pattern(pattern, file_filter=file_filter)
+            for filepath, line_num, line, match in matches:
+                if self._is_in_comment(line, filepath):
+                    continue
+
+                result.findings.append(Finding(
+                    file=filepath,
+                    line=line_num,
+                    code=line[:200],
+                    issue=issue,
+                    confidence=Confidence.HIGH,
+                    severity=severity,
+                    category="state",
+                ))
+
+        result.summary = f"Found {len(result.findings)} state mutation patterns"
+        return result
+
+    def run_persistence_scan(self, min_confidence: str = "LOW") -> list[ToolResult]:
+        """
+        Run all persistence and state management scans.
+
+        Returns findings about:
+        - Data persistence (localStorage, UserDefaults, databases)
+        - State management (React, SwiftUI, Redux, etc.)
+        """
+        return [
+            self.find_persistence_patterns(),
+            self.find_state_mutations(),
+        ]
+
     # ===== RUN ALL SECURITY =====
 
     def run_security_scan(
