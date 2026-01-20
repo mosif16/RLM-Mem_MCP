@@ -177,36 +177,22 @@ def get_trajectory_logger() -> TrajectoryLogger:
 # =============================================================================
 
 class AdaptiveModelSelector:
-    """L10: Select optimal model based on query type and content size."""
+    """Model selector - uses Claude Haiku 4.5 exclusively for all tasks."""
 
-    MODELS = [
-        ("google/gemini-2.5-flash-lite", "fast", 0.15),  # $/1M input tokens
-        ("anthropic/claude-3-haiku-20240307", "balanced", 0.25),
-        ("anthropic/claude-3-5-sonnet-20241022", "quality", 3.00),
-    ]
+    # Single model: Claude Haiku 4.5 - fast, cost-effective with prompt caching
+    MODEL = "anthropic/claude-haiku-4.5"
+    MODEL_COST = 0.80  # $/1M input tokens (0.08 with cache)
 
-    def __init__(self, default_model: str = "google/gemini-2.5-flash-lite"):
-        self.default_model = default_model
+    def __init__(self, default_model: str = "anthropic/claude-haiku-4.5"):
+        self.default_model = self.MODEL  # Always use Haiku 4.5
         self.failure_counts: dict[str, int] = {}
 
     def select_model(self, query_type: str, content_size: int, prefer_quality: bool = False) -> str:
-        """Select optimal model for the task."""
-        if prefer_quality:
-            return self.MODELS[2][0]  # Best quality
-
-        # Security on large codebases needs quality
-        if query_type == "security" and content_size > 100_000:
-            return self.MODELS[2][0]
-
-        # Architecture understanding needs reasoning
-        if query_type in ["architecture", "quality"]:
-            return self.MODELS[1][0]
-
-        # Default to fast model
-        return self.default_model
+        """Always returns Claude Haiku 4.5."""
+        return self.MODEL
 
     def record_failure(self, model: str):
-        """Record a model failure for fallback logic."""
+        """Record a model failure."""
         self.failure_counts[model] = self.failure_counts.get(model, 0) + 1
 
     def record_success(self, model: str):
@@ -214,22 +200,15 @@ class AdaptiveModelSelector:
         self.failure_counts[model] = 0
 
     def get_fallback(self, current_model: str) -> str | None:
-        """Get fallback model after failure."""
-        model_names = [m[0] for m in self.MODELS]
-        try:
-            current_idx = model_names.index(current_model)
-            if current_idx < len(self.MODELS) - 1:
-                return self.MODELS[current_idx + 1][0]
-        except ValueError:
-            pass
+        """No fallback - always use Haiku 4.5."""
         return None
 
     def get_stats(self) -> dict:
-        """Get model selection stats."""
+        """Get model stats."""
         return {
-            "default_model": self.default_model,
+            "model": self.MODEL,
+            "cost_per_1m_tokens": self.MODEL_COST,
             "failure_counts": dict(self.failure_counts),
-            "available_models": [m[0] for m in self.MODELS]
         }
 
 
@@ -1324,105 +1303,58 @@ class RLMProcessor:
     - Connection pooling
     """
 
-    # System prompts for different stages
-    RELEVANCE_PROMPT = """You are a relevance assessor. Given a query and content chunk,
-rate the relevance from 0.0 to 1.0. Only output a single decimal number.
+    # Optimized system prompts for Claude Haiku 4.5 (token-efficient)
+    # Based on Anthropic's prompt engineering best practices
 
-0.0 = Completely irrelevant
-0.3 = Marginally relevant
-0.5 = Somewhat relevant
-0.7 = Quite relevant
-1.0 = Highly relevant"""
+    RELEVANCE_PROMPT = """Rate query-content relevance: 0.0-1.0. Output only the number.
+0.0=irrelevant, 0.5=partial, 1.0=exact match"""
 
-    CHUNK_ANALYSIS_PROMPT = """You are a precise information extractor analyzing code and text.
-Your task is to find information relevant to the given query.
+    CHUNK_ANALYSIS_PROMPT = """Extract code findings matching the query. For each finding:
 
-CRITICAL OUTPUT REQUIREMENTS:
-1. ALWAYS include file:line format (e.g., `src/utils.py:42`)
-2. ALWAYS include the actual code snippet showing the issue
-3. ALWAYS assign a CONFIDENCE LEVEL to each finding
-4. Format each finding as:
-   ```
-   **File:** path/to/file.ext:LINE_NUMBER [Confidence: HIGH/MEDIUM/LOW]
-   **Issue:** Brief description
-   **Code:**
-   ```language
-   <actual code from the content>
-   ```
-   ```
+<output_format>
+**{filepath}:{line}** [{confidence}] - {issue}
+```{lang}
+{code_snippet}
+```
+</output_format>
 
-CONFIDENCE LEVELS (REQUIRED):
-- **HIGH**: Code is in active blocks, line verified, finding clearly matches issue type
-- **MEDIUM**: Context unclear, cannot verify reachability, partial pattern match
-- **LOW**: Code in #if false/#if DEBUG blocks, line unverified, signature-only (no body)
+<confidence_rules>
+HIGH: Active code, verified line, clear match
+MEDIUM: Uncertain context, partial match
+LOW: Dead code (#if false/DEBUG/0), unverified, test file
+</confidence_rules>
 
-DEAD CODE DETECTION:
-- Check for #if false, #if 0, #if DEBUG, #ifdef NEVER blocks
-- Code inside these blocks should be marked [Confidence: LOW - dead code]
-- Swift/ObjC: #if false ... #endif
-- C/C++: #if 0 ... #endif
-- Python: if False: ...
+Rules:
+- Copy exact code from content (no paraphrasing)
+- Line 1 starts at each "### File:" header
+- No findings? Say "No relevant findings" only"""
 
-Guidelines:
-- Focus ONLY on the provided content
-- Extract EXACT code snippets (copy from content, don't paraphrase)
-- Count line numbers from file headers (### File: path starts at line 1)
-- If content is not relevant, say "No relevant findings" briefly
-- Be specific and actionable - readers should find the exact location
-- If uncertain about a finding, use MEDIUM or LOW confidence"""
+    AGGREGATION_PROMPT = """Synthesize findings into a structured report. PRESERVE all file:line refs, code snippets, and confidence levels exactly.
 
-    AGGREGATION_PROMPT = """You are an expert at synthesizing information from multiple sources.
-Your task is to combine findings into a coherent, well-organized response.
-
-CRITICAL: PRESERVE ALL SPECIFIC DETAILS
-- Keep ALL file:line references (e.g., `src/auth.py:42`)
-- Keep ALL code snippets exactly as provided
-- Keep ALL confidence levels [Confidence: HIGH/MEDIUM/LOW]
-- Keep ALL severity ratings and categories
-- Do NOT generalize specific findings into vague summaries
-
-CONFIDENCE HANDLING:
-- Group findings by confidence level (HIGH first, then MEDIUM, then LOW)
-- LOW confidence findings should be labeled "Verify Manually"
-- If a finding is in dead code (#if false, etc.), keep it LOW confidence
-
-Output Format:
+<output_schema>
 ## Summary
-Brief overview: X high-confidence, Y medium-confidence, Z low-confidence findings
+{count_high} HIGH, {count_medium} MEDIUM, {count_low} LOW findings
 
-## High Confidence Findings
-These findings are verified and in active code.
-
-### [Category]
-**file.py:LINE** [Confidence: HIGH] - Description
-```language
-actual code snippet
+## High Confidence
+**{file}:{line}** [HIGH] - {description}
+```{lang}
+{code}
 ```
 
-## Medium Confidence Findings
-These findings need additional verification.
+## Medium Confidence
+(same format)
 
-### [Category]
-**file.py:LINE** [Confidence: MEDIUM] - Description
-```language
-actual code snippet
+## Low Confidence (Verify Manually)
+**{file}:{line}** [LOW - {reason}] - {description}
+```{lang}
+{code}
 ```
+</output_schema>
 
-## Low Confidence Findings (Verify Manually)
-These may be false positives (dead code, unverified lines, etc.)
-
-### [Category]
-**file.py:LINE** [Confidence: LOW - reason] - Description
-```language
-actual code snippet
-```
-
-Guidelines:
-- Group similar findings by category within each confidence level
-- Remove exact duplicates only (same file, same line, same issue)
-- Preserve unique findings even if similar
-- If findings conflict, note the discrepancy with both locations
-- Dead code findings (#if false, #if DEBUG) should always be LOW confidence"""
+Rules:
+- Group by confidence (HIGH→MEDIUM→LOW)
+- Remove exact duplicates only (same file+line+issue)
+- Dead code (#if false) = always LOW"""
 
     def __init__(
         self,

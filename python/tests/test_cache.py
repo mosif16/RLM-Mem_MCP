@@ -15,7 +15,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from rlm_mem_mcp.cache_manager import CacheManager, LLMResponseCache
+from rlm_mem_mcp.cache_manager import CacheManager
+from rlm_mem_mcp.rlm_processor import LLMResponseCache
 from rlm_mem_mcp.config import RLMConfig
 
 

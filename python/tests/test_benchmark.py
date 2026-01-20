@@ -20,7 +20,8 @@ import pytest_asyncio
 
 from rlm_mem_mcp.config import RLMConfig
 from rlm_mem_mcp.file_collector import FileCollector
-from rlm_mem_mcp.cache_manager import CacheManager, LLMResponseCache
+from rlm_mem_mcp.cache_manager import CacheManager
+from rlm_mem_mcp.rlm_processor import LLMResponseCache
 from rlm_mem_mcp.memory_store import MemoryStore
 
 

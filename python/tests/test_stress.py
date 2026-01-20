@@ -22,7 +22,7 @@ import pytest_asyncio
 from rlm_mem_mcp.config import RLMConfig
 from rlm_mem_mcp.file_collector import FileCollector, MAX_CONCURRENT_FILE_READS
 from rlm_mem_mcp.memory_store import MemoryStore
-from rlm_mem_mcp.cache_manager import LLMResponseCache
+from rlm_mem_mcp.rlm_processor import LLMResponseCache
 
 
 class TestHighConcurrency:

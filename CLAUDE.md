@@ -83,9 +83,12 @@ Unlike simple summarization, TRUE RLM:
 |--------|------------------|--------------|------|
 | Direct (if possible) | Fails or degrades | 200k+ (full) | N/A |
 | Premium 1M context | Works | 500k | ~$15 |
-| **RLM via MCP** | Works | ~4k summary | **~$0.50-3** |
+| **RLM via MCP** | Works | ~4k summary | **~$0.10-0.50** |
 
-RLM is often **cheaper** and leaves context for reasoning.
+RLM with Claude Haiku 4.5 and prompt caching is **extremely cost-effective**:
+- Base: $0.80/1M input tokens
+- With cache hits: $0.08/1M (90% savings!)
+- Output: $4/1M tokens
 
 ---
 
@@ -442,10 +445,11 @@ claude mcp add --transport stdio rlm -- python -m rlm_mem_mcp.server
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `OPENROUTER_API_KEY` | (required) | Your OpenRouter API key |
-| `RLM_MODEL` | `google/gemini-2.5-flash-lite` | Model for RLM processing |
-| `RLM_AGGREGATOR_MODEL` | `google/gemini-2.5-flash-lite` | Model for final aggregation |
+| `RLM_MODEL` | `anthropic/claude-haiku-4.5` | Model for RLM processing |
+| `RLM_AGGREGATOR_MODEL` | `anthropic/claude-haiku-4.5` | Model for final aggregation |
 | `RLM_USE_CACHE` | `true` | Enable prompt caching |
-| `RLM_CACHE_TTL` | `5m` | Cache TTL (`5m` or `1h`) |
+| `RLM_CACHE_TTL` | `1h` | Cache TTL (`5m` or `1h`) |
+| `RLM_USE_PREFILLED` | `true` | Enable prefilled responses for token efficiency |
 | `RLM_MAX_RESULT_TOKENS` | `4000` | Max tokens in result |
 | `RLM_MAX_CHUNK_TOKENS` | `8000` | Max tokens per chunk |
 | `RLM_OVERLAP_TOKENS` | `200` | Overlap tokens between chunks |
@@ -773,17 +777,12 @@ export RLM_CACHE_TTL=1h
 # 90% cost reduction on cache hits
 ```
 
-#### Strategy 2: Use Fast Models
+#### Strategy 2: Model Selection
 
 ```
-# Gemini Flash: ~$0.15/1M tokens (recommended)
-export RLM_MODEL=google/gemini-2.5-flash-lite
-
-# Claude 3.5: ~$3/1M tokens (10x more expensive)
-export RLM_MODEL=anthropic/claude-3-5-sonnet
-
-# Gemini Flash 2: ~$0.10/1M tokens
-export RLM_MODEL=google/gemini-2-flash
+# Uses Claude Haiku 4.5 exclusively
+# ~$0.80/1M tokens input, $0.08 with cache (90% savings)
+export RLM_MODEL=anthropic/claude-haiku-4.5
 ```
 
 #### Strategy 3: Optimize Queries

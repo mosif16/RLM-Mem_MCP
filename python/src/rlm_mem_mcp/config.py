@@ -3,13 +3,14 @@ Configuration for RLM-Mem MCP Server
 
 Environment Variables:
 - OPENROUTER_API_KEY: Required for RLM processing via OpenRouter
-- RLM_MODEL: Model for RLM processing (default: google/gemini-2.5-flash-preview)
-- RLM_AGGREGATOR_MODEL: Model for final aggregation (default: google/gemini-2.5-flash-preview)
+- RLM_MODEL: Model for RLM processing (default: anthropic/claude-haiku-4-5-20250115)
+- RLM_AGGREGATOR_MODEL: Model for final aggregation (default: anthropic/claude-haiku-4-5-20250115)
 - RLM_MAX_RESULT_TOKENS: Maximum tokens in result (default: 4000)
 
 OpenRouter:
 - Uses OpenAI-compatible API at https://openrouter.ai/api/v1
-- Gemini 2.5 Flash is fast and cost-effective (~$0.15/1M input tokens)
+- Claude Haiku 4.5 is fast and cost-effective (~$0.80/1M input tokens)
+- Supports prompt caching for 90% cost reduction on repeated content
 """
 
 import os
@@ -20,8 +21,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
-# Default model (OpenRouter model ID)
-DEFAULT_MODEL = "google/gemini-2.5-flash-lite"
+# Default model (OpenRouter model ID) - Claude Haiku 4.5 for speed and cost efficiency
+DEFAULT_MODEL = "anthropic/claude-haiku-4.5"
 
 # Default file extensions to include
 DEFAULT_EXTENSIONS = {
@@ -201,11 +202,17 @@ class RLMConfig:
         default_factory=lambda: int(os.getenv("RLM_MAX_TOTAL_TOKENS", "500000"))
     )  # Maximum tokens to process
 
-    # OpenRouter Prompt Caching Configuration
-    # Gemini has implicit caching (automatic), but we can extend TTL
-    # Anthropic requires explicit cache_control
+    # Claude 4.5 Prompt Caching Configuration
+    # Anthropic requires explicit cache_control blocks
+    # Cache hits cost 10% of normal input tokens (90% savings!)
+    use_cache: bool = field(
+        default_factory=lambda: os.getenv("RLM_USE_CACHE", "true").lower() == "true"
+    )
     use_prompt_cache: bool = field(
         default_factory=lambda: os.getenv("RLM_USE_PROMPT_CACHE", "true").lower() == "true"
+    )
+    cache_ttl: Literal["5m", "1h"] = field(
+        default_factory=lambda: os.getenv("RLM_CACHE_TTL", "1h")  # type: ignore
     )
     prompt_cache_ttl: Literal["5m", "1h"] = field(
         default_factory=lambda: os.getenv("RLM_PROMPT_CACHE_TTL", "1h")  # type: ignore
@@ -213,6 +220,10 @@ class RLMConfig:
     # Track cache usage for cost monitoring
     track_cache_usage: bool = field(
         default_factory=lambda: os.getenv("RLM_TRACK_CACHE_USAGE", "true").lower() == "true"
+    )
+    # Prefilled assistant responses for token efficiency
+    use_prefilled_responses: bool = field(
+        default_factory=lambda: os.getenv("RLM_USE_PREFILLED", "true").lower() == "true"
     )
 
     def validate(self) -> list[str]:

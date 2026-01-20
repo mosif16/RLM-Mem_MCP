@@ -39,7 +39,7 @@ The LLM acts as a programmer, writing code to search and analyze the content rat
 - **Memory Store**: Persist important findings across conversations (SQLite-backed)
 - **Robust Architecture**: Circuit breakers, rate limiters, exponential backoff
 - **Async Pipeline**: Fully async with connection pooling and concurrent operations
-- **Multi-Model Support**: Works with OpenRouter (Gemini, Claude, etc.) or Anthropic direct
+- **Claude Haiku 4.5**: Default model with 90% cost savings via prompt caching
 
 ## Installation
 
