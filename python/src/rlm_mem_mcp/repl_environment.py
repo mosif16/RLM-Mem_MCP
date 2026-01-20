@@ -1747,6 +1747,13 @@ Remove duplicates (same line, same issue). Keep all unique findings with their l
             "find_state_mutations": tools.find_state_mutations,
             "run_persistence_scan": tools.run_persistence_scan,
 
+            # ===== FILE ACCESS TOOLS (SAFE) =====
+            # These provide safe access to collected files without using open()
+            "read_file": tools.read_file,           # Read content of a specific file
+            "list_files": tools.list_files,         # List available files with optional filter
+            "search_in_file": tools.search_in_file, # Search pattern in a specific file
+            "get_file_info": tools.get_file_info,   # Get metadata about a file
+
             # VERIFICATION TOOL (REQUIRED before FINAL_ANSWER)
             "verify_results": self._create_verify_results_function(),
             "VerificationStatus": VerificationStatus,

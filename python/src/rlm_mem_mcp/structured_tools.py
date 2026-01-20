@@ -237,6 +237,142 @@ class StructuredTools:
             return None
         return content.split('\n')
 
+    # =========================================================================
+    # PUBLIC FILE ACCESS TOOLS
+    # These are safe to expose in the REPL for direct file reading
+    # =========================================================================
+
+    def read_file(self, path: str) -> str:
+        """
+        Read the content of a specific file.
+
+        This is the SAFE way to read files in the REPL sandbox.
+        Files must have been collected during the initial scan.
+
+        Args:
+            path: File path (can be partial - will match if path ends with this)
+
+        Returns:
+            File content as string, or error message if not found
+
+        Example:
+            content = read_file("server.py")
+            content = read_file("src/utils/helpers.ts")
+        """
+        content = self._get_file_content(path)
+        if content is None:
+            # Provide helpful error with suggestions
+            similar = [f for f in self.files if path.lower() in f.lower()][:5]
+            if similar:
+                suggestion = "\n".join(f"  - {f}" for f in similar)
+                return f"[ERROR] File not found: '{path}'\n\nDid you mean:\n{suggestion}\n\nUse list_files() to see all available files."
+            return f"[ERROR] File not found: '{path}'\n\nUse list_files() to see all {len(self.files)} available files."
+        return content
+
+    def list_files(self, pattern: str | None = None) -> str:
+        """
+        List all available files that were collected for analysis.
+
+        Args:
+            pattern: Optional filter pattern (case-insensitive substring match)
+
+        Returns:
+            Formatted list of files with sizes
+
+        Example:
+            list_files()              # All files
+            list_files(".swift")      # Only Swift files
+            list_files("ViewModel")   # Files containing 'ViewModel'
+        """
+        files_to_show = self.files
+        if pattern:
+            pattern_lower = pattern.lower()
+            files_to_show = [f for f in self.files if pattern_lower in f.lower()]
+
+        if not files_to_show:
+            if pattern:
+                return f"No files matching '{pattern}'. Total files available: {len(self.files)}"
+            return "No files available."
+
+        lines = [f"## Available Files ({len(files_to_show)}" + (f" matching '{pattern}')" if pattern else ")")]
+        lines.append("")
+
+        # Group by extension for better readability
+        by_ext: dict[str, list[str]] = {}
+        for f in files_to_show:
+            ext = f.split('.')[-1] if '.' in f else 'other'
+            if ext not in by_ext:
+                by_ext[ext] = []
+            by_ext[ext].append(f)
+
+        for ext in sorted(by_ext.keys()):
+            lines.append(f"### .{ext} ({len(by_ext[ext])} files)")
+            for f in sorted(by_ext[ext]):
+                size = self.file_index[f][1] - self.file_index[f][0]
+                lines.append(f"  - {f} ({size:,} chars)")
+            lines.append("")
+
+        return "\n".join(lines)
+
+    def search_in_file(self, path: str, pattern: str) -> list[dict]:
+        """
+        Search for a regex pattern within a specific file.
+
+        Args:
+            path: File path to search in
+            pattern: Regex pattern to search for
+
+        Returns:
+            List of matches with line numbers
+
+        Example:
+            matches = search_in_file("server.py", r"def \\w+")
+            for m in matches:
+                print(f"Line {m['line']}: {m['code']}")
+        """
+        lines = self._get_file_lines(path)
+        if lines is None:
+            return [{"error": f"File not found: {path}"}]
+
+        results = []
+        try:
+            regex = re.compile(pattern, re.IGNORECASE)
+            for i, line in enumerate(lines, 1):
+                if regex.search(line):
+                    results.append({
+                        "file": path,
+                        "line": i,
+                        "code": line.strip(),
+                        "match": regex.search(line).group(0)
+                    })
+        except re.error as e:
+            return [{"error": f"Invalid regex: {e}"}]
+
+        return results
+
+    def get_file_info(self, path: str) -> dict:
+        """
+        Get metadata about a specific file.
+
+        Args:
+            path: File path
+
+        Returns:
+            Dict with file info (path, size, line_count, extension)
+        """
+        content = self._get_file_content(path)
+        if content is None:
+            return {"error": f"File not found: {path}"}
+
+        lines = content.split('\n')
+        return {
+            "path": path,
+            "size_chars": len(content),
+            "line_count": len(lines),
+            "extension": path.split('.')[-1] if '.' in path else None,
+            "first_line": lines[0].strip() if lines else "",
+        }
+
     def _search_pattern(
         self,
         pattern: str,

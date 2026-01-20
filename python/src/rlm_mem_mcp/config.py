@@ -23,6 +23,82 @@ load_dotenv()
 # Default model (OpenRouter model ID)
 DEFAULT_MODEL = "google/gemini-2.5-flash-lite"
 
+# Default file extensions to include
+DEFAULT_EXTENSIONS = {
+    # Code files
+    ".py", ".js", ".ts", ".jsx", ".tsx", ".go", ".rs", ".java",
+    ".c", ".cpp", ".h", ".hpp", ".rb", ".php", ".swift", ".kt",
+    ".scala", ".cs", ".m", ".mm", ".vue", ".svelte",
+    # Config files
+    ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".env",
+    # Documentation
+    ".md", ".txt", ".rst", ".adoc",
+    # Other
+    ".sql", ".graphql", ".proto", ".sh", ".bash", ".zsh",
+    ".dockerfile", ".makefile", ".cmake",
+    # Additional common types
+    ".xml", ".html", ".css", ".scss", ".less", ".plist",
+}
+
+# Default directories to skip
+DEFAULT_SKIP_DIRS = {
+    ".git", "node_modules", "__pycache__", "venv", ".venv",
+    "dist", "build", ".next", "target", "vendor", ".cache",
+    ".idea", ".vscode", "coverage", ".nyc_output", "eggs",
+    "*.egg-info", ".tox", ".pytest_cache", ".mypy_cache",
+    ".ruff_cache", "htmlcov", ".hypothesis",
+}
+
+
+def _parse_csv_env(env_var: str) -> Set[str]:
+    """Parse a comma-separated environment variable into a set."""
+    value = os.getenv(env_var, "")
+    if not value:
+        return set()
+    return {item.strip() for item in value.split(",") if item.strip()}
+
+
+def _get_included_extensions() -> Set[str]:
+    """
+    Get the set of included file extensions, applying environment overrides.
+
+    Environment variables:
+    - RLM_EXTRA_EXTENSIONS: Comma-separated extensions to add (e.g., ".xml,.xsl")
+    - RLM_SKIP_EXTENSIONS: Comma-separated extensions to exclude (e.g., ".md,.txt")
+    """
+    extensions = DEFAULT_EXTENSIONS.copy()
+
+    # Add extra extensions
+    extra = _parse_csv_env("RLM_EXTRA_EXTENSIONS")
+    extensions.update(extra)
+
+    # Remove skipped extensions
+    skip = _parse_csv_env("RLM_SKIP_EXTENSIONS")
+    extensions -= skip
+
+    return extensions
+
+
+def _get_skipped_directories() -> Set[str]:
+    """
+    Get the set of skipped directories, applying environment overrides.
+
+    Environment variables:
+    - RLM_EXTRA_SKIP_DIRS: Comma-separated directories to skip (e.g., "logs,tmp")
+    - RLM_INCLUDE_DIRS: Comma-separated directories to include (removes from skip list)
+    """
+    dirs = DEFAULT_SKIP_DIRS.copy()
+
+    # Add extra directories to skip
+    extra = _parse_csv_env("RLM_EXTRA_SKIP_DIRS")
+    dirs.update(extra)
+
+    # Remove directories from skip list (force include)
+    include = _parse_csv_env("RLM_INCLUDE_DIRS")
+    dirs -= include
+
+    return dirs
+
 
 @dataclass
 class RLMConfig:
@@ -109,30 +185,21 @@ class RLMConfig:
         return min(timeout, self.max_timeout_seconds)
 
     # File Collection Configuration
-    included_extensions: Set[str] = field(default_factory=lambda: {
-        # Code files
-        ".py", ".js", ".ts", ".jsx", ".tsx", ".go", ".rs", ".java",
-        ".c", ".cpp", ".h", ".hpp", ".rb", ".php", ".swift", ".kt",
-        ".scala", ".cs", ".m", ".mm", ".vue", ".svelte",
-        # Config files
-        ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".env",
-        # Documentation
-        ".md", ".txt", ".rst", ".adoc",
-        # Other
-        ".sql", ".graphql", ".proto", ".sh", ".bash", ".zsh",
-        ".dockerfile", ".makefile", ".cmake",
-    })
+    # Can be customized via environment variables:
+    # - RLM_EXTRA_EXTENSIONS: Comma-separated extensions to add (e.g., ".xml,.xsl")
+    # - RLM_SKIP_EXTENSIONS: Comma-separated extensions to exclude (e.g., ".md,.txt")
+    # - RLM_EXTRA_SKIP_DIRS: Comma-separated directories to skip (e.g., "logs,tmp")
+    # - RLM_INCLUDE_DIRS: Comma-separated directories to include (removes from skip list)
+    included_extensions: Set[str] = field(default_factory=lambda: _get_included_extensions())
 
-    skipped_directories: Set[str] = field(default_factory=lambda: {
-        ".git", "node_modules", "__pycache__", "venv", ".venv",
-        "dist", "build", ".next", "target", "vendor", ".cache",
-        ".idea", ".vscode", "coverage", ".nyc_output", "eggs",
-        "*.egg-info", ".tox", ".pytest_cache", ".mypy_cache",
-        ".ruff_cache", "htmlcov", ".hypothesis",
-    })
+    skipped_directories: Set[str] = field(default_factory=lambda: _get_skipped_directories())
 
-    max_file_size_bytes: int = 1_000_000  # 1MB per file
-    max_total_tokens: int = 500_000  # Maximum tokens to process
+    max_file_size_bytes: int = field(
+        default_factory=lambda: int(os.getenv("RLM_MAX_FILE_SIZE", "1000000"))
+    )  # 1MB per file default
+    max_total_tokens: int = field(
+        default_factory=lambda: int(os.getenv("RLM_MAX_TOTAL_TOKENS", "500000"))
+    )  # Maximum tokens to process
 
     # OpenRouter Prompt Caching Configuration
     # Gemini has implicit caching (automatic), but we can extend TTL

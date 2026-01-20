@@ -94,7 +94,16 @@ claude mcp add --transport stdio rlm -- python -m rlm_mem_mcp.server
 }
 ```
 
-## Usage
+## Documentation
+
+Complete documentation is available in the [`docs/`](./docs/) directory:
+
+- **[Usage Guide](./docs/USAGE_GUIDE.md)** - Practical examples and workflows (start here!)
+- **[API Reference](./docs/API.md)** - Complete tool specifications
+- **[Configuration Guide](./docs/CONFIGURATION.md)** - Environment variables and setup
+- **[Architecture](./docs/ARCHITECTURE.md)** - Technical deep-dive
+
+## Quick Usage
 
 ### Tools Available
 

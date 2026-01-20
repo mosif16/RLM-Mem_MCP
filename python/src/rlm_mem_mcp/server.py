@@ -90,6 +90,50 @@ def validate_path(path: str) -> tuple[bool, str]:
     return True, ""
 
 
+def _format_skipped_files_summary(skipped_files: list[str], max_display: int = 10) -> str:
+    """
+    Format a summary of skipped files for user visibility.
+
+    Args:
+        skipped_files: List of skipped file paths with reasons
+        max_display: Maximum number of skipped files to show
+
+    Returns:
+        Formatted markdown string with skipped files summary
+    """
+    if not skipped_files:
+        return ""
+
+    # Group by reason
+    by_reason: dict[str, list[str]] = {}
+    for entry in skipped_files:
+        # Parse "path (reason)" format
+        if " (" in entry and entry.endswith(")"):
+            path, reason = entry.rsplit(" (", 1)
+            reason = reason.rstrip(")")
+        else:
+            path = entry
+            reason = "unknown"
+
+        if reason not in by_reason:
+            by_reason[reason] = []
+        by_reason[reason].append(path)
+
+    lines = [f"\n\n## Skipped Files ({len(skipped_files)} total)"]
+
+    for reason, paths in sorted(by_reason.items(), key=lambda x: -len(x[1])):
+        count = len(paths)
+        lines.append(f"\n**{reason}** ({count} files)")
+        for path in paths[:max_display]:
+            lines.append(f"  - {path}")
+        if count > max_display:
+            lines.append(f"  - ... and {count - max_display} more")
+
+    lines.append("\n*Tip: Modify config.skipped_directories or config.included_extensions to change what gets collected.*")
+
+    return "\n".join(lines)
+
+
 # Global instances
 _rlm_config: RLMConfig | None = None
 _server_config: ServerConfig | None = None
@@ -954,9 +998,18 @@ async def handle_rlm_analyze(arguments: dict[str, Any]) -> list[TextContent]:
     await _write_progress(session_id, "files_collected", f"Collected {collection.file_count} files", 20, {"file_count": collection.file_count})
 
     if collection.file_count == 0:
-        error_msg = "No matching files found"
+        error_msg = "## No Matching Files Found\n\n"
         if collection.errors:
-            error_msg += f": {'; '.join(collection.errors)}"
+            error_msg += f"**Errors:** {'; '.join(collection.errors)}\n\n"
+
+        # Show skipped files to help user understand why
+        if collection.skipped_files:
+            error_msg += _format_skipped_files_summary(collection.skipped_files, max_display=20)
+        else:
+            error_msg += "No files matched the configured extensions.\n\n"
+            error_msg += "**Included extensions:** " + ", ".join(sorted(rlm_config.included_extensions)[:20]) + "...\n"
+            error_msg += "**Skipped directories:** " + ", ".join(sorted(rlm_config.skipped_directories)[:10]) + "..."
+
         return [TextContent(type="text", text=error_msg)]
 
     # Check semantic cache for similar query
@@ -1005,6 +1058,10 @@ async def handle_rlm_analyze(arguments: dict[str, Any]) -> list[TextContent]:
         processing_time = int((time.time() - start_time) * 1000)
 
         literal_result += f"\n*Scanned {collection.file_count} files in {processing_time}ms (literal search fast-path)*"
+
+        # Add skipped files info if any
+        if collection.skipped_files:
+            literal_result += _format_skipped_files_summary(collection.skipped_files)
 
         return [TextContent(type="text", text=literal_result)]
 
@@ -1084,6 +1141,10 @@ async def handle_rlm_analyze(arguments: dict[str, Any]) -> list[TextContent]:
     if total_findings > 0:
         # Add file scan stats
         structured_output += f"\n\n*Scanned {collection.file_count} files in {int((time.time() - start_time) * 1000)}ms*"
+
+        # Add skipped files info if any
+        if collection.skipped_files:
+            structured_output += _format_skipped_files_summary(collection.skipped_files)
 
         # For comprehensive results, skip LLM processing entirely
         if high_conf_findings >= 3 or total_findings >= 10:
