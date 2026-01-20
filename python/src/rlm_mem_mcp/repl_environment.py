@@ -1739,6 +1739,12 @@ Remove duplicates (same line, same issue). Keep all unique findings with their l
             "run_quality_scan": tools.run_quality_scan,
             "run_ios_scan": tools.run_ios_scan,
 
+            # ===== CUSTOM SEARCH TOOLS (for agent-provided patterns) =====
+            # These are the PRIMARY tools for custom queries
+            "custom_search": tools.custom_search,      # Search with custom regex pattern
+            "multi_search": tools.multi_search,        # Search multiple patterns at once
+            "semantic_search": tools.semantic_search,  # Get relevant file content for LLM analysis
+
             # TypeScript analysis tools
             "analyze_typescript_imports": tools.analyze_typescript_imports,
             "trace_websocket_flow": tools.trace_websocket_flow,
@@ -1917,6 +1923,262 @@ Remove duplicates (same line, same issue). Keep all unique findings with their l
 
         return query_type, complexity
 
+    def _is_custom_query(self, query: str) -> bool:
+        """
+        Detect if a query requires custom search patterns vs. built-in tools.
+
+        Custom queries contain specific terms/patterns that don't map to
+        pre-built tools like find_secrets(), run_security_scan(), etc.
+
+        Returns:
+            True if the query needs custom search handling
+        """
+        query_lower = query.lower()
+
+        # Built-in tool keywords - queries with ONLY these can use built-in tools
+        builtin_keywords = {
+            # Security tools
+            "secrets", "api key", "password", "hardcoded", "credential",
+            "sql injection", "xss", "cross-site", "command injection",
+            "eval(", "exec(",
+            # iOS tools
+            "force unwrap", "retain cycle", "weak self", "main thread",
+            "@mainactor", "swiftui", "@observedobject", "@stateobject",
+            # Quality tools
+            "long function", "todo", "fixme", "hack", "complexity",
+            # Architecture
+            "architecture", "imports", "dependencies",
+        }
+
+        # Custom query indicators - specific terms that need custom searches
+        custom_indicators = [
+            # Specific function/variable names
+            r'\b[a-z_][a-z0-9_]*[A-Z][a-zA-Z0-9_]*\b',  # camelCase identifiers
+            r'\b[A-Z][a-z]+[A-Z][a-zA-Z]*\b',  # PascalCase identifiers
+            # Numbered lists indicating multi-part custom query
+            r'\(\s*\d+\s*\)',  # (1), (2), etc.
+            r'\d+\.\s+\w+',  # 1. something
+            # Specific patterns
+            "race condition", "stale", "cleanup", "leak", "listener",
+            "handler", "event", "destroy", "shutdown", "hmr", "hot reload",
+            "missing validation", "before calling", "after calling",
+            "flow", "state becomes", "not cleaned up",
+        ]
+
+        # Check if query has custom indicators
+        has_custom_indicator = False
+        for indicator in custom_indicators:
+            if indicator.startswith(r'\b'):
+                # It's a regex pattern
+                if re.search(indicator, query):
+                    has_custom_indicator = True
+                    break
+            else:
+                # Plain string
+                if indicator in query_lower:
+                    has_custom_indicator = True
+                    break
+
+        # Check if query ONLY matches built-in keywords
+        has_builtin_match = any(kw in query_lower for kw in builtin_keywords)
+
+        # Custom if: has custom indicators OR (no builtin match AND query is specific)
+        # A "specific" query has multiple clauses or detailed descriptions
+        is_specific = (
+            len(query.split()) > 15 or  # Long query
+            "(" in query or  # Has numbered items
+            query.count(",") >= 2 or  # Multiple comma-separated items
+            " where " in query_lower or  # Conditional clause
+            " when " in query_lower or
+            " that " in query_lower
+        )
+
+        return has_custom_indicator or (is_specific and not has_builtin_match)
+
+    def _extract_search_patterns_from_query(self, query: str) -> list[dict]:
+        """
+        Extract actionable search patterns from a custom query.
+
+        Parses queries like:
+        "Find (1) race conditions in table_remove (2) missing validation before assignAgent"
+
+        Returns:
+            List of {pattern: str, description: str, file_filter: str|None}
+        """
+        patterns = []
+
+        # Extract numbered items: (1) ..., (2) ..., etc.
+        numbered_pattern = r'\(\s*(\d+)\s*\)\s*([^(]+?)(?=\(\s*\d+\s*\)|$)'
+        matches = re.findall(numbered_pattern, query, re.DOTALL)
+
+        if matches:
+            for num, description in matches:
+                desc = description.strip().rstrip('.')
+                # Extract key terms for regex pattern
+                pattern_info = self._description_to_pattern(desc)
+                patterns.append({
+                    "number": int(num),
+                    "description": desc,
+                    **pattern_info
+                })
+        else:
+            # Try to extract from comma-separated or sentence structure
+            # Split on common separators
+            parts = re.split(r'\s*(?:,|\band\b|\bor\b)\s*', query)
+            for i, part in enumerate(parts):
+                part = part.strip()
+                if len(part) > 10:  # Skip very short fragments
+                    pattern_info = self._description_to_pattern(part)
+                    patterns.append({
+                        "number": i + 1,
+                        "description": part,
+                        **pattern_info
+                    })
+
+        return patterns
+
+    def _description_to_pattern(self, description: str) -> dict:
+        """
+        Convert a description to a regex pattern and file filter.
+
+        Args:
+            description: Natural language description like "race conditions in table_remove"
+
+        Returns:
+            {pattern: str, file_filter: str|None, search_terms: list[str]}
+        """
+        desc_lower = description.lower()
+
+        # Extract identifiers (function names, variable names, etc.)
+        identifiers = re.findall(r'\b([a-z_][a-z0-9_]*(?:[A-Z][a-zA-Z0-9_]*)?)\b', description)
+        # Filter out common words
+        stop_words = {'find', 'search', 'look', 'for', 'the', 'a', 'an', 'in', 'is', 'are',
+                      'all', 'any', 'where', 'when', 'that', 'which', 'with', 'without',
+                      'missing', 'not', 'before', 'after', 'properly', 'should', 'could',
+                      'race', 'condition', 'conditions', 'validation', 'check', 'checking'}
+        search_terms = [w for w in identifiers if w.lower() not in stop_words and len(w) > 2]
+
+        # Determine file filter based on context
+        file_filter = None
+        if any(x in desc_lower for x in ['swift', 'ios', 'xcode', '.swift']):
+            file_filter = '.swift'
+        elif any(x in desc_lower for x in ['typescript', 'ts', '.ts']):
+            file_filter = '.ts'
+        elif any(x in desc_lower for x in ['javascript', 'js', '.js', 'react', 'phaser']):
+            file_filter = '.js'
+        elif any(x in desc_lower for x in ['python', 'py', '.py']):
+            file_filter = '.py'
+
+        # Build regex pattern from search terms
+        if search_terms:
+            # Create pattern that matches any of the terms
+            pattern = '|'.join(re.escape(term) for term in search_terms[:5])
+        else:
+            # Fallback: extract quoted strings or capitalized words
+            quoted = re.findall(r'"([^"]+)"', description)
+            if quoted:
+                pattern = '|'.join(re.escape(q) for q in quoted)
+            else:
+                # Last resort: use first few significant words
+                words = [w for w in description.split() if len(w) > 4][:3]
+                pattern = '|'.join(re.escape(w) for w in words) if words else '.*'
+
+        return {
+            "pattern": pattern,
+            "file_filter": file_filter,
+            "search_terms": search_terms
+        }
+
+    def _build_custom_query_prompt(self, query: str, patterns: list[dict], files: list[str]) -> str:
+        """
+        Build a system prompt optimized for custom search queries.
+
+        Uses the flexible custom_search() and multi_search() tools that accept
+        agent-provided patterns instead of preset hardcoded patterns.
+        """
+        # Format the extracted patterns for the prompt
+        pattern_instructions = []
+        search_specs = []
+        for p in patterns:
+            pattern_instructions.append(
+                f"  {p['number']}. {p['description']}\n"
+                f"     Suggested regex: `{p['pattern']}`\n"
+                f"     Key terms: {p['search_terms']}"
+            )
+            # Build search spec for multi_search
+            spec = {
+                "pattern": p['pattern'],
+                "description": p['description'],
+            }
+            if p.get('file_filter'):
+                spec["file_filter"] = p['file_filter']
+            search_specs.append(spec)
+
+        patterns_text = "\n".join(pattern_instructions) if pattern_instructions else "  (Search for terms in the query)"
+
+        return f'''You are an RLM REPL analyzing code for SPECIFIC patterns requested by the user.
+
+## CRITICAL: This is a CUSTOM QUERY - Use custom_search() with YOUR OWN patterns!
+
+The user asked for specific things. You provide the search patterns.
+
+## User's Search Targets:
+{patterns_text}
+
+## CUSTOM SEARCH TOOLS (use these!)
+
+### Option 1: custom_search() - Single pattern search
+```python
+# YOU provide the pattern and description
+result = custom_search(
+    pattern=r'your_regex_here',      # YOUR regex pattern
+    description="What this finds",    # YOUR description
+    file_filter=".js",               # Optional: filter by extension
+    category="your_category"          # Optional: for grouping
+)
+print(result.to_markdown())
+```
+
+### Option 2: multi_search() - Multiple patterns at once
+```python
+# Search for all the user's requirements at once
+result = multi_search([
+    {{"pattern": r"pattern1", "description": "First thing to find"}},
+    {{"pattern": r"pattern2", "description": "Second thing to find"}},
+    {{"pattern": r"pattern3", "description": "Third thing to find"}},
+])
+print(result.to_markdown())
+FINAL_ANSWER = result.to_markdown()
+```
+
+### Option 3: semantic_search() + llm_query() - For complex logic
+```python
+# Get relevant files based on keywords
+content = semantic_search("table state agent assignment", file_filter=".ts")
+# Then analyze semantically
+analysis = llm_query(f"""Analyze for race conditions:
+{{content}}
+
+Look for: [specific issues]
+Report: file:line, code, issue""")
+print(analysis)
+```
+
+## Available Files ({len(files)} files)
+{', '.join(files[:30])}{'...' if len(files) > 30 else ''}
+
+## RULES:
+1. YOU write the regex patterns based on what the user asked
+2. Use custom_search() or multi_search() - they accept any pattern you provide
+3. Include file:line references for every finding
+4. If no matches, say "No matches found" - don't make things up
+5. Do NOT use generic tools like run_security_scan() unless user asked for security audit
+
+## User Query:
+{query}
+
+Write code to search for each item the user requested. You decide the patterns.'''
+
     async def run_rlm_session(
         self,
         query: str,
@@ -1968,19 +2230,46 @@ Remove duplicates (same line, same issue). Keep all unique findings with their l
         # Extract actual file list to ground the LLM in reality
         actual_files = self._extract_file_list()
 
-        system = self.SYSTEM_PROMPT.format(
-            query=safe_query,
-            char_count=len(self.state.prompt),
-            file_count=len(actual_files)
-        )
+        # Detect if this is a custom query that needs specific pattern searches
+        is_custom = self._is_custom_query(query)
 
-        # Build categorized file index for better discovery
-        categorized_index = self._build_categorized_file_index(actual_files)
+        if is_custom:
+            # Extract patterns from the query for custom searching
+            extracted_patterns = self._extract_search_patterns_from_query(query)
+            print(f"[REPL] CUSTOM QUERY detected - extracted {len(extracted_patterns)} search patterns", file=sys.stderr)
+            for p in extracted_patterns:
+                print(f"[REPL]   Pattern {p['number']}: {p['search_terms'][:3]}", file=sys.stderr)
 
-        # Initial message - simplified to emphasize tool usage
-        # Build system message with caching for the large codebase content
-        # The system prompt + codebase index is static and benefits from caching
-        system_content = f"""You are an RLM REPL analyzing code. Use structured tools and VERIFY results before returning.
+            # Use custom query prompt that guides LLM to search for specific patterns
+            system_content = self._build_custom_query_prompt(query, extracted_patterns, actual_files)
+
+            # User message for custom query
+            user_msg = f"""Search for each of the patterns listed above.
+
+For each pattern:
+1. Use search_pattern(r'pattern', file_filter) to find matches
+2. Print the results with file:line references
+3. If semantic analysis needed, use llm_query()
+
+Then combine all findings into FINAL_ANSWER with file:line references."""
+
+        else:
+            # Standard built-in tool query
+            print(f"[REPL] BUILTIN QUERY - using standard tools", file=sys.stderr)
+
+            system = self.SYSTEM_PROMPT.format(
+                query=safe_query,
+                char_count=len(self.state.prompt),
+                file_count=len(actual_files)
+            )
+
+            # Build categorized file index for better discovery
+            categorized_index = self._build_categorized_file_index(actual_files)
+
+            # Initial message - simplified to emphasize tool usage
+            # Build system message with caching for the large codebase content
+            # The system prompt + codebase index is static and benefits from caching
+            system_content = f"""You are an RLM REPL analyzing code. Use structured tools and VERIFY results before returning.
 
 ## Available Files ({len(actual_files)} files, {len(self.state.prompt):,} chars)
 {categorized_index}
@@ -1999,8 +2288,8 @@ if verification.status.value != "FAILED":
     FINAL_ANSWER = result.to_markdown()
 ```"""
 
-        # User message with the specific query (changes per request)
-        user_msg = f"""## Query: {safe_query}
+            # User message with the specific query (changes per request)
+            user_msg = f"""## Query: {safe_query}
 
 Select the appropriate tool(s), run them, verify results, then set FINAL_ANSWER."""
 

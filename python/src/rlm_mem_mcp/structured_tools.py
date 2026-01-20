@@ -789,42 +789,345 @@ class StructuredTools:
         end = min(len(lines), line_num + after)
         return lines[start:end]
 
-    # ===== SECURITY TOOLS =====
+    # ===== CUSTOM SEARCH TOOLS (Agent-provided patterns) =====
 
-    def find_secrets(self) -> ToolResult:
+    def custom_search(
+        self,
+        pattern: str,
+        description: str = "Custom search",
+        file_filter: str | None = None,
+        confidence: Confidence = Confidence.MEDIUM,
+        severity: Severity = Severity.MEDIUM,
+        category: str = "custom",
+        exclude_comments: bool = True,
+        exclude_tests: bool = False,
+        max_results: int = 100,
+    ) -> ToolResult:
+        """
+        Search for a custom regex pattern - the FLEXIBLE search tool.
+
+        This is the primary tool for custom queries where the agent provides
+        the search pattern instead of using preset patterns.
+
+        Args:
+            pattern: Regex pattern to search for (case-insensitive)
+            description: What this pattern represents (shown in output)
+            file_filter: Optional file extension filter (e.g., ".js", ".swift")
+            confidence: Confidence level for findings (HIGH/MEDIUM/LOW)
+            severity: Severity level for findings
+            category: Category label for grouping
+            exclude_comments: Skip matches in comments (default True)
+            exclude_tests: Skip test files (default False)
+            max_results: Maximum results to return (default 100)
+
+        Returns:
+            ToolResult with structured findings
+
+        Example:
+            # Search for specific function calls
+            result = custom_search(
+                pattern=r'assignAgent\\s*\\(',
+                description="assignAgent calls without validation",
+                file_filter=".ts"
+            )
+
+            # Search for event handler patterns
+            result = custom_search(
+                pattern=r'\\.on\\s*\\(["\\'](keydown|keyup)',
+                description="Keyboard event handlers",
+                file_filter=".js"
+            )
+
+            # Search with custom severity
+            result = custom_search(
+                pattern=r'localStorage\\.setItem',
+                description="LocalStorage writes",
+                severity=Severity.LOW,
+                category="persistence"
+            )
+        """
+        result = ToolResult(
+            tool_name=f"Custom Search: {description}",
+            files_scanned=len(self.files)
+        )
+
+        try:
+            matches = self._search_pattern(pattern, file_filter)
+        except re.error as e:
+            result.errors.append(f"Invalid regex pattern: {e}")
+            return result
+
+        count = 0
+        for filepath, line_num, line_content, match in matches:
+            if count >= max_results:
+                result.errors.append(f"Truncated at {max_results} results")
+                break
+
+            # Apply filters
+            if exclude_comments and self._is_in_comment(line_content, filepath):
+                continue
+            if exclude_tests and self._is_test_file(filepath):
+                continue
+
+            # Build context for confidence calculation
+            context = AnalysisContext(
+                in_test_file=self._is_test_file(filepath),
+                is_comment=self._is_in_comment(line_content, filepath),
+                pattern_match_only=True,
+            )
+
+            # Calculate final confidence
+            final_confidence = calculate_confidence(
+                Finding(file=filepath, line=line_num, code=line_content, issue=description),
+                context
+            )
+
+            # Use provided confidence as ceiling
+            if confidence == Confidence.HIGH and final_confidence != Confidence.HIGH:
+                final_confidence = confidence
+            elif confidence == Confidence.LOW:
+                final_confidence = Confidence.LOW
+
+            result.findings.append(Finding(
+                file=filepath,
+                line=line_num,
+                code=line_content,
+                issue=description,
+                confidence=final_confidence,
+                severity=severity,
+                category=category,
+            ))
+            count += 1
+
+        result.summary = f"Found {len(result.findings)} matches for '{pattern[:50]}...'" if len(pattern) > 50 else f"Found {len(result.findings)} matches for '{pattern}'"
+        return result
+
+    def multi_search(
+        self,
+        searches: list[dict],
+        combine: bool = True,
+    ) -> ToolResult | list[ToolResult]:
+        """
+        Search for multiple patterns at once - batch custom search.
+
+        This is useful when the user's query contains multiple numbered items
+        like "(1) find X (2) find Y (3) find Z".
+
+        Args:
+            searches: List of search specs, each a dict with:
+                - pattern: str (required) - regex pattern
+                - description: str - what this pattern represents
+                - file_filter: str|None - file extension filter
+                - confidence: Confidence - confidence level
+                - severity: Severity - severity level
+                - category: str - category label
+            combine: If True, combine all results into single ToolResult.
+                     If False, return list of ToolResults.
+
+        Returns:
+            Combined ToolResult or list of ToolResults
+
+        Example:
+            results = multi_search([
+                {
+                    "pattern": r"assignAgent\\(",
+                    "description": "assignAgent calls",
+                    "file_filter": ".ts"
+                },
+                {
+                    "pattern": r"\\.on\\(['\"]keydown",
+                    "description": "keydown event handlers",
+                    "file_filter": ".js"
+                },
+                {
+                    "pattern": r"\\.removeListener|\\.off\\(",
+                    "description": "event cleanup calls",
+                    "file_filter": ".js"
+                }
+            ])
+        """
+        results = []
+
+        for i, spec in enumerate(searches):
+            if "pattern" not in spec:
+                # Skip invalid specs
+                continue
+
+            result = self.custom_search(
+                pattern=spec["pattern"],
+                description=spec.get("description", f"Search {i+1}"),
+                file_filter=spec.get("file_filter"),
+                confidence=spec.get("confidence", Confidence.MEDIUM),
+                severity=spec.get("severity", Severity.MEDIUM),
+                category=spec.get("category", f"search_{i+1}"),
+                exclude_comments=spec.get("exclude_comments", True),
+                exclude_tests=spec.get("exclude_tests", False),
+                max_results=spec.get("max_results", 50),
+            )
+            results.append(result)
+
+        if not combine:
+            return results
+
+        # Combine into single result
+        combined = ToolResult(
+            tool_name="Multi-Search Results",
+            files_scanned=len(self.files)
+        )
+
+        for result in results:
+            combined.findings.extend(result.findings)
+            combined.errors.extend(result.errors)
+
+        # Deduplicate by file+line
+        seen = set()
+        unique_findings = []
+        for f in combined.findings:
+            key = (f.file, f.line)
+            if key not in seen:
+                seen.add(key)
+                unique_findings.append(f)
+        combined.findings = unique_findings
+
+        combined.summary = f"Multi-search: {len(combined.findings)} total findings from {len(searches)} patterns"
+        return combined
+
+    def semantic_search(
+        self,
+        query: str,
+        file_filter: str | None = None,
+        max_files: int = 10,
+    ) -> str:
+        """
+        Search using semantic analysis - returns file content for LLM analysis.
+
+        Unlike pattern-based search, this returns relevant file content that
+        the agent can then analyze with llm_query() for semantic understanding.
+
+        Use this when:
+        - The query requires understanding code semantics, not just patterns
+        - Looking for logic issues, race conditions, design problems
+        - The pattern is too complex for regex
+
+        Args:
+            query: Natural language description of what to find
+            file_filter: Optional file extension filter
+            max_files: Maximum files to return content for
+
+        Returns:
+            Formatted content of relevant files for analysis
+
+        Example:
+            # Get files that might have race conditions
+            content = semantic_search(
+                query="table state management and agent assignment",
+                file_filter=".ts"
+            )
+            # Then analyze with llm_query
+            analysis = llm_query(f"Find race conditions in:\\n{content}")
+        """
+        # Extract keywords from query
+        stop_words = {'find', 'search', 'look', 'for', 'the', 'a', 'an', 'in', 'is', 'are',
+                      'all', 'any', 'where', 'when', 'that', 'which', 'with', 'without'}
+        words = query.lower().split()
+        keywords = [w for w in words if w not in stop_words and len(w) > 2]
+
+        # Find files that match keywords
+        scored_files: list[tuple[str, int, str]] = []
+
+        for filepath in self.files:
+            if file_filter and not filepath.endswith(file_filter):
+                continue
+
+            content = self._get_file_content(filepath)
+            if not content:
+                continue
+
+            # Score by keyword matches
+            score = 0
+            content_lower = content.lower()
+            for kw in keywords:
+                score += content_lower.count(kw)
+
+            if score > 0:
+                scored_files.append((filepath, score, content))
+
+        # Sort by score and take top files
+        scored_files.sort(key=lambda x: x[1], reverse=True)
+        top_files = scored_files[:max_files]
+
+        if not top_files:
+            return f"No files found matching keywords: {keywords}"
+
+        # Build output with file content
+        output_parts = [f"## Relevant Files for: {query}\n"]
+        output_parts.append(f"Found {len(top_files)} relevant files (showing content)\n")
+
+        for filepath, score, content in top_files:
+            # Truncate very long files
+            if len(content) > 8000:
+                content = content[:8000] + "\n... (truncated)"
+
+            output_parts.append(f"\n### File: {filepath} (relevance: {score})\n")
+            output_parts.append(f"```\n{content}\n```\n")
+
+        return "\n".join(output_parts)
+
+    # ===== SECURITY TOOLS (all accept custom patterns) =====
+
+    def find_secrets(
+        self,
+        custom_patterns: list[tuple[str, str, Severity]] | None = None,
+        file_filter: str | None = None,
+    ) -> ToolResult:
         """
         Find hardcoded secrets: API keys, passwords, tokens.
 
-        Searches for:
+        Args:
+            custom_patterns: Optional list of (regex, description, severity) tuples.
+                             If provided, ONLY these patterns are used (no defaults).
+            file_filter: Optional file extension filter (e.g., ".py", ".js")
+
+        Default patterns (used if custom_patterns is None):
         - API key patterns (sk-, api_key, apikey)
         - Password assignments
         - Token/secret assignments
         - Private keys
+
+        Example with custom patterns:
+            result = find_secrets(custom_patterns=[
+                (r'my_api_key\\s*=', "Custom API key", Severity.HIGH),
+                (r'DATABASE_URL\\s*=', "Database URL", Severity.CRITICAL),
+            ])
         """
         result = ToolResult(tool_name="Hardcoded Secrets Scanner", files_scanned=len(self.files))
 
-        patterns = [
-            # API keys with prefixes
-            (r'''['"](sk-[a-zA-Z0-9]{20,})['"]''', "API Key (sk- prefix)", Severity.CRITICAL),
-            (r'''['"](api[_-]?key[_-]?[a-zA-Z0-9]{10,})['"]''', "API Key pattern", Severity.HIGH),
+        # Use custom patterns if provided, otherwise use defaults
+        if custom_patterns is not None:
+            patterns = custom_patterns
+        else:
+            patterns = [
+                # API keys with prefixes
+                (r'''['"](sk-[a-zA-Z0-9]{20,})['"]''', "API Key (sk- prefix)", Severity.CRITICAL),
+                (r'''['"](api[_-]?key[_-]?[a-zA-Z0-9]{10,})['"]''', "API Key pattern", Severity.HIGH),
 
-            # Assignments
-            (r'''(?:api[_-]?key|apikey)\s*[=:]\s*['"]((?!<|{|\$)[^'"]{8,})['"]\s*''', "API Key assignment", Severity.HIGH),
-            (r'''(?:password|passwd|pwd)\s*[=:]\s*['"]((?!<|{|\$)[^'"]{4,})['"]\s*''', "Password assignment", Severity.CRITICAL),
-            (r'''(?:secret|token)\s*[=:]\s*['"]((?!<|{|\$)[^'"]{8,})['"]\s*''', "Secret/Token assignment", Severity.HIGH),
+                # Assignments
+                (r'''(?:api[_-]?key|apikey)\s*[=:]\s*['"]((?!<|{|\$)[^'"]{8,})['"]\s*''', "API Key assignment", Severity.HIGH),
+                (r'''(?:password|passwd|pwd)\s*[=:]\s*['"]((?!<|{|\$)[^'"]{4,})['"]\s*''', "Password assignment", Severity.CRITICAL),
+                (r'''(?:secret|token)\s*[=:]\s*['"]((?!<|{|\$)[^'"]{8,})['"]\s*''', "Secret/Token assignment", Severity.HIGH),
 
-            # AWS patterns
-            (r'''AKIA[0-9A-Z]{16}''', "AWS Access Key ID", Severity.CRITICAL),
+                # AWS patterns
+                (r'''AKIA[0-9A-Z]{16}''', "AWS Access Key ID", Severity.CRITICAL),
 
-            # Private keys
-            (r'''-----BEGIN (?:RSA |EC )?PRIVATE KEY-----''', "Private Key", Severity.CRITICAL),
+                # Private keys
+                (r'''-----BEGIN (?:RSA |EC )?PRIVATE KEY-----''', "Private Key", Severity.CRITICAL),
 
-            # Bearer tokens
-            (r'''['"](Bearer\s+[a-zA-Z0-9\-_.]+)['"]\s*''', "Bearer Token", Severity.HIGH),
-        ]
+                # Bearer tokens
+                (r'''['"](Bearer\s+[a-zA-Z0-9\-_.]+)['"]\s*''', "Bearer Token", Severity.HIGH),
+            ]
 
         for pattern, issue, severity in patterns:
-            matches = self._search_pattern(pattern)
+            matches = self._search_pattern(pattern, file_filter)
             for filepath, line_num, line, match in matches:
                 # Skip non-code files (markdown, docs, etc.)
                 if not self._is_code_file(filepath):
@@ -854,51 +1157,69 @@ class StructuredTools:
         result.summary = f"Found {len(result.findings)} potential hardcoded secrets"
         return result
 
-    def find_sql_injection(self) -> ToolResult:
+    def find_sql_injection(
+        self,
+        custom_patterns: list[tuple[str, str, Severity]] | None = None,
+        file_filter: str | None = None,
+    ) -> ToolResult:
         """
         Find SQL injection vulnerabilities.
 
-        Searches for:
+        Args:
+            custom_patterns: Optional list of (regex, description, severity) tuples.
+                             If provided, ONLY these patterns are used.
+            file_filter: Optional file extension filter
+
+        Default patterns (used if custom_patterns is None):
         - String concatenation in queries
         - f-strings in SQL
         - .format() in SQL
         - % formatting in SQL
+
+        Example with custom patterns:
+            result = find_sql_injection(custom_patterns=[
+                (r'query\\s*\\+\\s*user_input', "User input in query", Severity.CRITICAL),
+            ])
         """
         result = ToolResult(tool_name="SQL Injection Scanner", files_scanned=len(self.files))
 
-        patterns = [
-            # f-string in SQL
-            (r'''f['"](SELECT|INSERT|UPDATE|DELETE|DROP).*\{''', "f-string in SQL query", Severity.CRITICAL),
+        if custom_patterns is not None:
+            patterns = custom_patterns
+        else:
+            patterns = [
+                # f-string in SQL
+                (r'''f['"](SELECT|INSERT|UPDATE|DELETE|DROP).*\{''', "f-string in SQL query", Severity.CRITICAL),
 
-            # String concatenation
-            (r'''(SELECT|INSERT|UPDATE|DELETE).*\+\s*[a-zA-Z_]''', "String concat in SQL", Severity.HIGH),
-            (r'''[a-zA-Z_]\s*\+.*(SELECT|INSERT|UPDATE|DELETE)''', "String concat in SQL", Severity.HIGH),
+                # String concatenation
+                (r'''(SELECT|INSERT|UPDATE|DELETE).*\+\s*[a-zA-Z_]''', "String concat in SQL", Severity.HIGH),
+                (r'''[a-zA-Z_]\s*\+.*(SELECT|INSERT|UPDATE|DELETE)''', "String concat in SQL", Severity.HIGH),
 
-            # .format() in SQL
-            (r'''['"](SELECT|INSERT|UPDATE|DELETE).*['"]\.format\(''', ".format() in SQL query", Severity.HIGH),
+                # .format() in SQL
+                (r'''['"](SELECT|INSERT|UPDATE|DELETE).*['"]\.format\(''', ".format() in SQL query", Severity.HIGH),
 
-            # % formatting
-            (r'''['"](SELECT|INSERT|UPDATE|DELETE).*%s.*['"].*%''', "% formatting in SQL query", Severity.HIGH),
+                # % formatting
+                (r'''['"](SELECT|INSERT|UPDATE|DELETE).*%s.*['"].*%''', "% formatting in SQL query", Severity.HIGH),
 
-            # execute with string concat
-            (r'''\.execute\([^)]*\+''', "execute() with concatenation", Severity.HIGH),
-            (r'''\.execute\(f['"']''', "execute() with f-string", Severity.CRITICAL),
-        ]
+                # execute with string concat
+                (r'''\.execute\([^)]*\+''', "execute() with concatenation", Severity.HIGH),
+                (r'''\.execute\(f['"']''', "execute() with f-string", Severity.CRITICAL),
+            ]
 
         # Only scan actual code files (Python, JS, etc.)
         code_extensions = {'.py', '.js', '.ts', '.php', '.rb', '.java', '.go', '.rs'}
 
         for pattern, issue, severity in patterns:
-            matches = self._search_pattern(pattern, exclude_pattern=r'#|//|/\*|\*')
+            matches = self._search_pattern(pattern, file_filter, exclude_pattern=r'#|//|/\*|\*')
             for filepath, line_num, line, match in matches:
                 # Skip non-code files
                 if not self._is_code_file(filepath):
                     continue
 
-                # Only check files that could have SQL
-                ext = '.' + filepath.rsplit('.', 1)[-1].lower() if '.' in filepath else ''
-                if ext not in code_extensions:
-                    continue
+                # Only check files that could have SQL (unless custom filter)
+                if file_filter is None:
+                    ext = '.' + filepath.rsplit('.', 1)[-1].lower() if '.' in filepath else ''
+                    if ext not in code_extensions:
+                        continue
 
                 if self._is_in_comment(line, filepath):
                     continue
@@ -919,35 +1240,55 @@ class StructuredTools:
         result.summary = f"Found {len(result.findings)} potential SQL injection points"
         return result
 
-    def find_command_injection(self) -> ToolResult:
+    def find_command_injection(
+        self,
+        custom_patterns: list[tuple[str, str, Severity]] | None = None,
+        file_filter: str | None = None,
+    ) -> ToolResult:
         """
         Find command injection vulnerabilities.
 
-        Searches for:
+        Args:
+            custom_patterns: Optional list of (regex, description, severity) tuples.
+                             If provided, ONLY these patterns are used.
+            file_filter: Optional file extension filter (default: ".py")
+
+        Default patterns (used if custom_patterns is None):
         - os.system() with variables
         - subprocess with shell=True
         - eval/exec with external input
+
+        Example with custom patterns:
+            result = find_command_injection(custom_patterns=[
+                (r'Runtime\\.exec\\(', "Java Runtime.exec()", Severity.HIGH),
+            ], file_filter=".java")
         """
         result = ToolResult(tool_name="Command Injection Scanner", files_scanned=len(self.files))
 
-        patterns = [
-            # os.system with variable
-            (r'''os\.system\([^)]*[a-zA-Z_][a-zA-Z0-9_]*''', "os.system() with variable", Severity.CRITICAL),
-            (r'''os\.system\(f['"']''', "os.system() with f-string", Severity.CRITICAL),
+        if custom_patterns is not None:
+            patterns = custom_patterns
+        else:
+            patterns = [
+                # os.system with variable
+                (r'''os\.system\([^)]*[a-zA-Z_][a-zA-Z0-9_]*''', "os.system() with variable", Severity.CRITICAL),
+                (r'''os\.system\(f['"']''', "os.system() with f-string", Severity.CRITICAL),
 
-            # subprocess with shell=True
-            (r'''subprocess\.\w+\([^)]*shell\s*=\s*True''', "subprocess with shell=True", Severity.HIGH),
+                # subprocess with shell=True
+                (r'''subprocess\.\w+\([^)]*shell\s*=\s*True''', "subprocess with shell=True", Severity.HIGH),
 
-            # os.popen
-            (r'''os\.popen\([^)]*[a-zA-Z_]''', "os.popen() with variable", Severity.HIGH),
+                # os.popen
+                (r'''os\.popen\([^)]*[a-zA-Z_]''', "os.popen() with variable", Severity.HIGH),
 
-            # eval/exec
-            (r'''eval\([^)]*[a-zA-Z_][a-zA-Z0-9_]*''', "eval() with variable", Severity.CRITICAL),
-            (r'''exec\([^)]*[a-zA-Z_][a-zA-Z0-9_]*''', "exec() with variable", Severity.CRITICAL),
-        ]
+                # eval/exec
+                (r'''eval\([^)]*[a-zA-Z_][a-zA-Z0-9_]*''', "eval() with variable", Severity.CRITICAL),
+                (r'''exec\([^)]*[a-zA-Z_][a-zA-Z0-9_]*''', "exec() with variable", Severity.CRITICAL),
+            ]
+
+        # Default to Python files if no filter specified and using default patterns
+        effective_filter = file_filter if file_filter else (".py" if custom_patterns is None else None)
 
         for pattern, issue, severity in patterns:
-            matches = self._search_pattern(pattern, file_filter=".py")
+            matches = self._search_pattern(pattern, file_filter=effective_filter)
             for filepath, line_num, line, match in matches:
                 if self._is_in_comment(line, filepath):
                     continue
