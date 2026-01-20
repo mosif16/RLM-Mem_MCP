@@ -2520,10 +2520,20 @@ class StructuredTools:
              "fatalError in code - will crash in production", Severity.HIGH,
              "Use proper error handling or preconditionFailure for debug-only"),
 
-            # Force try in non-constant context
-            (r'''(?<!static\s+let\s+\w+\s*=\s*)try!\s+(?!NSRegularExpression|JSONDecoder|JSONEncoder)''',
+            # Force try - will filter safe patterns below
+            (r'''\btry!\s+\w''',
              "try! can crash at runtime - use do-catch", Severity.HIGH,
              "Replace try! with do-catch error handling"),
+        ]
+
+        # Safe try! patterns (compile-time constants, safe APIs)
+        safe_try_patterns = [
+            r'static\s+let\s+\w+\s*=\s*try!',  # Static constants
+            r'NSRegularExpression',
+            r'JSONDecoder',
+            r'JSONEncoder',
+            r'DateFormatter',
+            r'NumberFormatter',
         ]
 
         for pattern, issue, severity, fix in patterns:
@@ -2534,6 +2544,10 @@ class StructuredTools:
 
                 # Skip test files for fatalError
                 if 'fatalError' in line and ('/test' in filepath.lower() or 'test' in filepath.lower()):
+                    continue
+
+                # Skip safe try! patterns
+                if 'try!' in issue and any(re.search(safe, line) for safe in safe_try_patterns):
                     continue
 
                 result.findings.append(Finding(
