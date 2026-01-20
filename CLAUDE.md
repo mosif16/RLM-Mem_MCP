@@ -233,12 +233,23 @@ Analyze files or directories using custom search queries.
 **Parameters**:
 ```javascript
 {
-  "query": "string (required)",        // Specific analysis query
-  "paths": ["string"] (required),      // Files/directories to analyze
-  "scan_mode": "string",               // 'auto', 'security', 'ios', 'quality'
-  "min_confidence": "string",          // 'HIGH', 'MEDIUM', 'LOW'
-  "include_quality": "boolean"         // Include code quality checks
+  "query": "string (required)",              // Specific analysis query
+  "paths": ["string"] (required),            // Files/directories to analyze
+  "query_mode": "string",                    // 'auto', 'semantic', 'scanner', 'literal', 'custom' (v2.3)
+  "scan_mode": "string",                     // 'auto', 'security', 'ios', 'quality', 'all', 'custom'
+  "min_confidence": "string",                // 'HIGH', 'MEDIUM', 'LOW'
+  "include_quality": "boolean",              // Include code quality checks
+  "include_skipped_signatures": "boolean"    // Extract signatures from skipped files (v2.3)
 }
+```
+
+**Query Mode** (v2.3):
+```
+• 'auto' (default): Auto-detect best mode based on query complexity
+• 'semantic': LLM interprets query and writes custom search code (TRUE RLM)
+• 'scanner': Use pre-built scanners only (ios, security, quality)
+• 'literal': Fast grep-style literal search for quoted strings (no LLM)
+• 'custom': Query-driven semantic analysis WITHOUT pre-built scanners
 ```
 
 **Query Patterns**:
@@ -1049,6 +1060,94 @@ New tools for JavaScript/TypeScript codebases:
 
 ---
 
+## Recent Improvements (v2.3)
+
+### Query Mode System
+New `query_mode` parameter for explicit control over how queries are interpreted:
+
+**Available Modes:**
+- `auto` (default): Auto-detect best mode based on query complexity
+- `semantic`: LLM interprets query and writes custom search code (TRUE RLM from paper)
+- `scanner`: Use pre-built scanners only (ios, security, quality) - fastest for standard audits
+- `literal`: Fast grep-style literal search for quoted strings (no LLM) - ~40ms
+- `custom`: Query-driven semantic analysis WITHOUT pre-built scanners - for feature discovery
+
+**When to Use Each Mode:**
+```
+# Literal mode - fast search for specific strings
+query_mode: "literal"
+query: 'Find files containing "ForecastEngine" or "WeatherData"'
+
+# Semantic mode - complex feature discovery
+query_mode: "semantic"
+query: "Trace how user authentication flows through the app, from login to session management"
+
+# Scanner mode - standard security/quality audits
+query_mode: "scanner"
+scan_mode: "security"
+query: "Find security vulnerabilities"
+
+# Custom mode - semantic analysis without scanner interference
+query_mode: "custom"
+query: "Find all places where LongRangeForecastView interacts with ForecastEngine"
+```
+
+### Path Handling Improvements
+Better support for relative paths with helpful error messages:
+
+- **Relative paths**: `paths: ["mybill"]` now resolves to `./mybill`
+- **Suggestions**: `"Path not found: 'mybill' | Did you mean: ./MyBill, ./mybill-ios?"`
+- **Available directories**: Shows `ls` of cwd when path not found
+- **Resolved paths**: Logs actual resolved path for clarity
+
+### Large File Skipping Improvements
+New `include_skipped_signatures` parameter:
+
+```javascript
+{
+  "include_skipped_signatures": true  // Extract signatures from skipped files
+}
+```
+
+**Output Example:**
+```
+## Skipped Files (32 total)
+
+**exceeds token limit** (15 files)
+  - `ReportsHubView.swift` [EXISTS]
+    Signatures: class ReportsHubView, func loadReports(), func filterByDate()
+  - `DataManager.swift` [EXISTS]
+    Signatures: class DataManager, struct CacheEntry, func fetchData()
+```
+
+### Architecture Mapping Improvements
+Enhanced `map_architecture()` now returns detailed output:
+
+- **Full file paths** grouped by category (not just counts)
+- **Key classes/structs/functions** extracted from each file
+- **Module dependencies** showing most common imports
+- **Categorization**: entry_points, views_ui, models, services, utilities, tests, config
+
+**Example Output:**
+```
+## Architecture Mapping
+
+**entry_points** (3 files)
+  - src/main.py [Classes: Application] [Funcs: main, setup]
+  - src/cli.py [Classes: CLI] [Funcs: parse_args, run]
+
+**services** (12 files)
+  - src/services/auth.py [Classes: AuthService, TokenManager]
+  - src/services/data.py [Classes: DataService] [Funcs: fetch, cache]
+
+**dependencies** (Top 15 imports)
+  - asyncio: 45 files
+  - typing: 38 files
+  - dataclasses: 22 files
+```
+
+---
+
 ## License
 
 MIT License - see LICENSE for details.
@@ -1056,5 +1155,5 @@ MIT License - see LICENSE for details.
 ---
 
 **Last Updated**: January 2026
-**Version**: 2.2
+**Version**: 2.3
 **Status**: Production Ready

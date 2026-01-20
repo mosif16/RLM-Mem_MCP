@@ -290,6 +290,66 @@ class FileCollector:
     # Async API (new, high-performance)
     # -------------------------------------------------------------------------
 
+    def _resolve_path_with_suggestions(self, path_str: str) -> tuple[Path | None, str | None]:
+        """
+        Resolve a path with helpful suggestions if not found.
+
+        Tries:
+        1. Absolute path as given
+        2. Relative to current working directory
+        3. With ./ prefix
+
+        Returns:
+            (resolved_path, error_message) - path is None if not found
+        """
+        cwd = Path.cwd()
+
+        # Try 1: Direct resolution
+        path = Path(path_str)
+        if path.is_absolute():
+            if path.exists():
+                return path, None
+        else:
+            # Try 2: Relative to cwd
+            rel_path = cwd / path_str
+            if rel_path.exists():
+                return rel_path.resolve(), None
+
+            # Try 3: With explicit ./ prefix removed/added
+            if path_str.startswith('./'):
+                clean_path = cwd / path_str[2:]
+            else:
+                clean_path = cwd / path_str
+
+            if clean_path.exists():
+                return clean_path.resolve(), None
+
+        # Path not found - build helpful error message
+        suggestions = []
+
+        # Suggest similar directories in cwd
+        if not path_str.startswith('/'):
+            try:
+                available_dirs = [d.name for d in cwd.iterdir() if d.is_dir() and not d.name.startswith('.')]
+                # Find similar names using simple substring matching
+                similar = [d for d in available_dirs if path_str.lower() in d.lower() or d.lower() in path_str.lower()]
+                if similar:
+                    suggestions.append(f"Did you mean: {', '.join(f'./{s}' for s in similar[:3])}?")
+                elif available_dirs:
+                    suggestions.append(f"Available directories: {', '.join(sorted(available_dirs)[:10])}")
+            except Exception:
+                pass
+
+        # Suggest common fixes
+        if not path_str.startswith('./') and not path_str.startswith('/'):
+            suggestions.append(f"Try: './{path_str}' or use absolute path")
+
+        error_parts = [f"Path not found: '{path_str}'"]
+        if suggestions:
+            error_parts.extend(suggestions)
+
+        return None, " | ".join(error_parts)
+
     async def collect_paths_async(
         self,
         paths: list[str],
@@ -303,6 +363,7 @@ class FileCollector:
         - Symlink loop detection
         - Timeout protection for slow reads
         - Early termination on token limit
+        - Smart path resolution with helpful suggestions
 
         Args:
             paths: List of file or directory paths to collect
@@ -323,11 +384,16 @@ class FileCollector:
         all_file_paths: list[tuple[Path, Path]] = []  # (file_path, base_dir)
 
         for path_str in paths:
-            path = Path(path_str).resolve()
+            # Use smart path resolution with suggestions
+            path, error = self._resolve_path_with_suggestions(path_str)
 
-            if not path.exists():
-                result.errors.append(f"Path not found: {path_str}")
+            if path is None:
+                result.errors.append(error or f"Path not found: {path_str}")
                 continue
+
+            # Log resolved path for clarity
+            if str(path) != path_str:
+                print(f"[RLM] Resolved: '{path_str}' -> '{path}'", file=sys.stderr)
 
             if path.is_file():
                 all_file_paths.append((path, path.parent))

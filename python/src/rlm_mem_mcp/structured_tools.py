@@ -3066,18 +3066,21 @@ class StructuredTools:
 
     # ===== ARCHITECTURE TOOLS =====
 
-    def map_architecture(self) -> ToolResult:
+    def map_architecture(self, detailed: bool = True) -> ToolResult:
         """
-        Map the codebase architecture.
+        Map the codebase architecture with detailed output.
+
+        Args:
+            detailed: If True, extract key classes/functions from each file
 
         Returns:
-        - File categories
-        - Entry points
-        - Module structure
+        - File categories with full paths
+        - Key classes/structs/functions per file
+        - Module dependencies
         """
         result = ToolResult(tool_name="Architecture Mapper", files_scanned=len(self.files))
 
-        categories = {
+        categories: dict[str, list[dict]] = {
             "entry_points": [],
             "views_ui": [],
             "models": [],
@@ -3085,41 +3088,139 @@ class StructuredTools:
             "utilities": [],
             "tests": [],
             "config": [],
+            "other": [],
         }
+
+        # Track imports for dependency mapping
+        imports_by_file: dict[str, list[str]] = {}
 
         for filepath in self.files:
             lower = filepath.lower()
+            file_info: dict = {"path": filepath, "classes": [], "functions": [], "imports": []}
 
-            # Categorize
-            if any(x in lower for x in ['main.', 'index.', 'app.', '__main__', 'cli.']):
-                categories["entry_points"].append(filepath)
-            elif any(x in lower for x in ['view', 'controller', 'screen', 'component', 'page']):
-                categories["views_ui"].append(filepath)
-            elif any(x in lower for x in ['model', 'entity', 'schema', 'type']):
-                categories["models"].append(filepath)
-            elif any(x in lower for x in ['service', 'manager', 'provider', 'handler', 'api']):
-                categories["services"].append(filepath)
-            elif any(x in lower for x in ['util', 'helper', 'common', 'shared']):
-                categories["utilities"].append(filepath)
-            elif any(x in lower for x in ['test', 'spec', '_test', '.test']):
-                categories["tests"].append(filepath)
-            elif any(x in lower for x in ['config', 'setting', '.json', '.yaml', '.env']):
-                categories["config"].append(filepath)
+            # Extract key symbols if detailed mode
+            if detailed and filepath in self.file_contents:
+                content = self.file_contents[filepath]
+                ext = filepath.split('.')[-1].lower() if '.' in filepath else ''
 
-        # Create findings for each category
+                # Extract classes/structs
+                if ext == 'swift':
+                    for match in re.findall(r'(?:class|struct|enum|protocol|actor)\s+(\w+)', content):
+                        file_info["classes"].append(match)
+                    for match in re.findall(r'func\s+(\w+)\s*\(', content):
+                        file_info["functions"].append(match)
+                    # Swift imports
+                    for match in re.findall(r'import\s+(\w+)', content):
+                        file_info["imports"].append(match)
+                elif ext == 'py':
+                    for match in re.findall(r'^class\s+(\w+)', content, re.MULTILINE):
+                        file_info["classes"].append(match)
+                    for match in re.findall(r'^(?:async\s+)?def\s+(\w+)', content, re.MULTILINE):
+                        file_info["functions"].append(match)
+                    # Python imports
+                    for match in re.findall(r'^(?:from\s+(\S+)|import\s+(\S+))', content, re.MULTILINE):
+                        file_info["imports"].append(match[0] or match[1])
+                elif ext in ('js', 'ts', 'tsx', 'jsx'):
+                    for match in re.findall(r'(?:class|interface)\s+(\w+)', content):
+                        file_info["classes"].append(match)
+                    for match in re.findall(r'(?:function|const|let|var)\s+(\w+)\s*[=\(]', content):
+                        file_info["functions"].append(match)
+                    # JS/TS imports
+                    for match in re.findall(r"(?:import|require)\s*\(?['\"]([^'\"]+)['\"]", content):
+                        file_info["imports"].append(match)
+                elif ext == 'go':
+                    for match in re.findall(r'type\s+(\w+)\s+struct', content):
+                        file_info["classes"].append(match)
+                    for match in re.findall(r'func\s+(?:\([^)]+\)\s+)?(\w+)', content):
+                        file_info["functions"].append(match)
+
+                imports_by_file[filepath] = file_info["imports"]
+
+            # Categorize file
+            categorized = False
+            if any(x in lower for x in ['main.', 'index.', 'app.', '__main__', 'cli.', 'entrypoint']):
+                categories["entry_points"].append(file_info)
+                categorized = True
+            elif any(x in lower for x in ['view', 'controller', 'screen', 'component', 'page', 'widget']):
+                categories["views_ui"].append(file_info)
+                categorized = True
+            elif any(x in lower for x in ['model', 'entity', 'schema', 'types', 'dto']):
+                categories["models"].append(file_info)
+                categorized = True
+            elif any(x in lower for x in ['service', 'manager', 'provider', 'handler', 'api', 'client', 'repository']):
+                categories["services"].append(file_info)
+                categorized = True
+            elif any(x in lower for x in ['util', 'helper', 'common', 'shared', 'extension', 'utils']):
+                categories["utilities"].append(file_info)
+                categorized = True
+            elif any(x in lower for x in ['test', 'spec', '_test', '.test', 'mock', 'fixture']):
+                categories["tests"].append(file_info)
+                categorized = True
+            elif any(x in lower for x in ['config', 'setting', '.json', '.yaml', '.env', '.plist']):
+                categories["config"].append(file_info)
+                categorized = True
+
+            if not categorized:
+                categories["other"].append(file_info)
+
+        # Create detailed findings for each category
         for category, files in categories.items():
-            if files:
+            if not files:
+                continue
+
+            # Build detailed code block with file paths and symbols
+            code_lines = []
+            for f in files[:30]:  # Show up to 30 files per category
+                path_line = f["path"]
+                if f.get("classes"):
+                    path_line += f"  [Classes: {', '.join(f['classes'][:5])}]"
+                if f.get("functions") and len(f.get("classes", [])) < 3:
+                    funcs = [fn for fn in f['functions'][:5] if not fn.startswith('_')]
+                    if funcs:
+                        path_line += f"  [Funcs: {', '.join(funcs)}]"
+                code_lines.append(path_line)
+
+            if len(files) > 30:
+                code_lines.append(f"... and {len(files) - 30} more files")
+
+            result.findings.append(Finding(
+                file=category,
+                line=0,
+                code="\n".join(code_lines),
+                issue=f"{len(files)} files",
+                confidence=Confidence.HIGH,
+                severity=Severity.INFO,
+                category="architecture",
+                fix=f"Category: {category.replace('_', ' ').title()}"
+            ))
+
+        # Add dependency summary
+        if imports_by_file:
+            # Find most common imports
+            all_imports: dict[str, int] = {}
+            for imports in imports_by_file.values():
+                for imp in imports:
+                    all_imports[imp] = all_imports.get(imp, 0) + 1
+
+            top_imports = sorted(all_imports.items(), key=lambda x: -x[1])[:15]
+            if top_imports:
+                import_summary = "\n".join(f"{imp}: {count} files" for imp, count in top_imports)
                 result.findings.append(Finding(
-                    file=category,
+                    file="dependencies",
                     line=0,
-                    code="\n".join(files[:20]),
-                    issue=f"{len(files)} files",
+                    code=import_summary,
+                    issue=f"Top {len(top_imports)} imports/dependencies",
                     confidence=Confidence.HIGH,
                     severity=Severity.INFO,
                     category="architecture",
+                    fix="Most frequently imported modules"
                 ))
 
-        result.summary = f"Mapped {len(self.files)} files into {len([c for c in categories.values() if c])} categories"
+        total_categories = len([c for c in categories.values() if c])
+        total_classes = sum(len(f.get("classes", [])) for files in categories.values() for f in files)
+        total_functions = sum(len(f.get("functions", [])) for files in categories.values() for f in files)
+
+        result.summary = f"Mapped {len(self.files)} files into {total_categories} categories. Found {total_classes} classes, {total_functions} functions."
         return result
 
     def find_imports(self, module_name: str) -> ToolResult:

@@ -90,13 +90,89 @@ def validate_path(path: str) -> tuple[bool, str]:
     return True, ""
 
 
-def _format_skipped_files_summary(skipped_files: list[str], max_display: int = 10) -> str:
+def _extract_signatures_from_file(file_path: str) -> list[str]:
+    """
+    Extract function/class/struct signatures from a file without loading full content.
+
+    Uses regex to find declarations, reading only the first portion of the file.
+
+    Args:
+        file_path: Path to the file
+
+    Returns:
+        List of signature strings (e.g., "func fetchData()", "class UserManager")
+    """
+    signatures = []
+    try:
+        from pathlib import Path
+        path = Path(file_path)
+        if not path.exists():
+            return []
+
+        ext = path.suffix.lower()
+
+        # Read first 50KB to extract signatures (enough for most files' declarations)
+        with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+            content = f.read(50000)
+
+        # Swift patterns
+        if ext == '.swift':
+            # Classes, structs, enums, protocols
+            for match in re.findall(r'^\s*((?:public|private|internal|open|final)\s+)?(class|struct|enum|protocol|actor)\s+(\w+)', content, re.MULTILINE):
+                signatures.append(f"{match[1]} {match[2]}")
+            # Functions
+            for match in re.findall(r'^\s*((?:public|private|internal|open|override)\s+)?func\s+(\w+)\s*\([^)]*\)', content, re.MULTILINE):
+                signatures.append(f"func {match[1]}()")
+
+        # Python patterns
+        elif ext == '.py':
+            for match in re.findall(r'^(class|def|async def)\s+(\w+)', content, re.MULTILINE):
+                signatures.append(f"{match[0]} {match[1]}")
+
+        # JavaScript/TypeScript patterns
+        elif ext in ('.js', '.ts', '.tsx', '.jsx'):
+            # Classes
+            for match in re.findall(r'^(?:export\s+)?class\s+(\w+)', content, re.MULTILINE):
+                signatures.append(f"class {match}")
+            # Functions
+            for match in re.findall(r'^(?:export\s+)?(?:async\s+)?function\s+(\w+)', content, re.MULTILINE):
+                signatures.append(f"function {match}()")
+            # Arrow functions assigned to const
+            for match in re.findall(r'^(?:export\s+)?const\s+(\w+)\s*=\s*(?:async\s*)?\([^)]*\)\s*=>', content, re.MULTILINE):
+                signatures.append(f"const {match} = () =>")
+
+        # Go patterns
+        elif ext == '.go':
+            for match in re.findall(r'^func\s+(?:\([^)]+\)\s+)?(\w+)', content, re.MULTILINE):
+                signatures.append(f"func {match}()")
+            for match in re.findall(r'^type\s+(\w+)\s+(struct|interface)', content, re.MULTILINE):
+                signatures.append(f"type {match[0]} {match[1]}")
+
+        # Rust patterns
+        elif ext == '.rs':
+            for match in re.findall(r'^(?:pub\s+)?(?:async\s+)?fn\s+(\w+)', content, re.MULTILINE):
+                signatures.append(f"fn {match}()")
+            for match in re.findall(r'^(?:pub\s+)?(?:struct|enum|trait)\s+(\w+)', content, re.MULTILINE):
+                signatures.append(f"struct/enum {match}")
+
+    except Exception:
+        pass
+
+    return signatures[:20]  # Limit to 20 signatures
+
+
+def _format_skipped_files_summary(
+    skipped_files: list[str],
+    max_display: int = 10,
+    include_signatures: bool = False
+) -> str:
     """
     Format a summary of skipped files for user visibility.
 
     Args:
         skipped_files: List of skipped file paths with reasons
         max_display: Maximum number of skipped files to show
+        include_signatures: Whether to extract and show function/class signatures
 
     Returns:
         Formatted markdown string with skipped files summary
@@ -124,12 +200,26 @@ def _format_skipped_files_summary(skipped_files: list[str], max_display: int = 1
     for reason, paths in sorted(by_reason.items(), key=lambda x: -len(x[1])):
         count = len(paths)
         lines.append(f"\n**{reason}** ({count} files)")
+
         for path in paths[:max_display]:
-            lines.append(f"  - {path}")
+            # Show file EXISTS confirmation
+            from pathlib import Path
+            file_exists = Path(path).exists() if not path.startswith("(") else False
+            existence = "EXISTS" if file_exists else "NOT FOUND"
+            lines.append(f"  - `{path}` [{existence}]")
+
+            # Extract signatures if requested
+            if include_signatures and file_exists:
+                signatures = _extract_signatures_from_file(path)
+                if signatures:
+                    lines.append(f"    Signatures: {', '.join(signatures[:5])}")
+                    if len(signatures) > 5:
+                        lines.append(f"    ... and {len(signatures) - 5} more")
+
         if count > max_display:
             lines.append(f"  - ... and {count - max_display} more")
 
-    lines.append("\n*Tip: Modify config.skipped_directories or config.included_extensions to change what gets collected.*")
+    lines.append("\n*Tip: Use `include_skipped_signatures: true` to see function/class names in skipped files.*")
 
     return "\n".join(lines)
 
@@ -231,17 +321,30 @@ def create_server() -> Server:
                             "items": {"type": "string"},
                             "description": "File or directory paths to analyze. Use ['.'] for current directory.",
                         },
+                        "query_mode": {
+                            "type": "string",
+                            "enum": ["auto", "semantic", "scanner", "literal", "custom"],
+                            "description": (
+                                "How to interpret and execute the query. Options:\n"
+                                "• 'auto' (default): Auto-detect best mode based on query complexity\n"
+                                "• 'semantic': LLM interprets query and writes custom search code (TRUE RLM)\n"
+                                "• 'scanner': Use pre-built scanners only (ios, security, quality)\n"
+                                "• 'literal': Fast grep-style literal search for quoted strings (no LLM)\n"
+                                "• 'custom': Query-driven semantic analysis WITHOUT pre-built scanners"
+                            ),
+                        },
                         "scan_mode": {
                             "type": "string",
-                            "enum": ["auto", "ios", "ios-strict", "security", "quality", "all"],
+                            "enum": ["auto", "ios", "ios-strict", "security", "quality", "all", "custom"],
                             "description": (
-                                "Pre-configured scan mode. Options:\n"
+                                "Pre-configured scan mode (used when query_mode='scanner' or 'auto'). Options:\n"
                                 "• 'auto' (default): Auto-detect based on query and file types\n"
                                 "• 'ios': Run iOS/Swift scanners (security + crash issues)\n"
                                 "• 'ios-strict': iOS scan with HIGH confidence only (minimal noise)\n"
                                 "• 'security': Run security scanners (secrets, injection, XSS)\n"
                                 "• 'quality': Run code quality scanners (long functions, TODOs)\n"
-                                "• 'all': Run all scanners including quality checks"
+                                "• 'all': Run all scanners including quality checks\n"
+                                "• 'custom': Skip all pre-built scanners, use query-driven analysis only"
                             ),
                         },
                         "min_confidence": {
@@ -259,6 +362,14 @@ def create_server() -> Server:
                             "description": (
                                 "Include code quality checks (long functions, TODOs). "
                                 "Default: false. Quality checks are excluded by default to focus on bugs/security."
+                            ),
+                        },
+                        "include_skipped_signatures": {
+                            "type": "boolean",
+                            "description": (
+                                "Extract function/class signatures from files that were skipped due to size limits. "
+                                "This provides visibility into large files without loading full content. "
+                                "Default: false."
                             ),
                         },
                     },
@@ -990,9 +1101,11 @@ async def handle_rlm_analyze(arguments: dict[str, Any]) -> list[TextContent]:
 
     query = arguments.get("query", "")
     paths = arguments.get("paths", [])
-    scan_mode = arguments.get("scan_mode", "auto")  # auto, ios, ios-strict, security, quality, all
+    query_mode = arguments.get("query_mode", "auto")  # auto, semantic, scanner, literal, custom
+    scan_mode = arguments.get("scan_mode", "auto")  # auto, ios, ios-strict, security, quality, all, custom
     min_confidence = arguments.get("min_confidence", "MEDIUM")  # LOW, MEDIUM, HIGH (default MEDIUM to reduce noise)
     include_quality = arguments.get("include_quality", False)  # Include code style checks
+    include_skipped_signatures = arguments.get("include_skipped_signatures", False)  # Extract signatures from skipped files
 
     # Input validation
     if not query:
@@ -1043,7 +1156,7 @@ async def handle_rlm_analyze(arguments: dict[str, Any]) -> list[TextContent]:
 
         # Show skipped files to help user understand why
         if collection.skipped_files:
-            error_msg += _format_skipped_files_summary(collection.skipped_files, max_display=20)
+            error_msg += _format_skipped_files_summary(collection.skipped_files, max_display=20, include_signatures=include_skipped_signatures)
         else:
             error_msg += "No files matched the configured extensions.\n\n"
             error_msg += "**Included extensions:** " + ", ".join(sorted(rlm_config.included_extensions)[:20]) + "...\n"
@@ -1068,10 +1181,100 @@ async def handle_rlm_analyze(arguments: dict[str, Any]) -> list[TextContent]:
     query_analysis = rlm_processor.analyze_query_quality(query)
     _log_timing("query_analysis", start_time, is_broad=query_analysis["is_broad"], query_type=query_analysis["query_type"])
 
-    # L3: Auto-select scan_mode based on detected query type when mode is "auto"
+    # Get combined content early for fast-path checks
+    content = collection.get_combined_content(include_headers=True)
+
+    # ===== QUERY MODE ROUTING =====
+    # query_mode controls HOW the query is interpreted:
+    # - "literal": Fast grep-style search (no LLM)
+    # - "scanner": Pre-built scanners only (no semantic analysis)
+    # - "semantic": LLM interprets query and writes custom search code (TRUE RLM)
+    # - "custom": Semantic analysis WITHOUT pre-built scanners
+    # - "auto": Detect best mode based on query
+
+    # Determine effective query_mode
+    effective_query_mode = query_mode
+    if query_mode == "auto":
+        # Auto-detect based on query characteristics
+        is_literal, search_terms = _is_literal_search_query(query)
+        if is_literal and search_terms:
+            effective_query_mode = "literal"
+            print(f"[RLM] Auto-selected query_mode='literal' for quoted strings: {search_terms}", file=sys.stderr)
+        elif query_analysis["is_broad"] or len(query.split()) <= 5:
+            # Broad or very short queries -> use scanners
+            effective_query_mode = "scanner"
+            print(f"[RLM] Auto-selected query_mode='scanner' for broad query", file=sys.stderr)
+        elif len(query.split()) > 15 or "(" in query or query.count(",") >= 2:
+            # Complex/specific queries -> use semantic
+            effective_query_mode = "semantic"
+            print(f"[RLM] Auto-selected query_mode='semantic' for complex query", file=sys.stderr)
+        else:
+            # Default: try scanners first, then semantic
+            effective_query_mode = "scanner"
+
+    print(f"[RLM] Using query_mode='{effective_query_mode}', scan_mode='{scan_mode}'", file=sys.stderr)
+
+    # ===== MODE: LITERAL =====
+    # Fast grep-style search without LLM
+    if effective_query_mode == "literal":
+        _log_timing("literal_mode", start_time)
+        is_literal, search_terms = _is_literal_search_query(query)
+        if not search_terms:
+            # Extract any words as search terms
+            search_terms = [w for w in query.split() if len(w) > 3][:5]
+
+        if search_terms:
+            literal_result = _perform_literal_search(content, search_terms)
+            processing_time = int((time.time() - start_time) * 1000)
+            literal_result += f"\n*Scanned {collection.file_count} files in {processing_time}ms (literal mode)*"
+
+            if collection.skipped_files:
+                literal_result += _format_skipped_files_summary(collection.skipped_files, include_signatures=include_skipped_signatures)
+
+            return [TextContent(type="text", text=literal_result)]
+
+    # ===== MODE: SEMANTIC or CUSTOM =====
+    # LLM interprets query and writes custom search code (TRUE RLM)
+    # "custom" mode skips pre-built scanners entirely
+    if effective_query_mode in ("semantic", "custom"):
+        _log_timing(f"{effective_query_mode}_mode", start_time)
+
+        # L4: Progress before RLM processing
+        await _write_progress(session_id, "analyzing", f"Running {effective_query_mode} analysis...", 50, {"query_mode": effective_query_mode})
+
+        def progress_log(msg: str) -> None:
+            print(f"[RLM Progress] {msg}", file=sys.stderr)
+
+        # Process with RLM (TRUE RLM: content as variable, LLM writes code)
+        result = await rlm_processor.process_with_decomposition(query, collection, progress_callback=progress_log)
+        _log_timing("rlm_process:complete", start_time, chunks=len(result.chunk_results))
+
+        # Format and verify output
+        output = rlm_processor.format_result(result)
+        verified_output, verification_stats = result_verifier.verify_findings(output, collection)
+
+        # Cache the result
+        semantic_cache.set(query, context_summary, verified_output)
+
+        # Add project context if relevant
+        if project_info.key_files:
+            verified_output += f"\n\n## Project Context\n- Type: {project_info.project_type}\n- Key files: {', '.join(project_info.key_files[:10])}"
+
+        verified_output += f"\n\n*Scanned {collection.file_count} files in {int((time.time() - start_time) * 1000)}ms ({effective_query_mode} mode)*"
+
+        if collection.skipped_files:
+            verified_output += _format_skipped_files_summary(collection.skipped_files, include_signatures=include_skipped_signatures)
+
+        await _write_progress(session_id, "complete", "Analysis complete", 100, {"query_mode": effective_query_mode})
+        return [TextContent(type="text", text=verified_output)]
+
+    # ===== MODE: SCANNER =====
+    # Use pre-built scanners (current default behavior)
+    # Also handles scan_mode="custom" which skips to semantic
+
+    # L3: Auto-select scan_mode based on detected query type when scan_mode is "auto"
     detected_type = query_analysis["query_type"]
     if scan_mode == "auto" and detected_type != "general":
-        # Map query types to scan modes
         type_to_scan_mode = {
             "ios": "ios",
             "security": "security",
@@ -1081,34 +1284,19 @@ async def handle_rlm_analyze(arguments: dict[str, Any]) -> list[TextContent]:
             scan_mode = type_to_scan_mode[detected_type]
             print(f"[RLM] Auto-selected scan_mode='{scan_mode}' based on query type '{detected_type}'", file=sys.stderr)
 
-    # Get combined content early for fast-path checks
-    content = collection.get_combined_content(include_headers=True)
+    # Handle scan_mode="custom" - skip to semantic analysis
+    if scan_mode == "custom":
+        print(f"[RLM] scan_mode='custom' - skipping pre-built scanners, using semantic analysis", file=sys.stderr)
+        # Recursive call with semantic mode
+        arguments_copy = dict(arguments)
+        arguments_copy["query_mode"] = "semantic"
+        arguments_copy["scan_mode"] = "auto"
+        return await handle_rlm_analyze(arguments_copy)
 
-    # ===== FAST-PATH: LITERAL SEARCH =====
-    # Check if this is a literal string search (grep-like query with quoted strings)
-    # If so, bypass all LLM routing and perform direct search
-    is_literal, search_terms = _is_literal_search_query(query)
-    if is_literal and search_terms:
-        _log_timing("literal_search:detected", start_time, terms=search_terms)
-        print(f"[RLM] Literal search detected: {search_terms}", file=sys.stderr)
+    # Run pre-built scanners based on scan_mode
+    structured_results: list[ToolResult] = []
+    tools_to_run: list[str] = []
 
-        # Perform fast grep-like search
-        literal_result = _perform_literal_search(content, search_terms)
-        processing_time = int((time.time() - start_time) * 1000)
-
-        literal_result += f"\n*Scanned {collection.file_count} files in {processing_time}ms (literal search fast-path)*"
-
-        # Add skipped files info if any
-        if collection.skipped_files:
-            literal_result += _format_skipped_files_summary(collection.skipped_files)
-
-        return [TextContent(type="text", text=literal_result)]
-
-    # ===== DOUBLE-LAYER AUTO-ROUTING =====
-    # Layer 1: LLM decides which tools to run (intelligent routing)
-    # Layer 2: Structured tools execute deterministically (reliable execution)
-
-    # Handle explicit scan_mode
     if scan_mode != "auto":
         _log_timing("explicit_scan_mode", start_time, mode=scan_mode)
         tools = StructuredTools(content)
@@ -1120,7 +1308,6 @@ async def handle_rlm_analyze(arguments: dict[str, Any]) -> list[TextContent]:
             )
             tools_to_run = ["ios_scan"]
         elif scan_mode == "ios-strict":
-            # iOS-strict: only security/crash issues, no quality, HIGH confidence
             structured_results = tools.run_ios_scan(
                 min_confidence="HIGH",
                 include_quality=False
@@ -1141,9 +1328,6 @@ async def handle_rlm_analyze(arguments: dict[str, Any]) -> list[TextContent]:
                 tools.run_security_scan(min_confidence=min_confidence, include_quality=False)
             )
             tools_to_run = ["ios_scan", "security_scan", "quality_scan"]
-        else:
-            structured_results = []
-            tools_to_run = []
 
         structured_output, _ = _format_tool_results(structured_results, tools_to_run)
     else:
@@ -1153,13 +1337,11 @@ async def handle_rlm_analyze(arguments: dict[str, Any]) -> list[TextContent]:
         tool_params = routing_decision.get("params", {})
 
         if tools_to_run:
-            # LLM routing succeeded - execute selected tools
             _log_timing("llm_routing", start_time, tools=tools_to_run)
             structured_output, structured_results = _execute_routed_tools(
                 tools_to_run, tool_params, content, min_confidence
             )
         else:
-            # Fall back to keyword-based routing
             _log_timing("keyword_routing", start_time, query_type=query_analysis["query_type"])
             structured_output, structured_results = _run_structured_tools_for_query_type(
                 query_analysis["query_type"],
@@ -1169,28 +1351,25 @@ async def handle_rlm_analyze(arguments: dict[str, Any]) -> list[TextContent]:
             )
 
     _log_timing("structured_tools", start_time,
-                tools_run=len(structured_results),
-                findings=sum(r.count for r in structured_results))
+                tools_run=len(structured_results) if structured_results else 0,
+                findings=sum(r.count for r in structured_results) if structured_results else 0)
 
     # If structured tools found significant results, return them directly
-    # without additional LLM processing (faster, more reliable)
-    total_findings = sum(r.count for r in structured_results)
-    high_conf_findings = sum(len(r.high_confidence) for r in structured_results)
+    total_findings = sum(r.count for r in structured_results) if structured_results else 0
+    high_conf_findings = sum(len(r.high_confidence) for r in structured_results) if structured_results else 0
 
     if total_findings > 0:
-        # Add file scan stats
-        structured_output += f"\n\n*Scanned {collection.file_count} files in {int((time.time() - start_time) * 1000)}ms*"
+        structured_output += f"\n\n*Scanned {collection.file_count} files in {int((time.time() - start_time) * 1000)}ms (scanner mode)*"
 
-        # Add skipped files info if any
         if collection.skipped_files:
-            structured_output += _format_skipped_files_summary(collection.skipped_files)
+            structured_output += _format_skipped_files_summary(collection.skipped_files, include_signatures=include_skipped_signatures)
 
-        # For comprehensive results, skip LLM processing entirely
+        # For comprehensive results, skip additional LLM processing
         if high_conf_findings >= 3 or total_findings >= 10:
             return [TextContent(type="text", text=structured_output)]
 
-    # L4: Progress before RLM processing
-    await _write_progress(session_id, "analyzing", "Running RLM analysis...", 50, {"scan_mode": scan_mode})
+    # L4: Progress before additional RLM processing
+    await _write_progress(session_id, "analyzing", "Running additional RLM analysis...", 50, {"scan_mode": scan_mode})
 
     # Progress callback that logs to stderr and memory store
     async def progress_log_async(msg: str) -> None:
