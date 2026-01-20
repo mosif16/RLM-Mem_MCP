@@ -335,7 +335,7 @@ def create_server() -> Server:
                         },
                         "scan_mode": {
                             "type": "string",
-                            "enum": ["auto", "ios", "ios-strict", "security", "quality", "all", "custom"],
+                            "enum": ["auto", "ios", "ios-strict", "security", "quality", "web", "rust", "node", "frontend", "backend", "all", "custom"],
                             "description": (
                                 "Pre-configured scan mode (used when query_mode='scanner' or 'auto'). Options:\n"
                                 "• 'auto' (default): Auto-detect based on query and file types\n"
@@ -343,6 +343,11 @@ def create_server() -> Server:
                                 "• 'ios-strict': iOS scan with HIGH confidence only (minimal noise)\n"
                                 "• 'security': Run security scanners (secrets, injection, XSS)\n"
                                 "• 'quality': Run code quality scanners (long functions, TODOs)\n"
+                                "• 'web': Run web/frontend scanners (React, Vue, Angular, DOM, a11y, CSS)\n"
+                                "• 'rust': Run Rust scanners (unsafe, unwrap, concurrency, clippy)\n"
+                                "• 'node': Run Node.js scanners (callbacks, promises, security, async)\n"
+                                "• 'frontend': Combined web + node scanners\n"
+                                "• 'backend': Combined node + security scanners\n"
                                 "• 'all': Run all scanners including quality checks\n"
                                 "• 'custom': Skip all pre-built scanners, use query-driven analysis only"
                             ),
@@ -1279,6 +1284,15 @@ async def handle_rlm_analyze(arguments: dict[str, Any]) -> list[TextContent]:
             "ios": "ios",
             "security": "security",
             "quality": "quality",
+            "web": "web",
+            "react": "web",
+            "vue": "web",
+            "angular": "web",
+            "frontend": "frontend",
+            "rust": "rust",
+            "node": "node",
+            "nodejs": "node",
+            "backend": "backend",
         }
         if detected_type in type_to_scan_mode:
             scan_mode = type_to_scan_mode[detected_type]
@@ -1322,12 +1336,30 @@ async def handle_rlm_analyze(arguments: dict[str, Any]) -> list[TextContent]:
         elif scan_mode == "quality":
             structured_results = tools.run_quality_scan(min_confidence=min_confidence)
             tools_to_run = ["quality_scan"]
+        elif scan_mode == "web":
+            structured_results = tools.run_web_scan(min_confidence=min_confidence)
+            tools_to_run = ["web_scan"]
+        elif scan_mode == "rust":
+            structured_results = tools.run_rust_scan(min_confidence=min_confidence)
+            tools_to_run = ["rust_scan"]
+        elif scan_mode == "node":
+            structured_results = tools.run_node_scan(min_confidence=min_confidence)
+            tools_to_run = ["node_scan"]
+        elif scan_mode == "frontend":
+            structured_results = tools.run_frontend_scan(min_confidence=min_confidence)
+            tools_to_run = ["frontend_scan"]
+        elif scan_mode == "backend":
+            structured_results = tools.run_backend_scan(min_confidence=min_confidence)
+            tools_to_run = ["backend_scan"]
         elif scan_mode == "all":
             structured_results = (
                 tools.run_ios_scan(min_confidence=min_confidence, include_quality=True) +
-                tools.run_security_scan(min_confidence=min_confidence, include_quality=False)
+                tools.run_security_scan(min_confidence=min_confidence, include_quality=False) +
+                tools.run_web_scan(min_confidence=min_confidence) +
+                tools.run_rust_scan(min_confidence=min_confidence) +
+                tools.run_node_scan(min_confidence=min_confidence)
             )
-            tools_to_run = ["ios_scan", "security_scan", "quality_scan"]
+            tools_to_run = ["ios_scan", "security_scan", "quality_scan", "web_scan", "rust_scan", "node_scan"]
 
         structured_output, _ = _format_tool_results(structured_results, tools_to_run)
     else:

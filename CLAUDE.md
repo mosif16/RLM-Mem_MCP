@@ -980,11 +980,14 @@ Token bucket algorithm:
 | **Swift Memory/Error** | `find_memory_management_issues()`, `find_error_handling_issues()` |
 | **SwiftUI** | `find_swiftui_performance_issues()`, `find_stateobject_issues()` |
 | **iOS Quality** | `find_accessibility_issues()`, `find_localization_issues()`, `find_deprecated_apis()` |
+| **Web/React** | `find_react_issues()`, `find_vue_issues()`, `find_angular_issues()`, `find_dom_security()`, `find_a11y_issues()`, `find_css_issues()` |
+| **Rust** | `find_unsafe_blocks()`, `find_unwrap_usage()`, `find_rust_concurrency_issues()`, `find_rust_error_handling()`, `find_rust_clippy_patterns()` |
+| **Node.js** | `find_callback_hell()`, `find_promise_issues()`, `find_node_security()`, `find_require_issues()`, `find_node_async_issues()` |
 | **Quality** | `find_long_functions()`, `find_complex_functions()`, `find_code_smells()`, `find_dead_code()`, `find_todos()` |
 | **TypeScript** | `analyze_typescript_imports()`, `trace_websocket_flow()`, `build_call_graph()` |
 | **Persistence** | `find_persistence_patterns()`, `find_state_mutations()` |
 | **Architecture** | `map_architecture()`, `find_imports()` |
-| **Batch Scans** | `run_security_scan()`, `run_quality_scan()`, `run_ios_scan()`, `run_persistence_scan()` |
+| **Batch Scans** | `run_security_scan()`, `run_quality_scan()`, `run_ios_scan()`, `run_web_scan()`, `run_rust_scan()`, `run_node_scan()`, `run_frontend_scan()`, `run_backend_scan()` |
 
 ### Best Practices
 1. Be specific in your queries - avoid vague searches
@@ -1148,6 +1151,85 @@ Enhanced `map_architecture()` now returns detailed output:
 
 ---
 
+## Recent Improvements (v2.4)
+
+### Full Web/Frontend Support
+Comprehensive support for React, Vue, Angular, and modern web development:
+
+**New Web Analysis Tools:**
+- `find_react_issues()` - Missing keys, useEffect deps, stale closures, state mutation
+- `find_vue_issues()` - v-for without :key, prop mutation, watcher cleanup
+- `find_angular_issues()` - Subscription leaks, change detection, template issues
+- `find_dom_security()` - eval, document.write, innerHTML XSS, postMessage
+- `find_a11y_issues()` - Missing alt, ARIA labels, keyboard accessibility
+- `find_css_issues()` - !important overuse, z-index wars, hardcoded colors
+
+**File Extensions Added:**
+- HTML: `.html`, `.htm`, `.xhtml`
+- CSS: `.css`, `.scss`, `.sass`, `.less`, `.styl`, `.stylus`
+- Templates: `.ejs`, `.hbs`, `.pug`, `.mustache`, `.njk`, `.liquid`, `.jinja2`
+- Frameworks: `.vue`, `.svelte`, `.astro`
+- WebAssembly: `.wasm`, `.wat`
+
+**Skip Directories Added:**
+- `.next`, `.nuxt`, `.output`, `.svelte-kit`, `.angular`
+- `.parcel-cache`, `.turbo`, `.vercel`, `.netlify`
+- `storybook-static`, `.docusaurus`, `.astro`
+
+### Full Rust Support
+Comprehensive Rust analysis with safety-focused tools:
+
+**New Rust Analysis Tools:**
+- `find_unsafe_blocks()` - unsafe blocks/functions, raw pointers, FFI
+- `find_unwrap_usage()` - .unwrap(), .expect(), panic!, unreachable!
+- `find_rust_concurrency_issues()` - Arc without Mutex, data races, deadlocks
+- `find_rust_error_handling()` - Result handling, error types, propagation
+- `find_rust_clippy_patterns()` - Manual detection of common clippy lints
+
+**File Extensions Added:**
+- `.rs` (Rust source)
+- Cargo.toml, Cargo.lock handled
+
+**Skip Directories Added:**
+- `target/`, `.cargo/`
+
+### Full Node.js Support
+Comprehensive Node.js and JavaScript backend analysis:
+
+**New Node.js Analysis Tools:**
+- `find_callback_hell()` - Deeply nested callbacks (4+ levels)
+- `find_promise_issues()` - Unhandled rejections, Promise anti-patterns
+- `find_node_security()` - Command injection, path traversal, eval
+- `find_require_issues()` - Dynamic requires, circular deps, deprecated modules
+- `find_node_async_issues()` - Missing await, event listener leaks
+
+**File Extensions Added:**
+- `.mjs`, `.cjs` (ES modules, CommonJS)
+- `.nvmrc`, `.npmrc`, `.yarnrc`
+
+**Skip Directories Added:**
+- `.npm`, `.yarn`, `.pnpm-store`, `.nx`, `.rush`
+
+### New Scan Modes
+New batch scan modes for ecosystem-specific analysis:
+
+| Mode | Description |
+|------|-------------|
+| `scan_mode="web"` | React + Vue + Angular + DOM + a11y + CSS |
+| `scan_mode="rust"` | unsafe + unwrap + concurrency + errors + clippy |
+| `scan_mode="node"` | callbacks + promises + security + require + async |
+| `scan_mode="frontend"` | web + node combined |
+| `scan_mode="backend"` | node + security combined |
+
+### RLM-First Tool Guidance
+New hook system for optimal tool selection:
+
+- `pretool-rlm-guidance.js` - Suggests RLM for broad searches
+- Auto-detects when Grep/Glob should use rlm_analyze instead
+- Reduces context consumption on large codebases
+
+---
+
 ## License
 
 MIT License - see LICENSE for details.
@@ -1155,5 +1237,5 @@ MIT License - see LICENSE for details.
 ---
 
 **Last Updated**: January 2026
-**Version**: 2.3
+**Version**: 2.4
 **Status**: Production Ready

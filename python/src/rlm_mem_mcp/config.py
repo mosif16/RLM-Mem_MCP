@@ -26,11 +26,54 @@ DEFAULT_MODEL = "anthropic/claude-haiku-4.5"
 
 # Default file extensions to include
 DEFAULT_EXTENSIONS = {
-    # Code files
-    ".py", ".js", ".ts", ".jsx", ".tsx", ".go", ".rs", ".java",
-    ".c", ".cpp", ".h", ".hpp", ".rb", ".php", ".swift", ".kt",
-    ".scala", ".cs", ".m", ".mm", ".vue", ".svelte",
-    # iOS/Swift specific
+    # =========================================================================
+    # CORE LANGUAGES
+    # =========================================================================
+    # Python
+    ".py", ".pyi", ".pyx", ".pxd",
+    # JavaScript/TypeScript (Full Web Support)
+    ".js", ".mjs", ".cjs", ".jsx",
+    ".ts", ".mts", ".cts", ".tsx", ".d.ts",
+    # Go
+    ".go",
+    # Rust (Full Support)
+    ".rs",
+    # Java/Kotlin/Scala
+    ".java", ".kt", ".kts", ".scala",
+    # C/C++/Objective-C
+    ".c", ".cpp", ".cc", ".cxx", ".h", ".hpp", ".hxx",
+    ".m", ".mm",
+    # Ruby
+    ".rb", ".erb", ".rake",
+    # PHP
+    ".php", ".phtml",
+    # Swift (Full iOS Support)
+    ".swift",
+    # C#
+    ".cs", ".csx",
+
+    # =========================================================================
+    # WEB/FRONTEND (Full Support)
+    # =========================================================================
+    # HTML
+    ".html", ".htm", ".xhtml",
+    # CSS & Preprocessors
+    ".css", ".scss", ".sass", ".less", ".styl", ".stylus",
+    # Vue
+    ".vue",
+    # Svelte
+    ".svelte",
+    # Astro
+    ".astro",
+    # Template Engines
+    ".ejs", ".hbs", ".handlebars", ".pug", ".jade",
+    ".mustache", ".njk", ".nunjucks", ".liquid", ".jinja", ".jinja2",
+    # WebAssembly
+    ".wasm", ".wat",
+
+    # =========================================================================
+    # iOS/SWIFT SPECIFIC
+    # =========================================================================
     ".xcstrings",       # Xcode localization (new format)
     ".strings",         # Localization strings
     ".stringsdict",     # Pluralization rules
@@ -41,26 +84,158 @@ DEFAULT_EXTENSIONS = {
     ".intentdefinition", # Siri Intent definitions
     ".xib",             # Interface Builder (legacy)
     ".storyboard",      # Storyboard UI files
-    # Config files
-    ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".env",
-    # Documentation
-    ".md", ".txt", ".rst", ".adoc",
-    # Other
-    ".sql", ".graphql", ".proto", ".sh", ".bash", ".zsh",
-    ".dockerfile", ".makefile", ".cmake",
-    # Additional common types
-    ".xml", ".html", ".css", ".scss", ".less", ".plist",
+
+    # =========================================================================
+    # RUST SPECIFIC
+    # =========================================================================
+    # Note: Cargo.toml and Cargo.lock handled via filename matching
+
+    # =========================================================================
+    # NODE.JS SPECIFIC
+    # =========================================================================
+    ".nvmrc",           # Node version
+    ".npmrc",           # npm config
+    ".yarnrc",          # Yarn config
+
+    # =========================================================================
+    # CONFIG FILES
+    # =========================================================================
+    ".json", ".jsonc", ".json5",
+    ".yaml", ".yml",
+    ".toml",
+    ".ini", ".cfg", ".conf",
+    ".env", ".env.local", ".env.development", ".env.production",
+    ".editorconfig",
+    ".prettierrc", ".eslintrc", ".stylelintrc",
+
+    # =========================================================================
+    # DOCUMENTATION
+    # =========================================================================
+    ".md", ".mdx", ".markdown",
+    ".txt",
+    ".rst", ".adoc", ".asciidoc",
+
+    # =========================================================================
+    # DATA & QUERY
+    # =========================================================================
+    ".sql",
+    ".graphql", ".gql",
+    ".proto",
+    ".xml", ".xsl", ".xslt",
+    ".plist",
+
+    # =========================================================================
+    # SHELL & SCRIPTS
+    # =========================================================================
+    ".sh", ".bash", ".zsh", ".fish",
+    ".ps1", ".psm1",  # PowerShell
+    ".bat", ".cmd",   # Windows batch
+
+    # =========================================================================
+    # BUILD & INFRASTRUCTURE
+    # =========================================================================
+    ".dockerfile", ".containerfile",
+    ".makefile", ".mk",
+    ".cmake",
+    ".gradle", ".gradle.kts",
+    ".tf", ".tfvars",  # Terraform
 }
 
 # Default directories to skip
 DEFAULT_SKIP_DIRS = {
-    # General
-    ".git", "node_modules", "__pycache__", "venv", ".venv",
-    "dist", "build", ".next", "target", "vendor", ".cache",
-    ".idea", ".vscode", "coverage", ".nyc_output", "eggs",
-    "*.egg-info", ".tox", ".pytest_cache", ".mypy_cache",
-    ".ruff_cache", "htmlcov", ".hypothesis",
-    # iOS/Xcode specific
+    # =========================================================================
+    # GENERAL / VERSION CONTROL
+    # =========================================================================
+    ".git",
+    ".svn",
+    ".hg",
+
+    # =========================================================================
+    # PYTHON
+    # =========================================================================
+    "__pycache__",
+    "venv", ".venv", "env", ".env",
+    "*.egg-info", "eggs",
+    ".tox",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    "htmlcov",
+    ".hypothesis",
+    ".nox",
+    ".pytype",
+
+    # =========================================================================
+    # NODE.JS / JAVASCRIPT (Full Support)
+    # =========================================================================
+    "node_modules",
+    ".npm",
+    ".yarn",
+    ".pnpm-store",
+    ".turbo",
+    ".nx",
+    ".rush",
+
+    # =========================================================================
+    # WEB FRAMEWORKS (Full Support)
+    # =========================================================================
+    # Next.js
+    ".next",
+    "out",  # Next.js static export
+    # Nuxt.js
+    ".nuxt",
+    ".output",
+    # SvelteKit
+    ".svelte-kit",
+    # Angular
+    ".angular",
+    # Parcel
+    ".parcel-cache",
+    # Vercel/Netlify
+    ".vercel",
+    ".netlify",
+    # Docusaurus
+    ".docusaurus",
+    # Astro
+    ".astro",
+    # Storybook
+    "storybook-static",
+    # Gatsby
+    ".cache",
+    "public",  # Often contains generated assets
+
+    # =========================================================================
+    # BUILD OUTPUTS
+    # =========================================================================
+    "dist",
+    "build",
+    "out",
+    "_build",
+    "target",  # Rust, Java
+    "vendor",
+    "lib",  # Compiled libraries (be careful - sometimes source)
+
+    # =========================================================================
+    # RUST (Full Support)
+    # =========================================================================
+    "target",           # Rust build output
+    ".cargo",           # Cargo cache
+
+    # =========================================================================
+    # GO
+    # =========================================================================
+    "vendor",
+
+    # =========================================================================
+    # JAVA / KOTLIN / GRADLE
+    # =========================================================================
+    ".gradle",
+    "gradle",  # Gradle wrapper
+    ".mvn",
+
+    # =========================================================================
+    # iOS/XCODE (Full Support)
+    # =========================================================================
     "DerivedData",      # Xcode build artifacts
     ".build",           # Swift Package Manager build directory
     "Pods",             # CocoaPods dependencies
@@ -77,6 +252,30 @@ DEFAULT_SKIP_DIRS = {
     "*.ipa",            # App archives
     "ModuleCache",      # Clang module cache
     "Index",            # Xcode index data
+
+    # =========================================================================
+    # IDE / EDITOR
+    # =========================================================================
+    ".idea",
+    ".vscode",
+    "*.sublime-*",
+
+    # =========================================================================
+    # TESTING / COVERAGE
+    # =========================================================================
+    "coverage",
+    ".nyc_output",
+    "__snapshots__",
+    ".jest",
+
+    # =========================================================================
+    # MISC
+    # =========================================================================
+    "logs",
+    "tmp",
+    "temp",
+    ".tmp",
+    ".temp",
 }
 
 

@@ -3947,6 +3947,891 @@ class StructuredTools:
 
         return all_results
 
+    # =========================================================================
+    # WEB/FRONTEND ANALYSIS TOOLS
+    # =========================================================================
+
+    def find_react_issues(self) -> ToolResult:
+        """
+        Find common React issues and anti-patterns.
+
+        Searches for:
+        - Missing key props in lists
+        - useEffect missing dependencies
+        - Stale closure issues
+        - Direct state mutation
+        - Memory leaks from subscriptions
+        """
+        result = ToolResult(tool_name="React Issues Scanner", files_scanned=len(self.files))
+
+        patterns = [
+            # Missing keys
+            (r'\.map\s*\([^)]*\)\s*=>\s*[(<](?![^>]*key\s*=)', "Missing key prop in map", Severity.MEDIUM),
+            # Empty useEffect deps
+            (r'useEffect\s*\([^,]+,\s*\[\s*\]\s*\)', "useEffect with empty deps - runs only once", Severity.LOW),
+            # No deps array in useEffect
+            (r'useEffect\s*\([^)]+\)\s*(?!\s*,)', "useEffect without dependency array - runs every render", Severity.HIGH),
+            # Direct state mutation
+            (r'(?:state|this\.state)\.\w+\s*=\s*', "Direct state mutation instead of setState", Severity.HIGH),
+            (r'\.push\s*\([^)]+\)\s*(?=.*set\w+)', "Array mutation before setState - use spread", Severity.MEDIUM),
+            # Stale closures
+            (r'setInterval\s*\([^)]+(?:state|props)\w*', "Potential stale closure in setInterval", Severity.MEDIUM),
+            (r'setTimeout\s*\([^)]+(?:state|props)\w*[^)]*,\s*\d{4,}', "Long setTimeout may have stale closure", Severity.LOW),
+            # Memory leaks
+            (r'addEventListener\s*\([^)]+\)(?!.*removeEventListener)', "addEventListener without cleanup", Severity.MEDIUM),
+            (r'subscribe\s*\([^)]+\)(?!.*unsubscribe)', "Subscription without cleanup", Severity.MEDIUM),
+            # Prop drilling indicators
+            (r'props\.\w+\.\w+\.\w+\.\w+', "Deep prop drilling - consider context or state management", Severity.LOW),
+            # Inline function in JSX (perf)
+            (r'onClick\s*=\s*\{\s*\(\)\s*=>', "Inline arrow function in onClick - may cause re-renders", Severity.LOW),
+        ]
+
+        for pattern, issue, severity in patterns:
+            matches = self._search_pattern(pattern)
+            for filepath, line_num, line, match in matches:
+                if not any(filepath.endswith(ext) for ext in ['.jsx', '.tsx', '.js', '.ts']):
+                    continue
+
+                result.findings.append(Finding(
+                    file=filepath,
+                    line=line_num,
+                    code=line[:150],
+                    issue=issue,
+                    confidence=Confidence.MEDIUM,
+                    severity=severity,
+                    category="react",
+                ))
+
+        result.summary = f"Found {len(result.findings)} React issues"
+        return result
+
+    def find_vue_issues(self) -> ToolResult:
+        """
+        Find common Vue.js issues and anti-patterns.
+
+        Searches for:
+        - v-for without :key
+        - Watchers without cleanup
+        - Mutating props directly
+        - Reactivity issues
+        """
+        result = ToolResult(tool_name="Vue Issues Scanner", files_scanned=len(self.files))
+
+        patterns = [
+            # v-for without key
+            (r'v-for\s*=\s*"[^"]+"\s*(?!.*:key)', "v-for without :key binding", Severity.MEDIUM),
+            # Mutating props
+            (r'this\.\$props\.\w+\s*=', "Mutating props directly", Severity.HIGH),
+            (r'props\.\w+\s*=\s*(?![=>])', "Direct prop mutation", Severity.HIGH),
+            # Missing async in lifecycle
+            (r'(?:mounted|created)\s*\(\s*\)\s*\{[^}]*await\s', "Async operation in sync lifecycle hook", Severity.MEDIUM),
+            # Reactivity gotchas
+            (r'\$set\s*\(', "Using $set - consider reactive() in Vue 3", Severity.LOW),
+            (r'this\.\$forceUpdate\s*\(', "$forceUpdate used - usually indicates reactivity issue", Severity.MEDIUM),
+            # Event bus (deprecated pattern)
+            (r'\$emit\s*\([\'"](?!update:)[^\'"]+[\'"]', "Custom event emission - ensure proper cleanup", Severity.LOW),
+            # Watch without cleanup
+            (r'watch\s*\([^)]+\)\s*(?!.*stop|unwatch)', "Watch without explicit cleanup", Severity.LOW),
+        ]
+
+        for pattern, issue, severity in patterns:
+            matches = self._search_pattern(pattern)
+            for filepath, line_num, line, match in matches:
+                if not any(filepath.endswith(ext) for ext in ['.vue', '.js', '.ts']):
+                    continue
+
+                result.findings.append(Finding(
+                    file=filepath,
+                    line=line_num,
+                    code=line[:150],
+                    issue=issue,
+                    confidence=Confidence.MEDIUM,
+                    severity=severity,
+                    category="vue",
+                ))
+
+        result.summary = f"Found {len(result.findings)} Vue issues"
+        return result
+
+    def find_angular_issues(self) -> ToolResult:
+        """
+        Find common Angular issues and anti-patterns.
+
+        Searches for:
+        - Memory leaks from subscriptions
+        - Change detection issues
+        - Template binding issues
+        """
+        result = ToolResult(tool_name="Angular Issues Scanner", files_scanned=len(self.files))
+
+        patterns = [
+            # Subscription without unsubscribe
+            (r'\.subscribe\s*\([^)]+\)(?!.*unsubscribe|takeUntil|take\(1\))', "Subscription without cleanup", Severity.HIGH),
+            # Missing OnDestroy
+            (r'implements\s+[^{]*(?<!OnDestroy)\s*\{[^}]*subscribe', "Component with subscription missing OnDestroy", Severity.MEDIUM),
+            # Avoid function calls in templates
+            (r'\{\{\s*\w+\s*\([^)]*\)\s*\}\}', "Function call in template - triggers on every change detection", Severity.MEDIUM),
+            # ngIf with ngFor on same element
+            (r'\*ngIf.*\*ngFor|\*ngFor.*\*ngIf', "ngIf and ngFor on same element - use ng-container", Severity.MEDIUM),
+            # Direct DOM manipulation
+            (r'document\.(getElementById|querySelector|getElementsBy)', "Direct DOM access - use ViewChild/Renderer2", Severity.MEDIUM),
+            # Missing trackBy
+            (r'\*ngFor\s*=\s*"[^"]+"\s*(?!.*trackBy)', "ngFor without trackBy - may cause performance issues", Severity.LOW),
+            # Zone.js issues
+            (r'runOutsideAngular\s*\([^)]+(?:subscribe|setTimeout|setInterval)', "Long-running operation outside zone - ensure proper cleanup", Severity.LOW),
+        ]
+
+        for pattern, issue, severity in patterns:
+            matches = self._search_pattern(pattern)
+            for filepath, line_num, line, match in matches:
+                if not any(filepath.endswith(ext) for ext in ['.ts', '.html', '.component.ts']):
+                    continue
+
+                result.findings.append(Finding(
+                    file=filepath,
+                    line=line_num,
+                    code=line[:150],
+                    issue=issue,
+                    confidence=Confidence.MEDIUM,
+                    severity=severity,
+                    category="angular",
+                ))
+
+        result.summary = f"Found {len(result.findings)} Angular issues"
+        return result
+
+    def find_dom_security(self) -> ToolResult:
+        """
+        Find DOM-based security vulnerabilities.
+
+        Searches for:
+        - eval() usage
+        - document.write()
+        - innerHTML with user input
+        - postMessage without origin check
+        """
+        result = ToolResult(tool_name="DOM Security Scanner", files_scanned=len(self.files))
+
+        patterns = [
+            # eval and friends
+            (r'\beval\s*\(', "eval() is dangerous - allows arbitrary code execution", Severity.CRITICAL),
+            (r'new\s+Function\s*\(', "new Function() is like eval - avoid", Severity.CRITICAL),
+            (r'setTimeout\s*\(\s*["\']', "setTimeout with string - acts like eval", Severity.HIGH),
+            (r'setInterval\s*\(\s*["\']', "setInterval with string - acts like eval", Severity.HIGH),
+            # document.write
+            (r'document\.write\s*\(', "document.write is dangerous and blocks parsing", Severity.HIGH),
+            (r'document\.writeln\s*\(', "document.writeln is dangerous", Severity.HIGH),
+            # innerHTML/outerHTML
+            (r'\.innerHTML\s*=\s*(?![\'"]\s*[\'"])', "innerHTML assignment - potential XSS", Severity.HIGH),
+            (r'\.outerHTML\s*=', "outerHTML assignment - potential XSS", Severity.HIGH),
+            (r'insertAdjacentHTML\s*\(', "insertAdjacentHTML - potential XSS", Severity.MEDIUM),
+            # postMessage
+            (r'\.postMessage\s*\([^,]+,\s*["\']?\*["\']?\s*\)', "postMessage to * origin - security risk", Severity.HIGH),
+            (r'addEventListener\s*\(["\']message["\'][^)]+(?!.*origin)', "message listener without origin check", Severity.HIGH),
+            # URL injection
+            (r'location\s*=\s*(?!location)', "Location assignment - check for open redirect", Severity.MEDIUM),
+            (r'location\.href\s*=\s*(?![\'"]/)', "Dynamic href assignment - potential open redirect", Severity.MEDIUM),
+            (r'window\.open\s*\([^,\'"]+(?:\+|`)', "Dynamic window.open - potential open redirect", Severity.MEDIUM),
+        ]
+
+        for pattern, issue, severity in patterns:
+            matches = self._search_pattern(pattern)
+            for filepath, line_num, line, match in matches:
+                if not any(filepath.endswith(ext) for ext in ['.js', '.jsx', '.ts', '.tsx', '.html', '.vue', '.svelte']):
+                    continue
+
+                result.findings.append(Finding(
+                    file=filepath,
+                    line=line_num,
+                    code=line[:150],
+                    issue=issue,
+                    confidence=Confidence.HIGH,
+                    severity=severity,
+                    category="dom_security",
+                ))
+
+        result.summary = f"Found {len(result.findings)} DOM security issues"
+        return result
+
+    def find_a11y_issues(self) -> ToolResult:
+        """
+        Find web accessibility (a11y) issues.
+
+        Searches for:
+        - Missing alt attributes
+        - Missing ARIA labels
+        - Click handlers without keyboard support
+        - Color contrast issues in inline styles
+        """
+        result = ToolResult(tool_name="Accessibility Scanner", files_scanned=len(self.files))
+
+        patterns = [
+            # Images without alt
+            (r'<img[^>]+(?<!alt=)[^>]*/?>', "Image missing alt attribute", Severity.MEDIUM),
+            (r'<img[^>]+alt\s*=\s*["\']["\']', "Image with empty alt - use alt=\"decorative\" if intentional", Severity.LOW),
+            # Interactive elements without labels
+            (r'<button[^>]*>(?:\s*<(?:i|span|svg)[^>]*>[^<]*</(?:i|span|svg)>\s*)</button>', "Icon-only button needs aria-label", Severity.MEDIUM),
+            (r'<a[^>]+href[^>]*>\s*<(?:i|img|svg)', "Icon-only link needs aria-label", Severity.MEDIUM),
+            # Click without keyboard
+            (r'onClick[^>]+(?!onKeyDown|onKeyPress|onKeyUp|role=)', "Click handler without keyboard support", Severity.MEDIUM),
+            (r'@click[^>]+(?!@keydown|@keypress|role=)', "Vue click without keyboard handler", Severity.MEDIUM),
+            # Div/span as button
+            (r'<(?:div|span)[^>]*onClick[^>]*(?!role=["\']button)', "Clickable div/span needs role=\"button\"", Severity.MEDIUM),
+            # Form issues
+            (r'<input[^>]+(?<!id=)[^>]*(?<!aria-label)[^>]*/?>', "Input may be missing label association", Severity.LOW),
+            (r'<select[^>]+(?<!aria-label)[^>]*>', "Select may be missing label", Severity.LOW),
+            # Heading order
+            (r'<h1[^>]*>[^<]*</h1>.*<h3', "Skipped heading level (h1 to h3)", Severity.LOW),
+            # Tabindex
+            (r'tabindex\s*=\s*["\'][2-9]|[1-9]\d', "tabindex > 1 disrupts natural tab order", Severity.MEDIUM),
+            (r'tabindex\s*=\s*["\']0["\'][^>]*(?!role=)', "tabindex=0 on non-interactive element needs role", Severity.LOW),
+        ]
+
+        for pattern, issue, severity in patterns:
+            matches = self._search_pattern(pattern)
+            for filepath, line_num, line, match in matches:
+                if not any(filepath.endswith(ext) for ext in ['.html', '.jsx', '.tsx', '.vue', '.svelte']):
+                    continue
+
+                result.findings.append(Finding(
+                    file=filepath,
+                    line=line_num,
+                    code=line[:150],
+                    issue=issue,
+                    confidence=Confidence.MEDIUM,
+                    severity=severity,
+                    fix="Add appropriate ARIA attributes or semantic HTML",
+                    category="a11y",
+                ))
+
+        result.summary = f"Found {len(result.findings)} accessibility issues"
+        return result
+
+    def find_css_issues(self) -> ToolResult:
+        """
+        Find CSS anti-patterns and issues.
+
+        Searches for:
+        - !important overuse
+        - z-index wars
+        - Hardcoded colors (not using variables)
+        - Deep nesting
+        """
+        result = ToolResult(tool_name="CSS Issues Scanner", files_scanned=len(self.files))
+
+        patterns = [
+            # !important
+            (r'!\s*important', "!important usage - consider specificity fix", Severity.LOW),
+            # High z-index
+            (r'z-index\s*:\s*(\d{4,}|999)', "High z-index value - potential z-index war", Severity.LOW),
+            # Hardcoded colors (not CSS vars)
+            (r'(?:color|background(?:-color)?)\s*:\s*#[0-9a-fA-F]{3,8}(?!\s*;?\s*/\*)', "Hardcoded color - consider CSS variable", Severity.LOW),
+            # Fixed dimensions (accessibility)
+            (r'font-size\s*:\s*\d+px', "Fixed font-size in px - consider rem/em for accessibility", Severity.LOW),
+            # Browser-specific prefixes without standard
+            (r'-webkit-(?!.*(?:webkit|moz|ms|o|standard))', "Webkit prefix without standard property", Severity.LOW),
+            # Deprecated properties
+            (r'(?:clip|zoom)\s*:', "Deprecated CSS property", Severity.LOW),
+        ]
+
+        for pattern, issue, severity in patterns:
+            matches = self._search_pattern(pattern)
+            for filepath, line_num, line, match in matches:
+                if not any(filepath.endswith(ext) for ext in ['.css', '.scss', '.sass', '.less', '.styl']):
+                    continue
+
+                result.findings.append(Finding(
+                    file=filepath,
+                    line=line_num,
+                    code=line[:150],
+                    issue=issue,
+                    confidence=Confidence.LOW,
+                    severity=severity,
+                    category="css",
+                ))
+
+        result.summary = f"Found {len(result.findings)} CSS issues"
+        return result
+
+    # =========================================================================
+    # RUST ANALYSIS TOOLS
+    # =========================================================================
+
+    def find_unsafe_blocks(self) -> ToolResult:
+        """
+        Find unsafe Rust code blocks and analyze their usage.
+
+        Searches for:
+        - unsafe blocks and functions
+        - Raw pointer operations
+        - FFI boundaries
+        - Transmute usage
+        """
+        result = ToolResult(tool_name="Rust Unsafe Scanner", files_scanned=len(self.files))
+
+        patterns = [
+            # Unsafe blocks and functions
+            (r'\bunsafe\s*\{', "unsafe block - review for memory safety", Severity.MEDIUM),
+            (r'\bunsafe\s+fn\b', "unsafe function - document safety requirements", Severity.MEDIUM),
+            (r'\bunsafe\s+impl\b', "unsafe impl - ensure trait contract is upheld", Severity.MEDIUM),
+            (r'\bunsafe\s+trait\b', "unsafe trait - document safety invariants", Severity.MEDIUM),
+            # Raw pointers
+            (r'\*(?:const|mut)\s+\w+', "Raw pointer type", Severity.LOW),
+            (r'\.as_ptr\s*\(\)', "Converting to raw pointer", Severity.LOW),
+            (r'\.as_mut_ptr\s*\(\)', "Converting to mutable raw pointer", Severity.MEDIUM),
+            (r'\bfrom_raw\s*\(', "Creating from raw pointer - ensure pointer validity", Severity.HIGH),
+            # Dangerous operations
+            (r'std::mem::transmute', "transmute is extremely unsafe - prefer safe alternatives", Severity.CRITICAL),
+            (r'std::mem::forget', "mem::forget prevents Drop - potential resource leak", Severity.HIGH),
+            (r'std::mem::uninitialized', "uninitialized memory is UB - use MaybeUninit", Severity.CRITICAL),
+            (r'std::mem::zeroed', "zeroed memory may be invalid for type", Severity.HIGH),
+            # FFI
+            (r'extern\s+"C"\s*\{', "FFI boundary - ensure correct ABI", Severity.MEDIUM),
+            (r'#\[no_mangle\]', "no_mangle for FFI - ensure correct signature", Severity.LOW),
+            # Union access
+            (r'\bunion\s+\w+', "Union type - all field access is unsafe", Severity.MEDIUM),
+        ]
+
+        for pattern, issue, severity in patterns:
+            matches = self._search_pattern(pattern)
+            for filepath, line_num, line, match in matches:
+                if not filepath.endswith('.rs'):
+                    continue
+
+                result.findings.append(Finding(
+                    file=filepath,
+                    line=line_num,
+                    code=line[:150],
+                    issue=issue,
+                    confidence=Confidence.HIGH,
+                    severity=severity,
+                    category="rust_unsafe",
+                ))
+
+        result.summary = f"Found {len(result.findings)} unsafe Rust patterns"
+        return result
+
+    def find_unwrap_usage(self) -> ToolResult:
+        """
+        Find .unwrap() and .expect() usage that may panic.
+
+        Searches for:
+        - .unwrap() calls
+        - .expect() calls
+        - Indexing that may panic
+        """
+        result = ToolResult(tool_name="Rust Unwrap Scanner", files_scanned=len(self.files))
+
+        patterns = [
+            # Unwrap variants
+            (r'\.unwrap\s*\(\)', ".unwrap() may panic - handle error properly", Severity.MEDIUM),
+            (r'\.unwrap_or_default\s*\(\)', ".unwrap_or_default() - ensure default is appropriate", Severity.LOW),
+            (r'\.expect\s*\(["\']', ".expect() may panic - ensure invariant is documented", Severity.LOW),
+            # Unchecked indexing
+            (r'\[\s*\w+\s*\](?!\s*(?:\.get|\.as_ref))', "Direct indexing may panic - consider .get()", Severity.LOW),
+            # Unreachable/unimplemented
+            (r'\bunreachable!\s*\(', "unreachable! - ensure this path is truly unreachable", Severity.LOW),
+            (r'\bunimplemented!\s*\(', "unimplemented! - stub that will panic", Severity.MEDIUM),
+            (r'\btodo!\s*\(', "todo! - incomplete code that will panic", Severity.HIGH),
+            # Panic
+            (r'\bpanic!\s*\(', "Explicit panic - consider Result/Option", Severity.MEDIUM),
+            (r'\.unwrap_err\s*\(\)', ".unwrap_err() panics on Ok - ensure this is tested", Severity.MEDIUM),
+        ]
+
+        for pattern, issue, severity in patterns:
+            matches = self._search_pattern(pattern)
+            for filepath, line_num, line, match in matches:
+                if not filepath.endswith('.rs'):
+                    continue
+
+                # Skip test files for unwrap (common and acceptable)
+                if '/tests/' in filepath or '_test.rs' in filepath or '#[test]' in line:
+                    continue
+
+                result.findings.append(Finding(
+                    file=filepath,
+                    line=line_num,
+                    code=line[:150],
+                    issue=issue,
+                    confidence=Confidence.MEDIUM,
+                    severity=severity,
+                    fix="Use ? operator or match/if let for proper error handling",
+                    category="rust_unwrap",
+                ))
+
+        result.summary = f"Found {len(result.findings)} unwrap/panic patterns"
+        return result
+
+    def find_rust_concurrency_issues(self) -> ToolResult:
+        """
+        Find Rust concurrency issues and potential data races.
+
+        Searches for:
+        - Arc without Mutex for interior mutability
+        - Mutex poisoning risks
+        - Deadlock patterns
+        - Unsafe Send/Sync implementations
+        """
+        result = ToolResult(tool_name="Rust Concurrency Scanner", files_scanned=len(self.files))
+
+        patterns = [
+            # Arc without Mutex
+            (r'Arc<(?!.*Mutex|RwLock|Atomic).*RefCell', "Arc<RefCell<T>> is not thread-safe - use Mutex", Severity.CRITICAL),
+            (r'Arc<(?!.*Mutex|RwLock|Atomic).*Cell<', "Arc<Cell<T>> is not thread-safe - use Atomic*", Severity.CRITICAL),
+            # Mutex patterns
+            (r'\.lock\s*\(\)\s*\.unwrap\s*\(\)', "Mutex lock unwrap - handle poisoned mutex", Severity.MEDIUM),
+            (r'Mutex::new\([^)]*Mutex', "Nested Mutex - potential deadlock", Severity.HIGH),
+            # Unsafe Send/Sync
+            (r'unsafe\s+impl\s+Send', "Manual Send impl - ensure thread safety", Severity.HIGH),
+            (r'unsafe\s+impl\s+Sync', "Manual Sync impl - ensure thread safety", Severity.HIGH),
+            # Static mut
+            (r'static\s+mut\s+', "static mut is unsafe - prefer atomics or Mutex", Severity.HIGH),
+            # Channel patterns
+            (r'\.send\s*\([^)]+\)\s*\.unwrap\s*\(\)', "Channel send unwrap - receiver may be dropped", Severity.MEDIUM),
+            # Thread spawn without join
+            (r'thread::spawn\s*\([^)]+\)(?!.*\.join)', "Thread spawned without join - may outlive caller", Severity.LOW),
+        ]
+
+        for pattern, issue, severity in patterns:
+            matches = self._search_pattern(pattern)
+            for filepath, line_num, line, match in matches:
+                if not filepath.endswith('.rs'):
+                    continue
+
+                result.findings.append(Finding(
+                    file=filepath,
+                    line=line_num,
+                    code=line[:150],
+                    issue=issue,
+                    confidence=Confidence.HIGH,
+                    severity=severity,
+                    category="rust_concurrency",
+                ))
+
+        result.summary = f"Found {len(result.findings)} Rust concurrency issues"
+        return result
+
+    def find_rust_error_handling(self) -> ToolResult:
+        """
+        Find Rust error handling patterns and issues.
+
+        Searches for:
+        - Improper Result handling
+        - Missing error propagation
+        - Error type issues
+        """
+        result = ToolResult(tool_name="Rust Error Handling Scanner", files_scanned=len(self.files))
+
+        patterns = [
+            # Discarding Results
+            (r'let\s+_\s*=\s*\w+\s*\?\s*;', "Propagating then discarding Result", Severity.LOW),
+            (r'(?<!let\s)(?<!return\s)\w+\([^)]*\)\s*;(?=\s*//.*(?:Result|Option))', "Ignoring Result/Option return value", Severity.MEDIUM),
+            # String errors
+            (r'Result<.*,\s*String>', "Using String for errors - consider custom error type", Severity.LOW),
+            (r'Result<.*,\s*&\'static\s+str>', "Using &str for errors - consider custom error type", Severity.LOW),
+            # Box<dyn Error>
+            (r'Box<dyn\s+(?:std::)?error::Error', "Box<dyn Error> loses error context - consider thiserror/anyhow", Severity.LOW),
+            # Panic in Result context
+            (r'\.map_err\s*\([^)]*panic', "Panic in map_err - defeats purpose of Result", Severity.HIGH),
+            # Ok-wrapping anti-pattern
+            (r'Ok\s*\(\s*\(\s*\)\s*\)', "Ok(()) - consider returning more useful value", Severity.LOW),
+        ]
+
+        for pattern, issue, severity in patterns:
+            matches = self._search_pattern(pattern)
+            for filepath, line_num, line, match in matches:
+                if not filepath.endswith('.rs'):
+                    continue
+
+                result.findings.append(Finding(
+                    file=filepath,
+                    line=line_num,
+                    code=line[:150],
+                    issue=issue,
+                    confidence=Confidence.MEDIUM,
+                    severity=severity,
+                    category="rust_errors",
+                ))
+
+        result.summary = f"Found {len(result.findings)} Rust error handling issues"
+        return result
+
+    def find_rust_clippy_patterns(self) -> ToolResult:
+        """
+        Find patterns that Clippy would flag.
+
+        Manual detection of common Clippy lints for when Clippy isn't available.
+        """
+        result = ToolResult(tool_name="Rust Clippy Pattern Scanner", files_scanned=len(self.files))
+
+        patterns = [
+            # Redundant clone
+            (r'\.clone\s*\(\)\s*\.clone\s*\(\)', "Redundant double clone", Severity.LOW),
+            (r'\.to_string\s*\(\)\s*\.to_string\s*\(\)', "Redundant double to_string", Severity.LOW),
+            # Useless conversions
+            (r'\.into\s*\(\)\s*\.into\s*\(\)', "Redundant double into()", Severity.LOW),
+            (r'String::from\s*\(\s*"[^"]*"\s*\)\.as_str\s*\(\)', "Useless String::from().as_str()", Severity.LOW),
+            # Inefficient patterns
+            (r'\.iter\s*\(\)\s*\.map\s*\([^)]+\)\s*\.collect::<Vec', "iter().map().collect() - consider .iter().map() directly", Severity.LOW),
+            (r'\.len\s*\(\)\s*==\s*0', ".len() == 0 - use .is_empty()", Severity.LOW),
+            (r'\.len\s*\(\)\s*>\s*0', ".len() > 0 - use !.is_empty()", Severity.LOW),
+            # Option/Result patterns
+            (r'\.is_some\s*\(\)\s*\{[^}]*\.unwrap\s*\(\)', "is_some() then unwrap() - use if let Some(x)", Severity.MEDIUM),
+            (r'\.is_ok\s*\(\)\s*\{[^}]*\.unwrap\s*\(\)', "is_ok() then unwrap() - use if let Ok(x)", Severity.MEDIUM),
+            (r'match\s+\w+\s*\{\s*Some\s*\(\s*x\s*\)\s*=>\s*Some\s*\(', "match Some(x) => Some() - use .map()", Severity.LOW),
+            # Single char patterns
+            (r'\.starts_with\s*\(\s*"[^"]"\s*\)', "starts_with single char - use char literal", Severity.LOW),
+            (r'\.ends_with\s*\(\s*"[^"]"\s*\)', "ends_with single char - use char literal", Severity.LOW),
+            # Loop patterns
+            (r'for\s+\w+\s+in\s+0\s*\.\.\s*\w+\.len\s*\(\)', "for i in 0..x.len() - use for item in &x", Severity.LOW),
+        ]
+
+        for pattern, issue, severity in patterns:
+            matches = self._search_pattern(pattern)
+            for filepath, line_num, line, match in matches:
+                if not filepath.endswith('.rs'):
+                    continue
+
+                result.findings.append(Finding(
+                    file=filepath,
+                    line=line_num,
+                    code=line[:150],
+                    issue=issue,
+                    confidence=Confidence.MEDIUM,
+                    severity=severity,
+                    fix="Run `cargo clippy` for full lint analysis",
+                    category="rust_clippy",
+                ))
+
+        result.summary = f"Found {len(result.findings)} Clippy-style issues"
+        return result
+
+    # =========================================================================
+    # NODE.JS ANALYSIS TOOLS
+    # =========================================================================
+
+    def find_callback_hell(self) -> ToolResult:
+        """
+        Find deeply nested callbacks (callback hell).
+
+        Searches for:
+        - Deeply nested callbacks
+        - Pyramid of doom patterns
+        """
+        result = ToolResult(tool_name="Callback Hell Scanner", files_scanned=len(self.files))
+
+        for filepath in self.files:
+            if not any(filepath.endswith(ext) for ext in ['.js', '.mjs', '.cjs', '.ts']):
+                continue
+
+            lines = self._get_file_lines(filepath)
+            if not lines:
+                continue
+
+            # Track nesting depth
+            callback_depth = 0
+            callback_start_line = 0
+
+            for line_num, line in enumerate(lines, 1):
+                # Count callback indicators
+                callbacks_opened = len(re.findall(r'(?:function\s*\(|=>\s*\{|\(\s*(?:err|error|e)\s*(?:,|\)\s*=>))', line))
+                callbacks_closed = line.count('});') + line.count('})') + line.count('};')
+
+                callback_depth += callbacks_opened - callbacks_closed
+
+                if callbacks_opened > 0 and callback_start_line == 0:
+                    callback_start_line = line_num
+
+                if callback_depth >= 4:  # 4+ levels of nesting
+                    result.findings.append(Finding(
+                        file=filepath,
+                        line=callback_start_line or line_num,
+                        code=line[:150],
+                        issue=f"Callback nesting depth {callback_depth} - consider async/await or Promises",
+                        confidence=Confidence.HIGH,
+                        severity=Severity.MEDIUM,
+                        fix="Refactor to use async/await or Promise chains",
+                        category="callback_hell",
+                    ))
+                    callback_depth = 0
+                    callback_start_line = 0
+
+                if callback_depth <= 0:
+                    callback_depth = 0
+                    callback_start_line = 0
+
+        result.summary = f"Found {len(result.findings)} callback hell patterns"
+        return result
+
+    def find_promise_issues(self) -> ToolResult:
+        """
+        Find Promise anti-patterns and issues.
+
+        Searches for:
+        - Unhandled rejections
+        - Promise constructor anti-pattern
+        - Missing error handling
+        """
+        result = ToolResult(tool_name="Promise Issues Scanner", files_scanned=len(self.files))
+
+        patterns = [
+            # Unhandled promises
+            (r'new\s+Promise\s*\([^)]+\)(?!\s*\.(then|catch|finally))', "Promise without .catch() - may have unhandled rejection", Severity.MEDIUM),
+            (r'\.then\s*\([^)]+\)(?!\s*\.(catch|finally))', ".then() without .catch() - add error handling", Severity.MEDIUM),
+            # Promise constructor anti-pattern
+            (r'new\s+Promise\s*\([^)]*resolve\s*\([^)]*await', "Promise constructor with await - unnecessary wrapper", Severity.LOW),
+            (r'new\s+Promise\s*\([^)]*resolve\s*\(\s*\w+\s*\)\s*\)', "Promise wrapping non-promise - use Promise.resolve()", Severity.LOW),
+            # async function without await
+            (r'async\s+(?:function\s+\w+|\w+\s*=\s*async)\s*\([^)]*\)\s*\{(?![\s\S]*await)', "async function without await", Severity.LOW),
+            # Common mistakes
+            (r'await\s+\w+\.forEach\s*\(', "await with forEach doesn't work as expected - use for...of", Severity.HIGH),
+            (r'\.catch\s*\(\s*\(\s*\)\s*=>\s*\{\s*\}\s*\)', "Empty catch block - at least log the error", Severity.MEDIUM),
+            # Promise.all pitfalls
+            (r'Promise\.all\s*\(\s*\[(?![\s\S]*\.map)', "Promise.all with static array - ensure all are promises", Severity.LOW),
+        ]
+
+        for pattern, issue, severity in patterns:
+            matches = self._search_pattern(pattern)
+            for filepath, line_num, line, match in matches:
+                if not any(filepath.endswith(ext) for ext in ['.js', '.mjs', '.cjs', '.ts', '.tsx', '.jsx']):
+                    continue
+
+                result.findings.append(Finding(
+                    file=filepath,
+                    line=line_num,
+                    code=line[:150],
+                    issue=issue,
+                    confidence=Confidence.MEDIUM,
+                    severity=severity,
+                    category="promise",
+                ))
+
+        result.summary = f"Found {len(result.findings)} Promise issues"
+        return result
+
+    def find_node_security(self) -> ToolResult:
+        """
+        Find Node.js security vulnerabilities.
+
+        Searches for:
+        - child_process without sanitization
+        - Path traversal risks
+        - Unsafe require/import
+        - Prototype pollution risks
+        """
+        result = ToolResult(tool_name="Node.js Security Scanner", files_scanned=len(self.files))
+
+        patterns = [
+            # Command injection
+            (r'exec\s*\(\s*(?:`[^`]*\$|["\'][^"\']*\+)', "Command injection risk - exec with user input", Severity.CRITICAL),
+            (r'execSync\s*\(\s*(?:`[^`]*\$|["\'][^"\']*\+)', "Command injection risk - execSync with user input", Severity.CRITICAL),
+            (r'spawn\s*\(\s*(?:req\.|user|input)', "Potential command injection in spawn", Severity.HIGH),
+            # Path traversal
+            (r'(?:readFile|writeFile|readdir)\s*\([^)]*(?:req\.|user|input)', "Path traversal risk - validate file paths", Severity.HIGH),
+            (r'path\.join\s*\([^)]*(?:req\.|user|input|\.\.))', "Path traversal risk - sanitize path input", Severity.HIGH),
+            (r'__dirname\s*\+\s*(?:req\.|user|input)', "Path traversal risk - use path.join with validation", Severity.HIGH),
+            # Eval and similar
+            (r'\beval\s*\(', "eval is dangerous - avoid completely", Severity.CRITICAL),
+            (r'new\s+Function\s*\(', "new Function is like eval - avoid", Severity.CRITICAL),
+            (r'vm\.runInContext\s*\([^)]*(?:req\.|user|input)', "vm.runInContext with user input - sandbox escape risk", Severity.CRITICAL),
+            # Prototype pollution
+            (r'Object\.assign\s*\(\s*\{\s*\}[^)]*(?:req\.|user|input)', "Object.assign with user input - prototype pollution risk", Severity.HIGH),
+            (r'\[(?:req\.|user|input)[^\]]*\]\s*=', "Dynamic property assignment - prototype pollution risk", Severity.MEDIUM),
+            # Unsafe deserialization
+            (r'JSON\.parse\s*\([^)]*(?:req\.|user|input)', "JSON.parse with untrusted input - validate schema", Severity.MEDIUM),
+            (r'(?:serialize|unserialize)\s*\(', "Serialization may be unsafe - use JSON", Severity.HIGH),
+            # SQL in template literals
+            (r'(?:query|execute)\s*\(\s*`[^`]*\$\{', "SQL injection risk - use parameterized queries", Severity.CRITICAL),
+        ]
+
+        for pattern, issue, severity in patterns:
+            matches = self._search_pattern(pattern)
+            for filepath, line_num, line, match in matches:
+                if not any(filepath.endswith(ext) for ext in ['.js', '.mjs', '.cjs', '.ts']):
+                    continue
+
+                result.findings.append(Finding(
+                    file=filepath,
+                    line=line_num,
+                    code=line[:150],
+                    issue=issue,
+                    confidence=Confidence.HIGH,
+                    severity=severity,
+                    category="node_security",
+                ))
+
+        result.summary = f"Found {len(result.findings)} Node.js security issues"
+        return result
+
+    def find_require_issues(self) -> ToolResult:
+        """
+        Find require/import issues in Node.js.
+
+        Searches for:
+        - Dynamic requires
+        - Circular dependency indicators
+        - Deprecated module usage
+        """
+        result = ToolResult(tool_name="Node.js Require Scanner", files_scanned=len(self.files))
+
+        patterns = [
+            # Dynamic require
+            (r'require\s*\(\s*(?![\'"]).+\)', "Dynamic require - may cause bundling issues", Severity.MEDIUM),
+            (r'require\s*\(\s*`', "Template literal require - unpredictable", Severity.MEDIUM),
+            (r'import\s*\(\s*(?![\'"]).+\)', "Dynamic import - ensure proper error handling", Severity.LOW),
+            # Deprecated Node.js modules
+            (r'require\s*\(\s*["\'](?:domain|sys)["\']', "Deprecated Node.js module", Severity.MEDIUM),
+            (r'require\s*\(\s*["\']punycode["\']', "punycode is deprecated in Node.js", Severity.LOW),
+            # Common issues
+            (r'require\.cache\s*\[', "Manipulating require.cache - may cause issues", Severity.MEDIUM),
+            (r'delete\s+require\.cache', "Clearing require cache - ensure this is intentional", Severity.MEDIUM),
+            # Missing file extensions
+            (r'require\s*\(\s*["\']\.\/[^"\']+(?<!\.[jt]sx?|\.json|\.node)["\']', "require without file extension - may fail", Severity.LOW),
+            # Conditional requires (harder to analyze)
+            (r'if\s*\([^)]+\)\s*\{[^}]*require\s*\(', "Conditional require - may cause issues with bundlers", Severity.LOW),
+        ]
+
+        for pattern, issue, severity in patterns:
+            matches = self._search_pattern(pattern)
+            for filepath, line_num, line, match in matches:
+                if not any(filepath.endswith(ext) for ext in ['.js', '.mjs', '.cjs', '.ts']):
+                    continue
+
+                result.findings.append(Finding(
+                    file=filepath,
+                    line=line_num,
+                    code=line[:150],
+                    issue=issue,
+                    confidence=Confidence.MEDIUM,
+                    severity=severity,
+                    category="node_require",
+                ))
+
+        result.summary = f"Found {len(result.findings)} require/import issues"
+        return result
+
+    def find_node_async_issues(self) -> ToolResult:
+        """
+        Find async/await issues specific to Node.js.
+
+        Searches for:
+        - Missing await
+        - Sequential awaits that could be parallel
+        - Event emitter memory leaks
+        """
+        result = ToolResult(tool_name="Node.js Async Scanner", files_scanned=len(self.files))
+
+        patterns = [
+            # Missing await
+            (r'(?<!await\s)(?:readFile|writeFile|mkdir|rmdir|unlink|rename|copyFile)\s*\(', "Async fs operation without await", Severity.MEDIUM),
+            (r'\.json\s*\(\)(?!\s*\.then|\s*;?\s*$)', ".json() without await - returns Promise", Severity.MEDIUM),
+            (r'fetch\s*\([^)]+\)(?!\s*\.then|await)', "fetch without await/then", Severity.MEDIUM),
+            # Sequential awaits
+            (r'await\s+\w+\([^)]*\)\s*;\s*\n\s*await\s+\w+\([^)]*\)\s*;\s*\n\s*await\s+', "Sequential awaits - consider Promise.all()", Severity.LOW),
+            # Event emitter issues
+            (r'\.on\s*\([^)]+\)(?![\s\S]{0,100}\.removeListener|\.off)', "Event listener without cleanup", Severity.MEDIUM),
+            (r'\.addListener\s*\([^)]+\)(?![\s\S]{0,100}\.removeListener)', "addListener without removeListener", Severity.MEDIUM),
+            (r'emitter\.setMaxListeners\s*\(\s*0\s*\)', "Unlimited listeners - potential memory leak", Severity.HIGH),
+            # Async in constructor
+            (r'constructor\s*\([^)]*\)\s*\{[^}]*await\s', "await in constructor - use factory function instead", Severity.HIGH),
+            # process.exit in async
+            (r'async\s+\w+[^{]*\{[^}]*process\.exit', "process.exit in async function - may skip cleanup", Severity.MEDIUM),
+        ]
+
+        for pattern, issue, severity in patterns:
+            matches = self._search_pattern(pattern)
+            for filepath, line_num, line, match in matches:
+                if not any(filepath.endswith(ext) for ext in ['.js', '.mjs', '.cjs', '.ts']):
+                    continue
+
+                result.findings.append(Finding(
+                    file=filepath,
+                    line=line_num,
+                    code=line[:150],
+                    issue=issue,
+                    confidence=Confidence.MEDIUM,
+                    severity=severity,
+                    category="node_async",
+                ))
+
+        result.summary = f"Found {len(result.findings)} Node.js async issues"
+        return result
+
+    # =========================================================================
+    # BATCH SCAN MODES
+    # =========================================================================
+
+    def run_web_scan(self, min_confidence: str = "MEDIUM") -> list[ToolResult]:
+        """
+        Run all web/frontend analysis scans.
+
+        Includes React, Vue, Angular, DOM security, accessibility, and CSS checks.
+        """
+        all_results = [
+            self.find_react_issues(),
+            self.find_vue_issues(),
+            self.find_angular_issues(),
+            self.find_dom_security(),
+            self.find_a11y_issues(),
+            self.find_css_issues(),
+            self.find_xss(),  # Existing XSS scanner
+        ]
+
+        if min_confidence.upper() != "LOW":
+            all_results = self._filter_by_confidence(all_results, min_confidence)
+
+        return all_results
+
+    def run_rust_scan(self, min_confidence: str = "MEDIUM") -> list[ToolResult]:
+        """
+        Run all Rust analysis scans.
+
+        Includes unsafe code, unwrap usage, concurrency, error handling, and clippy patterns.
+        """
+        all_results = [
+            self.find_unsafe_blocks(),
+            self.find_unwrap_usage(),
+            self.find_rust_concurrency_issues(),
+            self.find_rust_error_handling(),
+            self.find_rust_clippy_patterns(),
+        ]
+
+        if min_confidence.upper() != "LOW":
+            all_results = self._filter_by_confidence(all_results, min_confidence)
+
+        return all_results
+
+    def run_node_scan(self, min_confidence: str = "MEDIUM") -> list[ToolResult]:
+        """
+        Run all Node.js analysis scans.
+
+        Includes callback hell, promises, security, require issues, and async patterns.
+        """
+        all_results = [
+            self.find_callback_hell(),
+            self.find_promise_issues(),
+            self.find_node_security(),
+            self.find_require_issues(),
+            self.find_node_async_issues(),
+        ]
+
+        if min_confidence.upper() != "LOW":
+            all_results = self._filter_by_confidence(all_results, min_confidence)
+
+        return all_results
+
+    def run_frontend_scan(self, min_confidence: str = "MEDIUM") -> list[ToolResult]:
+        """
+        Run combined frontend scan (web + node).
+        """
+        return self.run_web_scan(min_confidence) + self.run_node_scan(min_confidence)
+
+    def run_backend_scan(self, min_confidence: str = "MEDIUM") -> list[ToolResult]:
+        """
+        Run combined backend scan (node + security).
+        """
+        return self.run_node_scan(min_confidence) + self.run_security_scan(min_confidence)
+
     # ===== RUN ALL QUALITY =====
 
     def run_quality_scan(self, min_confidence: str = "LOW", include_all: bool = True) -> list[ToolResult]:

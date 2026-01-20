@@ -1824,10 +1824,39 @@ Remove duplicates (same line, same issue). Keep all unique findings with their l
             "map_architecture": tools.map_architecture,
             "find_imports": tools.find_imports,
 
-            # Batch scans
+            # Batch scans - Original
             "run_security_scan": tools.run_security_scan,
             "run_quality_scan": tools.run_quality_scan,
             "run_ios_scan": tools.run_ios_scan,
+
+            # ===== WEB/FRONTEND TOOLS =====
+            "find_react_issues": tools.find_react_issues,
+            "find_vue_issues": tools.find_vue_issues,
+            "find_angular_issues": tools.find_angular_issues,
+            "find_dom_security": tools.find_dom_security,
+            "find_a11y_issues": tools.find_a11y_issues,
+            "find_css_issues": tools.find_css_issues,
+
+            # ===== RUST TOOLS =====
+            "find_unsafe_blocks": tools.find_unsafe_blocks,
+            "find_unwrap_usage": tools.find_unwrap_usage,
+            "find_rust_concurrency_issues": tools.find_rust_concurrency_issues,
+            "find_rust_error_handling": tools.find_rust_error_handling,
+            "find_rust_clippy_patterns": tools.find_rust_clippy_patterns,
+
+            # ===== NODE.JS TOOLS =====
+            "find_callback_hell": tools.find_callback_hell,
+            "find_promise_issues": tools.find_promise_issues,
+            "find_node_security": tools.find_node_security,
+            "find_require_issues": tools.find_require_issues,
+            "find_node_async_issues": tools.find_node_async_issues,
+
+            # ===== NEW BATCH SCANS =====
+            "run_web_scan": tools.run_web_scan,
+            "run_rust_scan": tools.run_rust_scan,
+            "run_node_scan": tools.run_node_scan,
+            "run_frontend_scan": tools.run_frontend_scan,
+            "run_backend_scan": tools.run_backend_scan,
 
             # ===== CUSTOM SEARCH TOOLS (for agent-provided patterns) =====
             # These are the PRIMARY tools for custom queries
