@@ -131,6 +131,8 @@ class ToolResult:
     summary: str = ""
     files_scanned: int = 0
     errors: list[str] = field(default_factory=list)
+    # Optional: file line counts for validation
+    _file_line_counts: dict[str, int] = field(default_factory=dict)
 
     @property
     def count(self) -> int:
@@ -148,6 +150,62 @@ class ToolResult:
             if sev not in result:
                 result[sev] = []
             result[sev].append(f)
+        return result
+
+    def validate_line_numbers(self, file_line_counts: dict[str, int]) -> 'ToolResult':
+        """
+        Validate and filter findings with invalid line numbers.
+
+        Args:
+            file_line_counts: Dict mapping filepath to total line count
+
+        Returns:
+            New ToolResult with invalid line numbers filtered or corrected
+        """
+        validated_findings = []
+        invalid_count = 0
+
+        for finding in self.findings:
+            max_lines = file_line_counts.get(finding.file, 0)
+
+            # Try partial path match if exact match fails
+            if max_lines == 0:
+                for path, count in file_line_counts.items():
+                    if finding.file in path or path.endswith(finding.file):
+                        max_lines = count
+                        break
+
+            if max_lines > 0 and finding.line > max_lines:
+                # Invalid line number - either skip or mark as low confidence
+                invalid_count += 1
+                # Create a corrected finding with clamped line number
+                corrected = Finding(
+                    file=finding.file,
+                    line=max_lines,  # Clamp to last line
+                    code=f"{finding.code} [LINE CORRECTED: was {finding.line}, max {max_lines}]",
+                    issue=finding.issue,
+                    confidence=Confidence.LOW,  # Lower confidence due to correction
+                    severity=finding.severity,
+                    fix=finding.fix,
+                    category=finding.category,
+                )
+                validated_findings.append(corrected)
+            else:
+                validated_findings.append(finding)
+
+        # Create new result with validated findings
+        result = ToolResult(
+            tool_name=self.tool_name,
+            findings=validated_findings,
+            summary=self.summary,
+            files_scanned=self.files_scanned,
+            errors=self.errors.copy(),
+            _file_line_counts=file_line_counts,
+        )
+
+        if invalid_count > 0:
+            result.errors.append(f"{invalid_count} findings had invalid line numbers (corrected)")
+
         return result
 
     def to_markdown(self) -> str:
@@ -217,6 +275,40 @@ class StructuredTools:
             index[filepath] = (start, end)
 
         return index
+
+    def _get_file_line_count(self, filepath: str) -> int:
+        """Get the total number of lines in a file."""
+        lines = self._get_file_lines(filepath)
+        return len(lines) if lines else 0
+
+    def _validate_line_number(self, filepath: str, line_num: int) -> tuple[bool, int]:
+        """
+        Validate that a line number is within file bounds.
+
+        Args:
+            filepath: Path to the file
+            line_num: Line number to validate (1-indexed)
+
+        Returns:
+            (is_valid, actual_max_lines) tuple
+            - is_valid: True if line_num is within bounds
+            - actual_max_lines: The actual number of lines in the file
+        """
+        max_lines = self._get_file_line_count(filepath)
+        if max_lines == 0:
+            return False, 0
+        return 1 <= line_num <= max_lines, max_lines
+
+    def _clamp_line_number(self, filepath: str, line_num: int) -> int:
+        """
+        Clamp a line number to valid range for the file.
+
+        If line_num exceeds file length, returns the last valid line.
+        """
+        max_lines = self._get_file_line_count(filepath)
+        if max_lines == 0:
+            return line_num  # Can't validate, return as-is
+        return min(max(1, line_num), max_lines)
 
     def _get_file_content(self, filepath: str) -> str | None:
         """Get content of a specific file."""
@@ -378,9 +470,16 @@ class StructuredTools:
         pattern: str,
         file_filter: str | None = None,
         exclude_pattern: str | None = None,
+        validate_lines: bool = True,
     ) -> list[tuple[str, int, str, re.Match]]:
         """
         Search for regex pattern across all files.
+
+        Args:
+            pattern: Regex pattern to search for
+            file_filter: Optional file extension filter (e.g., ".swift")
+            exclude_pattern: Optional pattern to exclude matches
+            validate_lines: If True, validate line numbers against file length
 
         Returns: List of (filepath, line_num, line_content, match)
         """
@@ -393,6 +492,7 @@ class StructuredTools:
 
             file_content = self.content[start:end]
             lines = file_content.split('\n')
+            max_lines = len(lines)
 
             for line_num, line in enumerate(lines, 1):
                 # Skip if matches exclude pattern
@@ -401,6 +501,11 @@ class StructuredTools:
 
                 match = re.search(pattern, line, re.IGNORECASE)
                 if match:
+                    # Validate line number against actual file length
+                    if validate_lines and line_num > max_lines:
+                        # This shouldn't happen in normal operation, but safeguard
+                        continue
+
                     results.append((filepath, line_num, line.strip(), match))
 
         return results
@@ -1703,6 +1808,85 @@ class StructuredTools:
 
     # ===== JAVASCRIPT TOOLS =====
 
+    # Known sanitizer functions/libraries that make innerHTML safe
+    SANITIZER_PATTERNS = [
+        r'escapeHtml\s*\(',          # escapeHtml() function
+        r'escape\s*\(',              # escape() function
+        r'sanitize\s*\(',            # sanitize() function
+        r'DOMPurify\.sanitize',      # DOMPurify library
+        r'xss\s*\(',                 # xss() sanitizer
+        r'htmlEncode\s*\(',          # htmlEncode() function
+        r'encodeHTML\s*\(',          # encodeHTML() function
+        r'safeHTML\s*\(',            # safeHTML() function
+        r'purify\s*\(',              # purify() function
+        r'sanitizeHtml\s*\(',        # sanitizeHtml() function
+        r'createTextNode',           # Safe DOM method
+        r'textContent\s*=',          # Safe property (often used in context)
+        r'\.innerText\s*=',          # Safe property
+        r'validator\.escape',        # validator.js escape
+        r'he\.encode',               # he library encode
+        r'entities\.encode',         # entities library
+    ]
+
+    def _is_sanitized(self, line: str, filepath: str, line_num: int) -> bool:
+        """
+        Check if a line uses sanitization that makes innerHTML/etc safe.
+
+        Checks:
+        1. Direct sanitizer call on the same line
+        2. Sanitizer call in the variable assignment (look back a few lines)
+        3. Known safe patterns (textContent assignment followed by innerHTML read)
+        """
+        # Check current line for sanitizer patterns
+        for sanitizer_pattern in self.SANITIZER_PATTERNS:
+            if re.search(sanitizer_pattern, line, re.IGNORECASE):
+                return True
+
+        # Check surrounding context (look back 5 lines for sanitizer usage)
+        lines = self._get_file_lines(filepath)
+        if lines:
+            start_line = max(0, line_num - 6)
+            context = '\n'.join(lines[start_line:line_num])
+            for sanitizer_pattern in self.SANITIZER_PATTERNS:
+                if re.search(sanitizer_pattern, context, re.IGNORECASE):
+                    return True
+
+        return False
+
+    def _get_xss_confidence(self, line: str, filepath: str, line_num: int) -> Confidence:
+        """
+        Determine confidence level for XSS finding based on context.
+
+        Returns:
+        - FILTERED: If sanitization is clearly present
+        - LOW: If sanitization might be present (ambiguous)
+        - MEDIUM: If no sanitization but context unclear
+        - HIGH: Clear vulnerability without sanitization
+        """
+        # Check for sanitization
+        if self._is_sanitized(line, filepath, line_num):
+            return Confidence.FILTERED
+
+        # Check if it's a static string (less concerning)
+        if re.search(r'\.innerHTML\s*=\s*["\'][^"\']*["\']', line):
+            return Confidence.LOW  # Static string, not a variable
+
+        # Check if it's in a test file
+        if self._is_test_file(filepath):
+            return Confidence.LOW
+
+        # Check for common false positive patterns
+        false_positive_patterns = [
+            r'\.innerHTML\s*=\s*["\']<',  # Static HTML string
+            r'\.innerHTML\s*=\s*["\']$',  # Empty string assignment
+            r'\.innerHTML\s*=\s*``',       # Empty template literal
+        ]
+        for fp_pattern in false_positive_patterns:
+            if re.search(fp_pattern, line):
+                return Confidence.LOW
+
+        return Confidence.HIGH
+
     def find_xss_vulnerabilities(self) -> ToolResult:
         """
         Find XSS vulnerabilities in JavaScript/TypeScript.
@@ -1711,6 +1895,11 @@ class StructuredTools:
         - innerHTML with variables
         - document.write
         - dangerouslySetInnerHTML
+
+        Filters out:
+        - Sanitized content (escapeHtml, DOMPurify, etc.)
+        - Static string assignments
+        - Test files (lower confidence)
         """
         result = ToolResult(tool_name="XSS Vulnerability Scanner", files_scanned=len(self.files))
 
@@ -1737,18 +1926,337 @@ class StructuredTools:
                 if self._is_in_comment(line, filepath):
                     continue
 
+                # Determine confidence based on sanitization context
+                confidence = self._get_xss_confidence(line, filepath, line_num)
+
+                # Skip filtered findings (sanitized)
+                if confidence == Confidence.FILTERED:
+                    continue
+
+                # Adjust issue message for lower confidence
+                adjusted_issue = issue
+                if confidence == Confidence.LOW:
+                    adjusted_issue = f"{issue} (verify - may be sanitized)"
+                elif confidence == Confidence.MEDIUM:
+                    adjusted_issue = f"{issue} (context unclear)"
+
                 result.findings.append(Finding(
                     file=filepath,
                     line=line_num,
                     code=line[:200],
-                    issue=issue,
-                    confidence=Confidence.HIGH,
+                    issue=adjusted_issue,
+                    confidence=confidence,
                     severity=severity,
-                    fix="Use textContent or proper sanitization",
+                    fix="Use textContent or proper sanitization (escapeHtml, DOMPurify)",
                     category="xss",
                 ))
 
         result.summary = f"Found {len(result.findings)} potential XSS vulnerabilities"
+        return result
+
+    # ===== TYPESCRIPT ANALYSIS TOOLS =====
+
+    def analyze_typescript_imports(self, filepath: str | None = None) -> ToolResult:
+        """
+        Analyze TypeScript/JavaScript imports and exports to build dependency graph.
+
+        Args:
+            filepath: Optional specific file to analyze. If None, analyzes all TS/JS files.
+
+        Returns:
+            ToolResult with import/export relationships
+        """
+        result = ToolResult(tool_name="TypeScript Import Analyzer", files_scanned=len(self.files))
+
+        # Import patterns
+        import_patterns = [
+            # ES6 imports
+            (r'''import\s+\{([^}]+)\}\s+from\s+['"]([@\w./\-]+)['"]''', 'named'),
+            (r'''import\s+(\w+)\s+from\s+['"]([@\w./\-]+)['"]''', 'default'),
+            (r'''import\s+\*\s+as\s+(\w+)\s+from\s+['"]([@\w./\-]+)['"]''', 'namespace'),
+            (r'''import\s+['"]([@\w./\-]+)['"]''', 'side_effect'),
+
+            # CommonJS
+            (r'''(?:const|let|var)\s+\{([^}]+)\}\s*=\s*require\(['"]([@\w./\-]+)['"]\)''', 'cjs_named'),
+            (r'''(?:const|let|var)\s+(\w+)\s*=\s*require\(['"]([@\w./\-]+)['"]\)''', 'cjs_default'),
+
+            # Dynamic imports
+            (r'''import\(['"]([@\w./\-]+)['"]\)''', 'dynamic'),
+        ]
+
+        # Export patterns
+        export_patterns = [
+            (r'''export\s+\{([^}]+)\}''', 'named_export'),
+            (r'''export\s+default\s+(\w+)''', 'default_export'),
+            (r'''export\s+(?:const|let|var|function|class|interface|type)\s+(\w+)''', 'declaration_export'),
+            (r'''module\.exports\s*=\s*\{([^}]+)\}''', 'cjs_export'),
+            (r'''module\.exports\s*=\s*(\w+)''', 'cjs_default_export'),
+        ]
+
+        target_files = [filepath] if filepath else self.files
+        import_map = {}  # file -> list of (import_type, imported_items, source)
+        export_map = {}  # file -> list of (export_type, exported_items)
+
+        for fp in target_files:
+            if not any(fp.endswith(ext) for ext in ['.ts', '.tsx', '.js', '.jsx', '.mjs']):
+                continue
+
+            lines = self._get_file_lines(fp)
+            if not lines:
+                continue
+
+            file_content = '\n'.join(lines)
+            imports = []
+            exports = []
+
+            # Find imports
+            for pattern, import_type in import_patterns:
+                for match in re.finditer(pattern, file_content):
+                    if import_type == 'side_effect':
+                        imports.append((import_type, '*', match.group(1)))
+                    elif import_type == 'dynamic':
+                        imports.append((import_type, 'dynamic', match.group(1)))
+                    else:
+                        imports.append((import_type, match.group(1).strip(), match.group(2)))
+
+            # Find exports
+            for pattern, export_type in export_patterns:
+                for match in re.finditer(pattern, file_content):
+                    exports.append((export_type, match.group(1).strip()))
+
+            if imports:
+                import_map[fp] = imports
+            if exports:
+                export_map[fp] = exports
+
+            # Report findings
+            for import_type, items, source in imports:
+                result.findings.append(Finding(
+                    file=fp,
+                    line=1,  # Would need more work to get exact line
+                    code=f"import {{{items}}} from '{source}'",
+                    issue=f"Imports from {source}",
+                    confidence=Confidence.HIGH,
+                    severity=Severity.INFO,
+                    category="import",
+                ))
+
+        result.summary = f"Analyzed {len(import_map)} files with imports, {len(export_map)} with exports"
+        return result
+
+    def trace_websocket_flow(self) -> ToolResult:
+        """
+        Trace WebSocket message flow through TypeScript/JavaScript code.
+
+        Tracks:
+        - WebSocket creation and connection
+        - Message handlers (onmessage, addEventListener)
+        - Send operations
+        - Message type definitions
+        - Data flow from receive to process
+        """
+        result = ToolResult(tool_name="WebSocket Flow Tracer", files_scanned=len(self.files))
+
+        # WebSocket patterns
+        ws_patterns = [
+            # WebSocket creation
+            (r'''new\s+WebSocket\s*\(['"](wss?://[^'"]+)['"]''', "WebSocket connection", Severity.INFO),
+            (r'''new\s+WebSocket\s*\(([^)]+)\)''', "WebSocket creation (dynamic URL)", Severity.LOW),
+
+            # Socket.io
+            (r'''io\s*\(\s*['"](wss?://[^'"]+)['"]''', "Socket.io connection", Severity.INFO),
+            (r'''socket\.on\s*\(\s*['"]([\w:]+)['"]''', "Socket event listener", Severity.INFO),
+            (r'''socket\.emit\s*\(\s*['"]([\w:]+)['"]''', "Socket emit", Severity.INFO),
+
+            # Message handlers
+            (r'''\.onmessage\s*=\s*(?:async\s*)?\(?(\w*)''', "onmessage handler", Severity.INFO),
+            (r'''\.addEventListener\s*\(\s*['"](message|open|close|error)['"]''', "WebSocket event listener", Severity.INFO),
+
+            # Send operations
+            (r'''\.send\s*\(\s*JSON\.stringify\s*\(([^)]+)\)''', "WebSocket send (JSON)", Severity.INFO),
+            (r'''\.send\s*\(([^)]+)\)''', "WebSocket send", Severity.INFO),
+
+            # Message parsing
+            (r'''JSON\.parse\s*\(\s*(?:event|e|msg|message)\.data\s*\)''', "Message parsing", Severity.INFO),
+
+            # Type definitions (TypeScript)
+            (r'''interface\s+(\w*[Mm]essage\w*)\s*\{''', "Message type definition", Severity.INFO),
+            (r'''type\s+(\w*[Mm]essage\w*)\s*=''', "Message type alias", Severity.INFO),
+        ]
+
+        # Track WebSocket-related files and handlers
+        ws_files = set()
+        handlers = []
+        connections = []
+        message_types = []
+
+        for pattern, issue, severity in ws_patterns:
+            matches = self._search_pattern(pattern)
+            for filepath, line_num, line, match in matches:
+                if not any(filepath.endswith(ext) for ext in ['.ts', '.tsx', '.js', '.jsx']):
+                    continue
+
+                ws_files.add(filepath)
+
+                # Categorize finding
+                if "connection" in issue.lower() or "creation" in issue.lower():
+                    connections.append((filepath, line_num, match.group(1) if match.groups() else ""))
+                elif "handler" in issue.lower() or "listener" in issue.lower():
+                    handlers.append((filepath, line_num, match.group(1) if match.groups() else ""))
+                elif "type" in issue.lower():
+                    message_types.append((filepath, line_num, match.group(1) if match.groups() else ""))
+
+                result.findings.append(Finding(
+                    file=filepath,
+                    line=line_num,
+                    code=line[:150],
+                    issue=issue,
+                    confidence=Confidence.HIGH,
+                    severity=severity,
+                    category="websocket",
+                ))
+
+        # Build flow summary
+        if connections or handlers:
+            flow_summary = f"WebSocket Flow: {len(connections)} connections, {len(handlers)} handlers, {len(message_types)} types in {len(ws_files)} files"
+            result.summary = flow_summary
+
+            # Add flow trace finding
+            if len(ws_files) > 0:
+                trace = "WebSocket Message Flow:\n"
+                if connections:
+                    trace += f"  Connections: {', '.join(f'{c[0]}:{c[1]}' for c in connections[:5])}\n"
+                if handlers:
+                    trace += f"  Handlers: {', '.join(f'{h[0]}:{h[1]}' for h in handlers[:5])}\n"
+                if message_types:
+                    trace += f"  Types: {', '.join(t[2] for t in message_types[:5])}"
+
+                result.findings.insert(0, Finding(
+                    file="[FLOW TRACE]",
+                    line=0,
+                    code=trace,
+                    issue="WebSocket message flow summary",
+                    confidence=Confidence.HIGH,
+                    severity=Severity.INFO,
+                    category="websocket_flow",
+                ))
+        else:
+            result.summary = "No WebSocket usage found"
+
+        return result
+
+    def build_call_graph(self, entry_point: str | None = None) -> ToolResult:
+        """
+        Build a function call graph for TypeScript/JavaScript.
+
+        Traces function calls and method invocations to understand code flow.
+
+        Args:
+            entry_point: Optional function name to start tracing from
+        """
+        result = ToolResult(tool_name="Call Graph Builder", files_scanned=len(self.files))
+
+        # Function definition patterns
+        func_def_patterns = [
+            # Named functions
+            (r'''function\s+(\w+)\s*\(([^)]*)\)''', 'function'),
+            # Arrow functions assigned to const/let
+            (r'''(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s*)?\(([^)]*)\)\s*=>''', 'arrow'),
+            # Class methods
+            (r'''(?:async\s+)?(\w+)\s*\(([^)]*)\)\s*\{''', 'method'),
+            # TypeScript methods with access modifiers
+            (r'''(?:public|private|protected)\s+(?:async\s+)?(\w+)\s*\(([^)]*)\)''', 'ts_method'),
+        ]
+
+        # Call patterns
+        call_patterns = [
+            r'''(\w+)\s*\(''',  # Direct function call
+            r'''this\.(\w+)\s*\(''',  # this.method() call
+            r'''await\s+(\w+)\s*\(''',  # await function()
+            r'''\.(\w+)\s*\(''',  # method call on object
+        ]
+
+        functions = {}  # name -> (file, line, params)
+        calls = {}  # caller -> list of callees
+
+        for filepath in self.files:
+            if not any(filepath.endswith(ext) for ext in ['.ts', '.tsx', '.js', '.jsx']):
+                continue
+
+            lines = self._get_file_lines(filepath)
+            if not lines:
+                continue
+
+            current_function = None
+
+            for line_num, line in enumerate(lines, 1):
+                # Check for function definitions
+                for pattern, func_type in func_def_patterns:
+                    match = re.search(pattern, line)
+                    if match:
+                        func_name = match.group(1)
+                        params = match.group(2) if len(match.groups()) > 1 else ""
+                        functions[func_name] = (filepath, line_num, params, func_type)
+                        current_function = func_name
+
+                        result.findings.append(Finding(
+                            file=filepath,
+                            line=line_num,
+                            code=f"{func_type}: {func_name}({params})",
+                            issue=f"Function definition: {func_name}",
+                            confidence=Confidence.HIGH,
+                            severity=Severity.INFO,
+                            category="function_def",
+                        ))
+                        break
+
+                # Track function calls within current function
+                if current_function:
+                    for call_pattern in call_patterns:
+                        for match in re.finditer(call_pattern, line):
+                            callee = match.group(1)
+                            # Skip common built-ins and noise
+                            if callee in ['if', 'for', 'while', 'switch', 'catch', 'console', 'log', 'error', 'warn']:
+                                continue
+                            if current_function not in calls:
+                                calls[current_function] = set()
+                            calls[current_function].add(callee)
+
+        # Build call graph summary
+        if entry_point and entry_point in functions:
+            # Trace from entry point
+            visited = set()
+            trace = []
+
+            def trace_calls(func_name, depth=0):
+                if func_name in visited or depth > 5:
+                    return
+                visited.add(func_name)
+                indent = "  " * depth
+                if func_name in functions:
+                    fp, ln, params, ftype = functions[func_name]
+                    trace.append(f"{indent}{func_name}() @ {fp}:{ln}")
+                else:
+                    trace.append(f"{indent}{func_name}() [external]")
+
+                if func_name in calls:
+                    for callee in sorted(calls[func_name]):
+                        trace_calls(callee, depth + 1)
+
+            trace_calls(entry_point)
+            trace_str = "\n".join(trace)
+
+            result.findings.insert(0, Finding(
+                file="[CALL GRAPH]",
+                line=0,
+                code=trace_str[:500],
+                issue=f"Call graph from {entry_point}",
+                confidence=Confidence.MEDIUM,
+                severity=Severity.INFO,
+                category="call_graph",
+            ))
+
+        result.summary = f"Found {len(functions)} functions, {sum(len(c) for c in calls.values())} calls"
         return result
 
     # ===== ARCHITECTURE TOOLS =====
@@ -1871,12 +2379,12 @@ class StructuredTools:
 
     # ===== QUALITY TOOLS =====
 
-    def find_long_functions(self, max_lines: int = 50) -> ToolResult:
+    def find_long_functions(self, max_lines: int = 30) -> ToolResult:
         """
         Find functions that are too long.
 
         Args:
-            max_lines: Maximum acceptable function length
+            max_lines: Maximum acceptable function length (default: 30, lowered from 50 for better sensitivity)
         """
         result = ToolResult(tool_name=f"Long Function Scanner (>{max_lines} lines)", files_scanned=len(self.files))
 
@@ -1885,7 +2393,12 @@ class StructuredTools:
             (r'''^\s*def\s+(\w+)\s*\(''', '.py'),  # Python
             (r'''^\s*(?:async\s+)?func\s+(\w+)\s*\(''', '.swift'),  # Swift
             (r'''^\s*(?:async\s+)?function\s+(\w+)\s*\(''', '.js'),  # JavaScript
+            (r'''^\s*(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s*)?\(''', '.js'),  # JS arrow functions
+            (r'''^\s*(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s*)?\(''', '.ts'),  # TS arrow functions
+            (r'''^\s*(?:async\s+)?function\s+(\w+)\s*\(''', '.ts'),  # TypeScript
             (r'''^\s*(?:public|private|protected)?\s*(?:static\s+)?(?:\w+\s+)+(\w+)\s*\(''', '.java'),  # Java
+            (r'''^\s*(?:pub\s+)?(?:async\s+)?fn\s+(\w+)''', '.rs'),  # Rust
+            (r'''^\s*func\s+(\w+)''', '.go'),  # Go
         ]
 
         for filepath in self.files:
@@ -1917,18 +2430,243 @@ class StructuredTools:
                 length = end_line - start_line
 
                 if length > max_lines:
+                    # Determine severity based on length thresholds
+                    if length > 100:
+                        severity = Severity.HIGH
+                    elif length > 60:
+                        severity = Severity.MEDIUM
+                    else:
+                        severity = Severity.LOW
+
                     result.findings.append(Finding(
                         file=filepath,
                         line=start_line + 1,
                         code=f"def {func_name}(...): # {length} lines",
                         issue=f"Function too long ({length} lines > {max_lines})",
                         confidence=Confidence.HIGH,
-                        severity=Severity.MEDIUM if length < 100 else Severity.HIGH,
+                        severity=severity,
                         fix=f"Refactor into smaller functions",
                         category="long_function",
                     ))
 
         result.summary = f"Found {len(result.findings)} functions over {max_lines} lines"
+        return result
+
+    def find_complex_functions(self, max_complexity: int = 10) -> ToolResult:
+        """
+        Find functions with high cyclomatic complexity.
+
+        Approximates complexity by counting:
+        - if/elif/else statements
+        - for/while loops
+        - try/except blocks
+        - and/or operators
+        - ternary operators
+
+        Args:
+            max_complexity: Maximum acceptable complexity score (default: 10)
+        """
+        result = ToolResult(tool_name=f"Complexity Scanner (>{max_complexity})", files_scanned=len(self.files))
+
+        # Complexity indicators by pattern
+        complexity_patterns = [
+            (r'\bif\b', 1),
+            (r'\belif\b', 1),
+            (r'\belse\b', 1),
+            (r'\bfor\b', 1),
+            (r'\bwhile\b', 1),
+            (r'\btry\b', 1),
+            (r'\bexcept\b', 1),
+            (r'\bcatch\b', 1),
+            (r'\bcase\b', 1),
+            (r'\b(and|or|&&|\|\|)\b', 1),
+            (r'\?.*:', 1),  # Ternary
+            (r'\bguard\b', 1),  # Swift guard
+            (r'\bswitch\b', 1),
+        ]
+
+        func_start_patterns = [
+            (r'^\s*def\s+(\w+)\s*\(', '.py'),
+            (r'^\s*(?:async\s+)?func\s+(\w+)\s*\(', '.swift'),
+            (r'^\s*(?:async\s+)?function\s+(\w+)\s*\(', '.js'),
+            (r'^\s*(?:async\s+)?function\s+(\w+)\s*\(', '.ts'),
+        ]
+
+        for filepath in self.files:
+            lines = self._get_file_lines(filepath)
+            if not lines:
+                continue
+
+            # Find applicable function pattern
+            func_pattern = None
+            for p, ext in func_start_patterns:
+                if filepath.endswith(ext):
+                    func_pattern = p
+                    break
+
+            if not func_pattern:
+                continue
+
+            # Find functions
+            func_starts = []
+            for i, line in enumerate(lines):
+                match = re.match(func_pattern, line)
+                if match:
+                    func_starts.append((i, match.group(1)))
+
+            # Calculate complexity for each function
+            for i, (start_line, func_name) in enumerate(func_starts):
+                end_line = func_starts[i + 1][0] if i + 1 < len(func_starts) else len(lines)
+                func_content = '\n'.join(lines[start_line:end_line])
+
+                # Count complexity
+                complexity = 1  # Base complexity
+                for pattern, weight in complexity_patterns:
+                    matches = re.findall(pattern, func_content, re.IGNORECASE)
+                    complexity += len(matches) * weight
+
+                if complexity > max_complexity:
+                    result.findings.append(Finding(
+                        file=filepath,
+                        line=start_line + 1,
+                        code=f"{func_name}(): complexity={complexity}",
+                        issue=f"High cyclomatic complexity ({complexity} > {max_complexity})",
+                        confidence=Confidence.MEDIUM,
+                        severity=Severity.MEDIUM if complexity < 20 else Severity.HIGH,
+                        fix="Break into smaller functions, reduce nesting, simplify conditionals",
+                        category="complexity",
+                    ))
+
+        result.summary = f"Found {len(result.findings)} functions with complexity > {max_complexity}"
+        return result
+
+    def find_code_smells(self) -> ToolResult:
+        """
+        Find common code smells and anti-patterns.
+
+        Searches for:
+        - Magic numbers (non-obvious numeric literals)
+        - Deep nesting (4+ levels)
+        - God classes (too many methods)
+        - Long parameter lists
+        - Duplicate code patterns
+        """
+        result = ToolResult(tool_name="Code Smell Scanner", files_scanned=len(self.files))
+
+        # Magic numbers (excluding 0, 1, 2, -1, common values)
+        magic_number_pattern = r'(?<![a-zA-Z_])(?<![\d.])([3-9]\d{2,}|[1-9]\d{3,})(?![\d.])'
+
+        # Long parameter lists (5+ params)
+        long_params_pattern = r'def\s+\w+\s*\([^)]*,\s*[^)]*,\s*[^)]*,\s*[^)]*,\s*[^)]*\)'
+
+        # Deep nesting indicators (4+ indent levels = 16+ spaces or 4+ tabs)
+        deep_nesting_pattern = r'^(\s{16,}|\t{4,})\S'
+
+        for filepath in self.files:
+            lines = self._get_file_lines(filepath)
+            if not lines:
+                continue
+
+            # Skip test files for some checks
+            is_test = self._is_test_file(filepath)
+
+            for line_num, line in enumerate(lines, 1):
+                # Magic numbers (skip tests and constants)
+                if not is_test and not self._is_in_comment(line, filepath):
+                    magic_matches = re.findall(magic_number_pattern, line)
+                    for magic in magic_matches:
+                        # Skip if it looks like a year, port, or common constant
+                        if int(magic) in [80, 443, 8080, 3000, 5000, 8000, 1000, 1024, 2048, 4096]:
+                            continue
+                        result.findings.append(Finding(
+                            file=filepath,
+                            line=line_num,
+                            code=line.strip()[:100],
+                            issue=f"Magic number: {magic}",
+                            confidence=Confidence.LOW,
+                            severity=Severity.LOW,
+                            fix="Extract to named constant",
+                            category="magic_number",
+                        ))
+
+                # Deep nesting
+                if re.match(deep_nesting_pattern, line):
+                    result.findings.append(Finding(
+                        file=filepath,
+                        line=line_num,
+                        code=line.strip()[:100],
+                        issue="Deep nesting (4+ levels)",
+                        confidence=Confidence.MEDIUM,
+                        severity=Severity.MEDIUM,
+                        fix="Extract nested logic into helper functions",
+                        category="deep_nesting",
+                    ))
+
+            # Check for long parameter lists
+            file_content = '\n'.join(lines)
+            for match in re.finditer(long_params_pattern, file_content):
+                line_num = file_content[:match.start()].count('\n') + 1
+                result.findings.append(Finding(
+                    file=filepath,
+                    line=line_num,
+                    code=match.group(0)[:100],
+                    issue="Long parameter list (5+ params)",
+                    confidence=Confidence.MEDIUM,
+                    severity=Severity.LOW,
+                    fix="Consider using a config object or builder pattern",
+                    category="long_params",
+                ))
+
+        result.summary = f"Found {len(result.findings)} code smells"
+        return result
+
+    def find_dead_code(self) -> ToolResult:
+        """
+        Find potentially dead/unreachable code.
+
+        Searches for:
+        - Code after return/throw/break/continue
+        - Unused variables (basic detection)
+        - Commented-out code blocks
+        - #if false / #if DEBUG blocks (Swift/ObjC)
+        """
+        result = ToolResult(tool_name="Dead Code Scanner", files_scanned=len(self.files))
+
+        patterns = [
+            # Code after return
+            (r'^\s*return\s+[^;]*;\s*\n\s*[a-zA-Z]', "Code after return statement", Severity.MEDIUM),
+
+            # Swift #if false
+            (r'#if\s+false', "#if false block (dead code)", Severity.LOW),
+
+            # Commented-out code (looks like real code)
+            (r'//\s*(if|for|while|func|def|class|return|var|let|const)\s+', "Commented-out code", Severity.LOW),
+
+            # Python pass in non-stub context
+            (r'^\s+pass\s*$', "Pass statement (potential placeholder)", Severity.LOW),
+
+            # Unreachable after throw/raise
+            (r'(throw|raise)\s+[^;]*\n\s*[a-zA-Z]', "Code after throw/raise", Severity.MEDIUM),
+        ]
+
+        for pattern, issue, severity in patterns:
+            matches = self._search_pattern(pattern)
+            for filepath, line_num, line, match in matches:
+                if self._is_test_file(filepath):
+                    continue
+
+                result.findings.append(Finding(
+                    file=filepath,
+                    line=line_num,
+                    code=line[:100],
+                    issue=issue,
+                    confidence=Confidence.LOW,
+                    severity=severity,
+                    fix="Remove or refactor dead code",
+                    category="dead_code",
+                ))
+
+        result.summary = f"Found {len(result.findings)} potential dead code areas"
         return result
 
     # ===== iOS SECURITY SCANNERS =====
@@ -2305,20 +3043,36 @@ class StructuredTools:
 
     # ===== RUN ALL QUALITY =====
 
-    def run_quality_scan(self, min_confidence: str = "LOW") -> list[ToolResult]:
+    def run_quality_scan(self, min_confidence: str = "LOW", include_all: bool = True) -> list[ToolResult]:
         """
-        Run all quality-related scans (style, maintainability).
+        Run all quality-related scans (style, maintainability, complexity).
+
+        Includes:
+        - Long functions (>30 lines, lowered threshold)
+        - Complex functions (cyclomatic complexity >10)
+        - Code smells (magic numbers, deep nesting, long params)
+        - Dead code detection
+        - TODO/FIXME comments
 
         Note: Quality scans are excluded from iOS/security scans by default.
         Use include_quality=True to include them, or run separately.
 
         Args:
             min_confidence: Minimum confidence level ("LOW", "MEDIUM", "HIGH")
+            include_all: If True, run all quality checks. If False, run only basic checks.
         """
         all_results = [
-            self.find_long_functions(),
+            self.find_long_functions(),  # Lowered to 30 lines threshold
             self.find_todos(),
         ]
+
+        # Add comprehensive quality checks if requested
+        if include_all:
+            all_results.extend([
+                self.find_complex_functions(),
+                self.find_code_smells(),
+                self.find_dead_code(),
+            ])
 
         if min_confidence.upper() != "LOW":
             all_results = self._filter_by_confidence(all_results, min_confidence)

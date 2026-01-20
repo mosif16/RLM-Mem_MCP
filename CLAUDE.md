@@ -959,6 +959,18 @@ Token bucket algorithm:
 - Making targeted edits
 - Quick lookups in known locations
 
+### Available Tools
+
+| Category | Tools |
+|----------|-------|
+| **Security** | `find_secrets()`, `find_sql_injection()`, `find_xss()`, `find_command_injection()`, `find_python_security()` |
+| **iOS/Swift** | `find_force_unwraps()`, `find_retain_cycles()`, `find_main_thread_violations()`, `find_weak_self_issues()` |
+| **Quality** | `find_long_functions()`, `find_complex_functions()`, `find_code_smells()`, `find_dead_code()`, `find_todos()` |
+| **TypeScript** | `analyze_typescript_imports()`, `trace_websocket_flow()`, `build_call_graph()` |
+| **Persistence** | `find_persistence_patterns()`, `find_state_mutations()` |
+| **Architecture** | `map_architecture()`, `find_imports()` |
+| **Batch Scans** | `run_security_scan()`, `run_quality_scan()`, `run_ios_scan()`, `run_persistence_scan()` |
+
 ### Best Practices
 1. Be specific in your queries - avoid vague searches
 2. Use appropriate confidence levels (HIGH for critical, MEDIUM for general)
@@ -969,6 +981,41 @@ Token bucket algorithm:
 
 ---
 
+## Recent Improvements (v2.1)
+
+### Sanitizer Detection for XSS Scanner
+The XSS vulnerability scanner now recognizes common sanitization functions and reduces false positives:
+- `escapeHtml()`, `DOMPurify.sanitize()`, `xss()`, `htmlEncode()`
+- Context-aware detection (checks surrounding lines for sanitization)
+- Confidence levels adjusted based on sanitization presence
+
+### REPL Iteration Controls
+New configuration options to ensure thorough analysis:
+- `RLM_MIN_ITERATIONS` (default: 3) - Minimum iterations before accepting results
+- `RLM_REQUIRE_TOOL_EXECUTION` (default: true) - Forces at least one tool execution
+- Prevents "0 iterations" early exits
+
+### Line Number Validation
+All findings now validate line numbers against actual file length:
+- Invalid line numbers are clamped to valid range
+- Findings with corrected lines marked as LOW confidence
+- Prevents references exceeding file length (e.g., line 550 in 548-line file)
+
+### Enhanced Quality Scanner
+More sensitive thresholds and additional checks:
+- `find_long_functions()` threshold lowered to 30 lines (from 50)
+- New `find_complex_functions()` for cyclomatic complexity (>10)
+- New `find_code_smells()` for magic numbers, deep nesting, long params
+- New `find_dead_code()` for unreachable code detection
+
+### TypeScript Analysis Tools
+New tools for JavaScript/TypeScript codebases:
+- `analyze_typescript_imports()` - Import/export dependency mapping
+- `trace_websocket_flow()` - WebSocket message flow tracing
+- `build_call_graph()` - Function call graph analysis
+
+---
+
 ## License
 
 MIT License - see LICENSE for details.
@@ -976,5 +1023,5 @@ MIT License - see LICENSE for details.
 ---
 
 **Last Updated**: January 2026
-**Version**: 2.0
+**Version**: 2.1
 **Status**: Production Ready

@@ -1739,6 +1739,16 @@ Remove duplicates (same line, same issue). Keep all unique findings with their l
             "run_quality_scan": tools.run_quality_scan,
             "run_ios_scan": tools.run_ios_scan,
 
+            # TypeScript analysis tools
+            "analyze_typescript_imports": tools.analyze_typescript_imports,
+            "trace_websocket_flow": tools.trace_websocket_flow,
+            "build_call_graph": tools.build_call_graph,
+
+            # Extended quality tools
+            "find_complex_functions": tools.find_complex_functions,
+            "find_code_smells": tools.find_code_smells,
+            "find_dead_code": tools.find_dead_code,
+
             # Helper to get file list
             "files": tools.files,
 
@@ -1929,6 +1939,10 @@ Remove duplicates (same line, same issue). Keep all unique findings with their l
         if max_iterations is None:
             max_iterations = self.config.max_iterations
 
+        # Ensure minimum iterations (prevents "0 iterations" issue from feedback)
+        min_iterations = self.config.min_iterations
+        require_tool_execution = self.config.require_tool_execution
+
         # Detect query type for dynamic timeout
         query_type, complexity = self._detect_query_type(query)
         file_count = len(self._extract_file_list())
@@ -1943,7 +1957,10 @@ Remove duplicates (same line, same issue). Keep all unique findings with their l
         import sys
         print(f"[REPL] Query type: {query_type}, complexity: {complexity}", file=sys.stderr)
         print(f"[REPL] Dynamic timeout: {timeout_seconds}s for {file_count} files", file=sys.stderr)
-        print(f"[REPL] Max iterations: {max_iterations}", file=sys.stderr)
+        print(f"[REPL] Iterations: min={min_iterations}, max={max_iterations}", file=sys.stderr)
+
+        # Track tool executions for require_tool_execution
+        tool_executed = False
 
         # Sanitize query to prevent format string issues and clean markdown
         safe_query = self.sanitize_query(query)
@@ -2034,10 +2051,37 @@ Select the appropriate tool(s), run them, verify results, then set FINAL_ANSWER.
             if not code_blocks:
                 # No code - check if we have a final answer
                 if self.state.final_answer:
+                    # Enforce minimum iterations before accepting result
+                    if iteration < min_iterations - 1:
+                        print(f"[REPL] Result available but below min_iterations ({iteration+1}/{min_iterations}), continuing...", file=sys.stderr)
+                        messages.append({"role": "assistant", "content": assistant_msg})
+                        messages.append({
+                            "role": "user",
+                            "content": f"Good progress! Please verify and expand your analysis. (iteration {iteration+1}/{min_iterations} minimum)"
+                        })
+                        continue
+                    # Enforce tool execution requirement
+                    if require_tool_execution and not tool_executed:
+                        print(f"[REPL] No tool executed yet, requiring tool execution...", file=sys.stderr)
+                        messages.append({"role": "assistant", "content": assistant_msg})
+                        messages.append({
+                            "role": "user",
+                            "content": "Please run at least one analysis tool (e.g., find_secrets(), run_security_scan()) before finalizing."
+                        })
+                        continue
                     return self.state.final_answer
 
                 # Check if assistant is asking for clarification or done
                 if any(phrase in assistant_msg.lower() for phrase in ["final_answer", "no issues found", "analysis complete", "in conclusion"]):
+                    # Enforce minimum iterations before accepting "done"
+                    if iteration < min_iterations - 1:
+                        print(f"[REPL] Early completion attempted at iteration {iteration+1}, enforcing min_iterations...", file=sys.stderr)
+                        messages.append({"role": "assistant", "content": assistant_msg})
+                        messages.append({
+                            "role": "user",
+                            "content": f"Please run a tool to verify this conclusion. We need at least {min_iterations} iterations. (current: {iteration+1})"
+                        })
+                        continue
                     return assistant_msg
 
                 # No code and no answer - prompt to continue
@@ -2057,9 +2101,30 @@ Select the appropriate tool(s), run them, verify results, then set FINAL_ANSWER.
                 outputs.append(output if output else "(no output)")
                 if success:
                     any_success = True
+                    # Track tool execution (check if any tool was called)
+                    tool_patterns = [
+                        r'find_secrets\s*\(', r'find_sql_injection\s*\(', r'find_xss\s*\(',
+                        r'find_force_unwraps\s*\(', r'find_retain_cycles\s*\(',
+                        r'run_security_scan\s*\(', r'run_ios_scan\s*\(', r'run_quality_scan\s*\(',
+                        r'find_persistence_patterns\s*\(', r'find_state_mutations\s*\(',
+                        r'map_architecture\s*\(', r'find_long_functions\s*\(',
+                        r'search_pattern\s*\(', r'llm_query\s*\(', r'analyze_file\s*\(',
+                    ]
+                    if any(re.search(pattern, code) for pattern in tool_patterns):
+                        tool_executed = True
+                        print(f"[REPL] Tool execution detected", file=sys.stderr)
 
                 # Check if FINAL_ANSWER was set
                 if self.state.final_answer:
+                    # Enforce minimum iterations
+                    if iteration < min_iterations - 1:
+                        print(f"[REPL] FINAL_ANSWER set but below min_iterations ({iteration+1}/{min_iterations})", file=sys.stderr)
+                        # Don't return yet, continue iterating
+                        continue
+                    # Enforce tool execution
+                    if require_tool_execution and not tool_executed:
+                        print(f"[REPL] FINAL_ANSWER set but no tool executed, continuing...", file=sys.stderr)
+                        continue
                     return self.state.final_answer
 
             # L5: Adaptive retry with prompt modification on failures

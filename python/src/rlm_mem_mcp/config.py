@@ -139,11 +139,21 @@ class RLMConfig:
     )
 
     # Iteration Limits (configurable per feedback)
+    # RLM_MAX_ITERATIONS: Maximum code execution rounds (default: 25)
+    # RLM_MIN_ITERATIONS: Minimum iterations before allowing early exit (default: 3)
+    # RLM_MAX_FAILURES: Consecutive failures before fallback (default: 3)
     max_iterations: int = field(
         default_factory=lambda: int(os.getenv("RLM_MAX_ITERATIONS", "25"))
     )
+    min_iterations: int = field(
+        default_factory=lambda: int(os.getenv("RLM_MIN_ITERATIONS", "3"))
+    )
     max_consecutive_failures: int = field(
         default_factory=lambda: int(os.getenv("RLM_MAX_FAILURES", "3"))
+    )
+    # Force at least one tool execution before accepting "no findings"
+    require_tool_execution: bool = field(
+        default_factory=lambda: os.getenv("RLM_REQUIRE_TOOL_EXECUTION", "true").lower() == "true"
     )
 
     def calculate_timeout(
