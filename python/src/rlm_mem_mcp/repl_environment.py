@@ -76,6 +76,43 @@ class UnsafeCodeError(Exception):
     pass
 
 
+def strip_markdown_fences_from_content(content_lines: list[str]) -> list[str]:
+    """
+    Strip markdown code fences from file content lines.
+
+    When files are combined with get_combined_content(), each file's content
+    is wrapped in markdown fences like:
+        ```language
+        actual content
+        ```
+
+    This function removes those fences to get the actual file content.
+
+    Args:
+        content_lines: Lines of content that may include markdown fences
+
+    Returns:
+        Lines with markdown fences removed
+    """
+    if not content_lines:
+        return content_lines
+
+    result = list(content_lines)
+
+    # Remove opening fence (```language) - it's typically the first line
+    if result and result[0].strip().startswith('```'):
+        result = result[1:]
+
+    # Remove closing fence (```) - check last few lines for trailing whitespace
+    while result and (result[-1].strip() == '```' or result[-1].strip() == ''):
+        if result[-1].strip() == '```':
+            result = result[:-1]
+            break
+        result = result[:-1]
+
+    return result
+
+
 def attempt_syntax_repair(code: str, error: SyntaxError) -> tuple[str | None, str]:
     """
     Attempt to automatically repair common syntax errors in LLM-generated code.
@@ -486,9 +523,27 @@ result = find_python_security()   # Find Python issues (pickle, yaml.load, bare 
 
 ### iOS/Swift Tools
 ```python
+# Core crash/safety issues
 result = find_force_unwraps()          # Find ! force unwraps (excluding !=)
 result = find_retain_cycles()          # Find closures missing [weak self]
 result = find_main_thread_violations() # Find UI updates off main thread
+result = find_weak_self_issues()       # Find missing [weak self] in closures
+result = find_swiftdata_issues()       # Find SwiftData threading issues
+
+# Swift Concurrency
+result = find_async_await_issues()     # Find async/await pitfalls
+result = find_sendable_issues()        # Find Sendable conformance issues
+
+# Memory & Error Handling
+result = find_memory_management_issues() # Find memory leaks, unowned issues
+result = find_error_handling_issues()    # Find empty catch, try? issues
+
+# SwiftUI & Performance
+result = find_swiftui_performance_issues() # Find SwiftUI antipatterns
+
+# Quality & Accessibility
+result = find_accessibility_issues()   # Find missing accessibility labels
+result = find_localization_issues()    # Find hardcoded strings
 ```
 
 ### Persistence/State Tools
@@ -1021,6 +1076,9 @@ Start by selecting the appropriate tool(s), run them, VERIFY results, then set F
                     # Get file content (skip the filename line)
                     content_lines = lines[1:]
 
+                    # Strip markdown fences from content
+                    content_lines = strip_markdown_fences_from_content(content_lines)
+
                     # Add line numbers
                     numbered_lines = []
                     for i, line in enumerate(content_lines[:max_lines], 1):
@@ -1063,7 +1121,9 @@ Start by selecting the appropriate tool(s), run them, VERIFY results, then set F
                     continue
                 file_path = lines[0].strip()
                 if filepath in file_path or file_path.endswith(filepath):
-                    content = "\n".join(lines[1:])
+                    # Strip markdown fences from content
+                    content_lines = strip_markdown_fences_from_content(lines[1:])
+                    content = "\n".join(content_lines)
                     actual_filepath = file_path
                     break
 
@@ -1123,7 +1183,9 @@ Start by selecting the appropriate tool(s), run them, VERIFY results, then set F
                     continue
                 file_path = lines[0].strip()
                 if filepath in file_path or file_path.endswith(filepath):
-                    content = "\n".join(lines[1:])
+                    # Strip markdown fences from content
+                    content_lines = strip_markdown_fences_from_content(lines[1:])
+                    content = "\n".join(content_lines)
                     actual_filepath = file_path
                     break
 
@@ -1172,7 +1234,9 @@ Start by selecting the appropriate tool(s), run them, VERIFY results, then set F
                     continue
                 file_path = lines[0].strip()
                 if filepath in file_path or file_path.endswith(filepath):
-                    content = "\n".join(lines[1:])
+                    # Strip markdown fences from content
+                    content_lines = strip_markdown_fences_from_content(lines[1:])
+                    content = "\n".join(content_lines)
                     actual_filepath = file_path
                     break
 
@@ -1235,7 +1299,9 @@ Start by selecting the appropriate tool(s), run them, VERIFY results, then set F
                         continue
                     file_path = lines[0].strip()
                     if filepath in file_path or file_path.endswith(filepath):
-                        content = "\n".join(lines[1:])
+                        # Strip markdown fences from content
+                        content_lines_raw = strip_markdown_fences_from_content(lines[1:])
+                        content = "\n".join(content_lines_raw)
                         actual_filepath = file_path
                         break
 
@@ -1341,7 +1407,8 @@ Start by selecting the appropriate tool(s), run them, VERIFY results, then set F
             content = prompt[start:end]
 
             issues = []
-            lines = content.split('\n')
+            # Strip markdown fences from content
+            lines = strip_markdown_fences_from_content(content.split('\n'))
 
             # Default to all issue types
             if not issue_types:
@@ -1601,26 +1668,39 @@ Remove duplicates (same line, same issue). Keep all unique findings with their l
             results = []
             current_file = None
             line_num = 0
+            in_fence = False  # Track if we're inside a markdown fence
 
             for line in prompt.split('\n'):
                 if line.startswith("### File:"):
                     current_file = line.replace("### File:", "").strip()
                     line_num = 0
+                    in_fence = False  # Reset fence state for new file
                     continue
 
-                line_num += 1
+                # Skip markdown fence lines (```language and ```)
+                stripped = line.strip()
+                if stripped.startswith('```'):
+                    if not in_fence:
+                        in_fence = True  # Opening fence
+                    else:
+                        in_fence = False  # Closing fence
+                    continue
 
-                if current_file and (not file_filter or current_file.endswith(file_filter)):
-                    try:
-                        if re.search(pattern, line, re.IGNORECASE):
-                            results.append({
-                                "file": current_file,
-                                "line": line_num,
-                                "content": line.strip()[:200],
-                                "match": re.search(pattern, line, re.IGNORECASE).group(0)
-                            })
-                    except re.error:
-                        pass
+                # Only count lines that are inside the code fence (actual file content)
+                if in_fence:
+                    line_num += 1
+
+                    if current_file and (not file_filter or current_file.endswith(file_filter)):
+                        try:
+                            if re.search(pattern, line, re.IGNORECASE):
+                                results.append({
+                                    "file": current_file,
+                                    "line": line_num,
+                                    "content": line.strip()[:200],
+                                    "match": re.search(pattern, line, re.IGNORECASE).group(0)
+                                })
+                        except re.error:
+                            pass
 
             return results[:100]  # Limit results
 
@@ -1717,7 +1797,7 @@ Remove duplicates (same line, same issue). Keep all unique findings with their l
             "find_xss": tools.find_xss_vulnerabilities,
             "find_python_security": tools.find_python_security,
 
-            # iOS/Swift tools
+            # iOS/Swift tools - Core
             "find_force_unwraps": tools.find_force_unwraps,
             "find_retain_cycles": tools.find_retain_cycles,
             "find_main_thread_violations": tools.find_main_thread_violations,
@@ -1725,6 +1805,16 @@ Remove duplicates (same line, same issue). Keep all unique findings with their l
             "find_cloudkit_issues": tools.find_cloudkit_issues,
             "find_deprecated_apis": tools.find_deprecated_apis,
             "find_swiftdata_issues": tools.find_swiftdata_issues,
+            # iOS/Swift tools - Concurrency & Performance
+            "find_async_await_issues": tools.find_async_await_issues,
+            "find_sendable_issues": tools.find_sendable_issues,
+            "find_swiftui_performance_issues": tools.find_swiftui_performance_issues,
+            # iOS/Swift tools - Memory & Error Handling
+            "find_memory_management_issues": tools.find_memory_management_issues,
+            "find_error_handling_issues": tools.find_error_handling_issues,
+            # iOS/Swift tools - Quality & Accessibility
+            "find_accessibility_issues": tools.find_accessibility_issues,
+            "find_localization_issues": tools.find_localization_issues,
 
             # Quality tools
             "find_long_functions": tools.find_long_functions,

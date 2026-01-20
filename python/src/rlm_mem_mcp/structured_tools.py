@@ -310,20 +310,59 @@ class StructuredTools:
             return line_num  # Can't validate, return as-is
         return min(max(1, line_num), max_lines)
 
+    def _strip_markdown_fences(self, content: str) -> str:
+        """
+        Strip markdown code fences from file content.
+
+        The content format is:
+        ```language
+        actual content
+        ```
+
+        This method removes the opening ```language and closing ``` lines.
+        """
+        if not content:
+            return content
+
+        lines = content.split('\n')
+
+        # Remove opening fence (```language)
+        if lines and lines[0].strip().startswith('```'):
+            lines = lines[1:]
+
+        # Remove closing fence (```)
+        # Check last few lines in case there's trailing whitespace
+        while lines and (lines[-1].strip() == '```' or lines[-1].strip() == ''):
+            if lines[-1].strip() == '```':
+                lines = lines[:-1]
+                break
+            lines = lines[:-1]
+
+        return '\n'.join(lines)
+
     def _get_file_content(self, filepath: str) -> str | None:
-        """Get content of a specific file."""
+        """Get content of a specific file (with markdown fences stripped)."""
+        raw_content = None
+
         if filepath not in self.file_index:
             # Try partial match
             for fp in self.file_index:
                 if filepath in fp or fp.endswith(filepath):
                     start, end = self.file_index[fp]
-                    return self.content[start:end]
+                    raw_content = self.content[start:end]
+                    break
+        else:
+            start, end = self.file_index[filepath]
+            raw_content = self.content[start:end]
+
+        if raw_content is None:
             return None
-        start, end = self.file_index[filepath]
-        return self.content[start:end]
+
+        # Strip markdown fences to get actual file content
+        return self._strip_markdown_fences(raw_content)
 
     def _get_file_lines(self, filepath: str) -> list[str] | None:
-        """Get lines of a specific file."""
+        """Get lines of a specific file (with markdown fences stripped)."""
         content = self._get_file_content(filepath)
         if content is None:
             return None
@@ -485,12 +524,16 @@ class StructuredTools:
         """
         results = []
 
-        for filepath, (start, end) in self.file_index.items():
+        for filepath in self.file_index.keys():
             # Apply file filter
             if file_filter and not filepath.endswith(file_filter):
                 continue
 
-            file_content = self.content[start:end]
+            # Use _get_file_content to get fence-stripped content
+            file_content = self._get_file_content(filepath)
+            if file_content is None:
+                continue
+
             lines = file_content.split('\n')
             max_lines = len(lines)
 
@@ -1496,11 +1539,13 @@ class StructuredTools:
         """
         result = ToolResult(tool_name="CloudKit Error Handling Scanner", files_scanned=len(self.files))
 
-        for filepath, (start, end) in self.file_index.items():
+        for filepath in self.file_index.keys():
             if not filepath.endswith('.swift'):
                 continue
 
-            file_content = self.content[start:end]
+            file_content = self._get_file_content(filepath)
+            if file_content is None:
+                continue
 
             # Only check files that use CloudKit
             if 'CloudKit' not in file_content and 'CKRecord' not in file_content:
@@ -2098,6 +2143,411 @@ class StructuredTools:
                 ))
 
         result.summary = f"Found {len(result.findings)} @StateObject issues"
+        return result
+
+    def find_async_await_issues(self) -> ToolResult:
+        """
+        Find common async/await issues in Swift.
+
+        Searches for:
+        - Missing await on async calls
+        - Task.detached without explicit priority
+        - Async in synchronous context
+        - Missing Task cancellation checks
+        """
+        result = ToolResult(tool_name="Async/Await Scanner", files_scanned=len(self.files))
+
+        patterns = [
+            # Task.detached without priority (can lead to unexpected behavior)
+            (r'''Task\.detached\s*\{''', "Task.detached without priority - consider explicit priority",
+             Severity.LOW, "Use Task.detached(priority: .userInitiated) for clarity"),
+
+            # Async let without await in same scope
+            (r'''async\s+let\s+\w+\s*=''', "async let binding - ensure corresponding await exists",
+             Severity.INFO, "Verify await is used for this async let"),
+
+            # Potential race condition - multiple async operations without proper grouping
+            (r'''(await\s+\w+[^\n]*\n\s*await\s+)''', "Sequential awaits - consider TaskGroup for parallelism",
+             Severity.INFO, "Use withTaskGroup for parallel execution if operations are independent"),
+
+            # Missing try with async throwing function
+            (r'''await\s+(?!try)(\w+\.)?(?:fetch|load|save|delete|upload|download)\w*\(''',
+             "Async operation may throw - consider using try await", Severity.MEDIUM,
+             "Add try before await if the function throws"),
+
+            # Task without storing reference (potential memory/cancellation issue)
+            (r'''^\s*Task\s*\{[^}]+\}(?!\s*\.cancel)''', "Task created without storing reference",
+             Severity.LOW, "Store Task reference if cancellation support is needed"),
+        ]
+
+        for pattern, issue, severity, fix in patterns:
+            matches = self._search_pattern(pattern, file_filter=".swift")
+            for filepath, line_num, line, match in matches:
+                if self._is_in_comment(line, filepath):
+                    continue
+
+                result.findings.append(Finding(
+                    file=filepath,
+                    line=line_num,
+                    code=line.strip()[:200],
+                    issue=issue,
+                    confidence=Confidence.MEDIUM,
+                    severity=severity,
+                    fix=fix,
+                    category="async-await",
+                ))
+
+        result.summary = f"Found {len(result.findings)} async/await issues"
+        return result
+
+    def find_sendable_issues(self) -> ToolResult:
+        """
+        Find Swift Sendable conformance issues.
+
+        Searches for:
+        - Classes passed across actor boundaries without Sendable
+        - Mutable state in Sendable types
+        - @unchecked Sendable usage
+        """
+        result = ToolResult(tool_name="Sendable Scanner", files_scanned=len(self.files))
+
+        patterns = [
+            # @unchecked Sendable (potential data race)
+            (r'''@unchecked\s+Sendable''', "@unchecked Sendable - potential data race",
+             Severity.HIGH, "Verify thread safety or make type properly Sendable"),
+
+            # Class with Sendable but mutable properties
+            (r'''class\s+\w+[^{]*:\s*[^{]*Sendable[^{]*\{[^}]*\bvar\s+''',
+             "Sendable class with mutable var - potential data race", Severity.HIGH,
+             "Use let properties or ensure thread-safe access"),
+
+            # nonisolated(unsafe) usage
+            (r'''nonisolated\s*\(\s*unsafe\s*\)''', "nonisolated(unsafe) - bypasses actor isolation",
+             Severity.HIGH, "Ensure thread safety is manually guaranteed"),
+
+            # @Sendable closure without capture list
+            (r'''@Sendable\s*\{(?!\s*\[)''', "@Sendable closure may need capture list",
+             Severity.MEDIUM, "Add capture list to clarify value semantics"),
+        ]
+
+        for pattern, issue, severity, fix in patterns:
+            matches = self._search_pattern(pattern, file_filter=".swift")
+            for filepath, line_num, line, match in matches:
+                if self._is_in_comment(line, filepath):
+                    continue
+
+                result.findings.append(Finding(
+                    file=filepath,
+                    line=line_num,
+                    code=line.strip()[:200],
+                    issue=issue,
+                    confidence=Confidence.HIGH,
+                    severity=severity,
+                    fix=fix,
+                    category="sendable",
+                ))
+
+        result.summary = f"Found {len(result.findings)} Sendable issues"
+        return result
+
+    def find_swiftui_performance_issues(self) -> ToolResult:
+        """
+        Find SwiftUI performance antipatterns.
+
+        Searches for:
+        - Heavy computation in body
+        - GeometryReader misuse
+        - Excessive view updates
+        - Large view hierarchies
+        """
+        result = ToolResult(tool_name="SwiftUI Performance Scanner", files_scanned=len(self.files))
+
+        patterns = [
+            # Computation in body (should use computed property or onAppear)
+            (r'''var\s+body\s*:\s*some\s+View\s*\{[^}]*(?:for|while|\.filter|\.map|\.sorted)[^}]*\}''',
+             "Heavy computation in body - move to computed property or onAppear", Severity.MEDIUM,
+             "Extract computation to a computed property or perform in onAppear"),
+
+            # GeometryReader inside ScrollView (can cause performance issues)
+            (r'''ScrollView[^{]*\{[^}]*GeometryReader''', "GeometryReader inside ScrollView - may cause layout issues",
+             Severity.MEDIUM, "Consider using preference keys or coordinateSpace instead"),
+
+            # @State with reference type
+            (r'''@State\s+(?:private\s+)?var\s+\w+\s*:\s*[A-Z]\w*(?:Class|Manager|Service|Controller)''',
+             "@State with reference type - use @StateObject instead", Severity.HIGH,
+             "Change to @StateObject for reference types"),
+
+            # AnyView usage (type erasure prevents SwiftUI optimizations)
+            (r'''AnyView\s*\(''', "AnyView erases type information - hurts performance",
+             Severity.MEDIUM, "Use @ViewBuilder or conditional modifiers instead"),
+
+            # Multiple .onAppear on same view (potential duplicate work)
+            (r'''\.onAppear\s*\{[^}]+\}[^}]*\.onAppear''', "Multiple onAppear modifiers - may cause duplicate work",
+             Severity.LOW, "Consolidate into single onAppear"),
+
+            # Animation without transaction (can cause unexpected behavior)
+            (r'''withAnimation\s*\{[^}]*self\.\w+\s*=[^}]*self\.\w+\s*=''',
+             "Multiple state changes in animation - may cause issues", Severity.LOW,
+             "Consider using explicit Animation or transaction"),
+        ]
+
+        for pattern, issue, severity, fix in patterns:
+            matches = self._search_pattern(pattern, file_filter=".swift")
+            for filepath, line_num, line, match in matches:
+                if self._is_in_comment(line, filepath):
+                    continue
+
+                result.findings.append(Finding(
+                    file=filepath,
+                    line=line_num,
+                    code=line.strip()[:200],
+                    issue=issue,
+                    confidence=Confidence.MEDIUM,
+                    severity=severity,
+                    fix=fix,
+                    category="swiftui-performance",
+                ))
+
+        result.summary = f"Found {len(result.findings)} SwiftUI performance issues"
+        return result
+
+    def find_accessibility_issues(self) -> ToolResult:
+        """
+        Find missing accessibility support in iOS apps.
+
+        Searches for:
+        - Images without accessibility labels
+        - Interactive elements without labels
+        - Missing accessibility hints
+        """
+        result = ToolResult(tool_name="Accessibility Scanner", files_scanned=len(self.files))
+
+        patterns = [
+            # Image without accessibility label
+            (r'''Image\s*\([^)]+\)(?!.*\.accessibilityLabel)''',
+             "Image without accessibilityLabel", Severity.MEDIUM,
+             "Add .accessibilityLabel() or .accessibilityHidden(true) for decorative images"),
+
+            # Button without label (using only image)
+            (r'''Button\s*\{[^}]*Image\s*\([^)]+\)[^}]*\}\s*label:\s*\{[^}]*Image''',
+             "Button with only image - needs accessibilityLabel", Severity.HIGH,
+             "Add .accessibilityLabel() to describe the button action"),
+
+            # Custom gesture without accessibility
+            (r'''\.gesture\s*\([^)]+\)(?!.*\.accessibilityAction)''',
+             "Custom gesture without accessibilityAction", Severity.MEDIUM,
+             "Add .accessibilityAction() for VoiceOver users"),
+
+            # Color used for meaning without label
+            (r'''\.foregroundColor\s*\(\s*\.\w*(?:red|green|yellow)\w*\s*\)(?!.*accessibility)''',
+             "Color conveying meaning - ensure accessibility", Severity.LOW,
+             "Don't rely on color alone; add text or symbols"),
+
+            # Icon-only tab items
+            (r'''\.tabItem\s*\{[^}]*Image[^}]*\}(?![^}]*Text)''',
+             "Tab item with only image - add label", Severity.MEDIUM,
+             "Add Text to tabItem for accessibility"),
+        ]
+
+        for pattern, issue, severity, fix in patterns:
+            matches = self._search_pattern(pattern, file_filter=".swift")
+            for filepath, line_num, line, match in matches:
+                if self._is_in_comment(line, filepath):
+                    continue
+
+                result.findings.append(Finding(
+                    file=filepath,
+                    line=line_num,
+                    code=line.strip()[:200],
+                    issue=issue,
+                    confidence=Confidence.MEDIUM,
+                    severity=severity,
+                    fix=fix,
+                    category="accessibility",
+                ))
+
+        result.summary = f"Found {len(result.findings)} accessibility issues"
+        return result
+
+    def find_localization_issues(self) -> ToolResult:
+        """
+        Find hardcoded strings that should be localized.
+
+        Searches for:
+        - Hardcoded UI strings
+        - Missing String(localized:) usage
+        - NSLocalizedString without comment
+        """
+        result = ToolResult(tool_name="Localization Scanner", files_scanned=len(self.files))
+
+        patterns = [
+            # Text with hardcoded string (not using localized key)
+            (r'''Text\s*\(\s*"[A-Z][a-z]+(?:\s+[a-z]+)+"\s*\)(?!.*LocalizedStringKey)''',
+             "Hardcoded string in Text - should be localized", Severity.MEDIUM,
+             "Use String(localized:) or LocalizedStringKey"),
+
+            # Button label with hardcoded string
+            (r'''Button\s*\(\s*"[A-Z][a-z]+(?:\s+[a-z]+)*"\s*[,)]''',
+             "Hardcoded button label - should be localized", Severity.MEDIUM,
+             "Use String(localized:) for button labels"),
+
+            # Alert with hardcoded strings
+            (r'''\.alert\s*\(\s*"[A-Z][a-z]+''',
+             "Hardcoded alert title - should be localized", Severity.MEDIUM,
+             "Use String(localized:) for alert messages"),
+
+            # NSLocalizedString without comment
+            (r'''NSLocalizedString\s*\([^,]+,\s*comment\s*:\s*""\s*\)''',
+             "NSLocalizedString with empty comment - add context for translators", Severity.LOW,
+             "Provide meaningful comment for translators"),
+
+            # Print statements with user-visible text
+            (r'''print\s*\(\s*"(?:Error|Warning|Success|Failed)[^"]*"''',
+             "User-visible message in print - consider proper error handling", Severity.LOW,
+             "Use proper error handling and localized messages"),
+        ]
+
+        for pattern, issue, severity, fix in patterns:
+            matches = self._search_pattern(pattern, file_filter=".swift")
+            for filepath, line_num, line, match in matches:
+                if self._is_in_comment(line, filepath):
+                    continue
+
+                # Skip test files
+                if '/test' in filepath.lower() or 'test' in filepath.lower():
+                    continue
+
+                result.findings.append(Finding(
+                    file=filepath,
+                    line=line_num,
+                    code=line.strip()[:200],
+                    issue=issue,
+                    confidence=Confidence.MEDIUM,
+                    severity=severity,
+                    fix=fix,
+                    category="localization",
+                ))
+
+        result.summary = f"Found {len(result.findings)} localization issues"
+        return result
+
+    def find_memory_management_issues(self) -> ToolResult:
+        """
+        Find memory management issues in Swift.
+
+        Searches for:
+        - Potential memory leaks
+        - Improper use of unowned
+        - Circular references
+        """
+        result = ToolResult(tool_name="Memory Management Scanner", files_scanned=len(self.files))
+
+        patterns = [
+            # unowned with optional (crash risk)
+            (r'''unowned\s+var\s+\w+\s*:\s*\w+\?''',
+             "unowned with optional type - will crash if nil", Severity.CRITICAL,
+             "Use weak instead of unowned for optional types"),
+
+            # Stored closure without capture list
+            (r'''(?:var|let)\s+\w+\s*:\s*\([^)]*\)\s*->\s*\w+\s*=\s*\{(?!\s*\[)''',
+             "Stored closure without capture list - potential retain cycle", Severity.MEDIUM,
+             "Add [weak self] or [unowned self] to prevent retain cycles"),
+
+            # Strong reference in NotificationCenter observer
+            (r'''NotificationCenter\.default\.addObserver\s*\([^)]*self[^)]*\{(?!\s*\[weak)''',
+             "NotificationCenter observer may retain self", Severity.HIGH,
+             "Use [weak self] in observer closure"),
+
+            # KVO without invalidation
+            (r'''\.observe\s*\([^)]+\)\s*\{[^}]*self\.''',
+             "KVO observation with self - ensure proper invalidation", Severity.MEDIUM,
+             "Store observation token and invalidate in deinit"),
+
+            # Timer without invalidation
+            (r'''Timer\.scheduledTimer[^}]+\}(?!.*invalidate)''',
+             "Timer may not be invalidated - potential memory leak", Severity.MEDIUM,
+             "Store timer reference and call invalidate() in deinit"),
+        ]
+
+        for pattern, issue, severity, fix in patterns:
+            matches = self._search_pattern(pattern, file_filter=".swift")
+            for filepath, line_num, line, match in matches:
+                if self._is_in_comment(line, filepath):
+                    continue
+
+                result.findings.append(Finding(
+                    file=filepath,
+                    line=line_num,
+                    code=line.strip()[:200],
+                    issue=issue,
+                    confidence=Confidence.MEDIUM,
+                    severity=severity,
+                    fix=fix,
+                    category="memory-management",
+                ))
+
+        result.summary = f"Found {len(result.findings)} memory management issues"
+        return result
+
+    def find_error_handling_issues(self) -> ToolResult:
+        """
+        Find error handling issues in Swift.
+
+        Searches for:
+        - Empty catch blocks
+        - try? silencing errors
+        - Missing error propagation
+        """
+        result = ToolResult(tool_name="Error Handling Scanner", files_scanned=len(self.files))
+
+        patterns = [
+            # Empty catch block
+            (r'''catch\s*\{[\s\n]*\}''', "Empty catch block - errors are silently ignored",
+             Severity.HIGH, "Log the error or handle it appropriately"),
+
+            # catch with only print
+            (r'''catch\s*\{[\s\n]*print\s*\([^)]+\)[\s\n]*\}''',
+             "Catch block only prints - consider proper error handling", Severity.MEDIUM,
+             "Show user-facing error message or recover gracefully"),
+
+            # try? without nil handling
+            (r'''try\?\s+\w+[^\n]*\n(?!\s*(?:guard|if|else))''',
+             "try? without nil check - error is silently ignored", Severity.MEDIUM,
+             "Handle the nil case or use try with do-catch"),
+
+            # fatalError in production code
+            (r'''fatalError\s*\(\s*"[^"]*"\s*\)''',
+             "fatalError in code - will crash in production", Severity.HIGH,
+             "Use proper error handling or preconditionFailure for debug-only"),
+
+            # Force try in non-constant context
+            (r'''(?<!static\s+let\s+\w+\s*=\s*)try!\s+(?!NSRegularExpression|JSONDecoder|JSONEncoder)''',
+             "try! can crash at runtime - use do-catch", Severity.HIGH,
+             "Replace try! with do-catch error handling"),
+        ]
+
+        for pattern, issue, severity, fix in patterns:
+            matches = self._search_pattern(pattern, file_filter=".swift")
+            for filepath, line_num, line, match in matches:
+                if self._is_in_comment(line, filepath):
+                    continue
+
+                # Skip test files for fatalError
+                if 'fatalError' in line and ('/test' in filepath.lower() or 'test' in filepath.lower()):
+                    continue
+
+                result.findings.append(Finding(
+                    file=filepath,
+                    line=line_num,
+                    code=line.strip()[:200],
+                    issue=issue,
+                    confidence=Confidence.HIGH,
+                    severity=severity,
+                    fix=fix,
+                    category="error-handling",
+                ))
+
+        result.summary = f"Found {len(result.findings)} error handling issues"
         return result
 
     # ===== PYTHON TOOLS =====
@@ -3443,20 +3893,30 @@ class StructuredTools:
             self.find_main_thread_violations(),
             self.find_weak_self_issues(),
             self.find_cloudkit_issues(),
-            self.find_cloudkit_sync_issues(),  # New: CloudKit sync patterns
+            self.find_cloudkit_sync_issues(),
             self.find_swiftdata_issues(),
             self.find_insecure_storage(),
-            self.find_keychain_issues(),  # New: Keychain security
+            self.find_keychain_issues(),
             self.find_input_sanitization_issues(),
             self.find_missing_jailbreak_detection(),
             self.find_task_cancellation_issues(),
             self.find_mainactor_issues(),
             self.find_stateobject_issues(),
+            # Swift concurrency & async/await
+            self.find_async_await_issues(),
+            self.find_sendable_issues(),
+            # Memory & error handling
+            self.find_memory_management_issues(),
+            self.find_error_handling_issues(),
+            # SwiftUI performance
+            self.find_swiftui_performance_issues(),
         ]
 
-        # Only include style/quality checks if explicitly requested
+        # Only include style/quality/accessibility checks if explicitly requested
         if include_quality:
             all_results.append(self.find_deprecated_apis())
+            all_results.append(self.find_accessibility_issues())
+            all_results.append(self.find_localization_issues())
             all_results.extend(self.run_quality_scan(min_confidence="LOW"))
 
         # Filter by confidence

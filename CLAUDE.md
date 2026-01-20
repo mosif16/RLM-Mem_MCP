@@ -964,7 +964,11 @@ Token bucket algorithm:
 | Category | Tools |
 |----------|-------|
 | **Security** | `find_secrets()`, `find_sql_injection()`, `find_xss()`, `find_command_injection()`, `find_python_security()` |
-| **iOS/Swift** | `find_force_unwraps()`, `find_retain_cycles()`, `find_main_thread_violations()`, `find_weak_self_issues()` |
+| **iOS/Swift Core** | `find_force_unwraps()`, `find_retain_cycles()`, `find_main_thread_violations()`, `find_weak_self_issues()`, `find_swiftdata_issues()` |
+| **Swift Concurrency** | `find_async_await_issues()`, `find_sendable_issues()`, `find_mainactor_issues()`, `find_task_cancellation_issues()` |
+| **Swift Memory/Error** | `find_memory_management_issues()`, `find_error_handling_issues()` |
+| **SwiftUI** | `find_swiftui_performance_issues()`, `find_stateobject_issues()` |
+| **iOS Quality** | `find_accessibility_issues()`, `find_localization_issues()`, `find_deprecated_apis()` |
 | **Quality** | `find_long_functions()`, `find_complex_functions()`, `find_code_smells()`, `find_dead_code()`, `find_todos()` |
 | **TypeScript** | `analyze_typescript_imports()`, `trace_websocket_flow()`, `build_call_graph()` |
 | **Persistence** | `find_persistence_patterns()`, `find_state_mutations()` |
@@ -981,7 +985,36 @@ Token bucket algorithm:
 
 ---
 
-## Recent Improvements (v2.1)
+## Recent Improvements (v2.2)
+
+### Full Swift/iOS Support
+Comprehensive Swift file and iOS project support:
+
+**File Extensions Added:**
+- `.swift`, `.xcstrings`, `.strings`, `.stringsdict` - Code and localization
+- `.entitlements`, `.xcconfig`, `.plist` - Configuration
+- `.storyboard`, `.xib` - Interface Builder
+- `.metal`, `.intentdefinition`, `.modulemap` - Specialized files
+
+**Skip Directories Added:**
+- `DerivedData`, `.build`, `SourcePackages` - Build artifacts
+- `Pods`, `Carthage` - Dependency managers
+- `*.xcodeproj`, `*.xcworkspace`, `*.xcassets` - Xcode bundles
+- `*.framework`, `*.app`, `*.appex`, `*.dSYM` - Build outputs
+
+**New Swift Analysis Tools:**
+- `find_async_await_issues()` - Task.detached, sequential awaits, missing try await
+- `find_sendable_issues()` - @unchecked Sendable, nonisolated(unsafe), data races
+- `find_swiftui_performance_issues()` - AnyView, GeometryReader misuse, @State issues
+- `find_memory_management_issues()` - unowned optionals, missing weak self, timer leaks
+- `find_error_handling_issues()` - Empty catch, try? silencing, fatalError usage
+- `find_accessibility_issues()` - Missing labels, gesture accessibility
+- `find_localization_issues()` - Hardcoded strings, NSLocalizedString issues
+
+**Enhanced iOS Project Detection:**
+- Auto-detects iOS projects from Package.swift, Info.plist, Podfile, Cartfile
+- Recognizes iOS indicator files (AppDelegate.swift, ContentView.swift, etc.)
+- Improved tech stack detection for Apple frameworks
 
 ### Sanitizer Detection for XSS Scanner
 The XSS vulnerability scanner now recognizes common sanitization functions and reduces false positives:
@@ -1023,5 +1056,5 @@ MIT License - see LICENSE for details.
 ---
 
 **Last Updated**: January 2026
-**Version**: 2.1
+**Version**: 2.2
 **Status**: Production Ready

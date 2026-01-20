@@ -78,6 +78,27 @@ class ProjectAnalyzer:
         "go.mod",
         "build.gradle",
         "pom.xml",
+        # iOS-specific config files
+        "Info.plist",
+        "Podfile",
+        "Cartfile",
+        ".xcconfig",
+    ]
+
+    # iOS-specific indicator files and directories
+    IOS_INDICATORS = [
+        "Package.swift",
+        "project.pbxproj",
+        "Info.plist",
+        "Podfile",
+        "Cartfile",
+        "AppDelegate.swift",
+        "SceneDelegate.swift",
+        "ContentView.swift",
+        ".entitlements",
+        ".xcconfig",
+        ".xcassets",
+        "LaunchScreen.storyboard",
     ]
 
     # Patterns to extract file references from documentation
@@ -85,8 +106,9 @@ class ProjectAnalyzer:
         r'`([a-zA-Z0-9_/\-\.]+\.[a-zA-Z]{1,10})`',  # `path/to/file.ext`
         r'\*\*([a-zA-Z0-9_/\-\.]+\.[a-zA-Z]{1,10})\*\*',  # **path/to/file.ext**
         r'- ([a-zA-Z0-9_/\-\.]+\.[a-zA-Z]{1,10})',  # - path/to/file.ext
-        r'([A-Z][a-zA-Z]+(?:View|Controller|Manager|Service|Model|Handler)\.swift)',  # SwiftUIView.swift
+        r'([A-Z][a-zA-Z]+(?:View|ViewController|Controller|Manager|Service|Model|Handler|Coordinator|Router|Repository|UseCase|Interactor)\.swift)',  # SwiftUIView.swift
         r'([a-z_]+\.py)',  # python_file.py
+        r'([A-Z][a-zA-Z]+(?:App|Scene)\.swift)',  # App entry points
     ]
 
     # Directory patterns
@@ -166,6 +188,8 @@ class ProjectAnalyzer:
         # Check metadata files first
         if "Package.swift" in metadata or "project.pbxproj" in metadata:
             return "ios"
+        if "Info.plist" in metadata or "Podfile" in metadata or "Cartfile" in metadata:
+            return "ios"
         if "Cargo.toml" in metadata:
             return "rust"
         if "go.mod" in metadata:
@@ -173,14 +197,37 @@ class ProjectAnalyzer:
         if "pyproject.toml" in metadata or "setup.py" in metadata:
             return "python"
 
+        # Check file names for iOS indicators
+        file_names = [f.relative_path.split('/')[-1] for f in collection.files]
+        ios_indicator_count = sum(
+            1 for indicator in self.IOS_INDICATORS
+            if any(indicator in name or name.endswith(indicator) for name in file_names)
+        )
+        if ios_indicator_count >= 2:
+            return "ios"
+
         # Check file extensions
         extensions = {}
         for f in collection.files:
             ext = f.extension.lower()
             extensions[ext] = extensions.get(ext, 0) + 1
 
+        # Check for iOS-specific extensions
+        ios_extensions = extensions.get(".swift", 0) + extensions.get(".m", 0) + extensions.get(".mm", 0)
+        ios_config_extensions = (
+            extensions.get(".storyboard", 0) +
+            extensions.get(".xib", 0) +
+            extensions.get(".entitlements", 0) +
+            extensions.get(".xcconfig", 0) +
+            extensions.get(".plist", 0)
+        )
+
+        # Strong iOS signal: Swift files + iOS config files
+        if extensions.get(".swift", 0) >= 1 and ios_config_extensions >= 1:
+            return "ios"
+
         # Determine by most common extension
-        if extensions.get(".swift", 0) > 5:
+        if ios_extensions > 5:
             return "ios"
         if extensions.get(".ts", 0) + extensions.get(".tsx", 0) > 5:
             return "typescript"
@@ -192,6 +239,10 @@ class ProjectAnalyzer:
             return "rust"
         if extensions.get(".go", 0) > 5:
             return "go"
+
+        # Even a single Swift file suggests iOS (more aggressive detection)
+        if extensions.get(".swift", 0) >= 1:
+            return "ios"
 
         return "unknown"
 
@@ -217,12 +268,24 @@ class ProjectAnalyzer:
         """Extract mentioned features from documentation."""
         features = []
 
-        # Look for feature keywords
+        # Look for feature keywords - iOS frameworks and common patterns
         feature_keywords = [
+            # Apple Frameworks
             'StoreKit', 'CloudKit', 'HealthKit', 'CoreData', 'SwiftUI', 'UIKit',
+            'SwiftData', 'Combine', 'CoreML', 'ARKit', 'RealityKit', 'MapKit',
+            'CoreLocation', 'CoreMotion', 'CoreBluetooth', 'AVFoundation',
+            'PhotosUI', 'Vision', 'NaturalLanguage', 'SpriteKit', 'SceneKit',
+            'GameKit', 'PassKit', 'WatchKit', 'WidgetKit', 'AppIntents',
+            'ActivityKit', 'WeatherKit', 'MusicKit', 'ShazamKit', 'CallKit',
+            'PushKit', 'UserNotifications', 'BackgroundTasks', 'CoreSpotlight',
+            # Architecture patterns
+            'MVVM', 'MVC', 'VIPER', 'Clean Architecture', 'TCA', 'Coordinator',
+            # Common features
             'authentication', 'authorization', 'payment', 'subscription', 'sync',
             'widget', 'extension', 'notification', 'background', 'offline',
             'API', 'REST', 'GraphQL', 'WebSocket', 'database', 'cache',
+            'push notification', 'deep link', 'universal link', 'App Clip',
+            'iCloud', 'Keychain', 'biometric', 'Face ID', 'Touch ID',
         ]
 
         content_lower = content.lower()

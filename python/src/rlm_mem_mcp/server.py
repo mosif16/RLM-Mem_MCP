@@ -481,28 +481,41 @@ def _perform_literal_search(content: str, search_terms: list[str]) -> str:
     results = []
     current_file = "unknown"
     line_number = 0
+    in_fence = False  # Track if we're inside a markdown fence
 
     # Track findings per search term
     findings: dict[str, list[dict]] = {term: [] for term in search_terms}
 
     for line in content.split('\n'):
-        line_number += 1
-
         # Track current file from headers
         if line.startswith("### File:"):
             current_file = line.replace("### File:", "").strip()
             line_number = 0  # Reset for new file
+            in_fence = False  # Reset fence state for new file
             continue
 
-        # Check each search term (case-insensitive)
-        line_lower = line.lower()
-        for term in search_terms:
-            if term.lower() in line_lower:
-                findings[term].append({
-                    "file": current_file,
-                    "line": line_number,
-                    "content": line.strip()[:200]  # Truncate long lines
-                })
+        # Skip markdown fence lines (```language and ```)
+        stripped = line.strip()
+        if stripped.startswith('```'):
+            if not in_fence:
+                in_fence = True  # Opening fence
+            else:
+                in_fence = False  # Closing fence
+            continue
+
+        # Only count and search lines inside code fence (actual file content)
+        if in_fence:
+            line_number += 1
+
+            # Check each search term (case-insensitive)
+            line_lower = line.lower()
+            for term in search_terms:
+                if term.lower() in line_lower:
+                    findings[term].append({
+                        "file": current_file,
+                        "line": line_number,
+                        "content": line.strip()[:200]  # Truncate long lines
+                    })
 
     # Format results
     output_parts = ["## Literal Search Results\n"]
@@ -762,6 +775,24 @@ def _execute_routed_tools(
                 all_results.append(tools.find_task_cancellation_issues())
             elif tool_name == "find_stateobject_issues":
                 all_results.append(tools.find_stateobject_issues())
+            # Swift Concurrency tools
+            elif tool_name == "find_async_await_issues":
+                all_results.append(tools.find_async_await_issues())
+            elif tool_name == "find_sendable_issues":
+                all_results.append(tools.find_sendable_issues())
+            # Memory & Error Handling tools
+            elif tool_name == "find_memory_management_issues":
+                all_results.append(tools.find_memory_management_issues())
+            elif tool_name == "find_error_handling_issues":
+                all_results.append(tools.find_error_handling_issues())
+            # SwiftUI Performance tools
+            elif tool_name == "find_swiftui_performance_issues":
+                all_results.append(tools.find_swiftui_performance_issues())
+            # Accessibility & Localization tools
+            elif tool_name == "find_accessibility_issues":
+                all_results.append(tools.find_accessibility_issues())
+            elif tool_name == "find_localization_issues":
+                all_results.append(tools.find_localization_issues())
         except Exception as e:
             print(f"[RLM Router] Tool {tool_name} failed: {e}", file=sys.stderr)
 
@@ -794,7 +825,15 @@ def _format_tool_results(
             confidence_counts[conf] = confidence_counts.get(conf, 0) + 1
 
     if total_findings == 0:
-        return f"## Scan Results\n\n**Tools Run**: {', '.join(tools_run)}\n**Findings**: None - code looks clean!\n", all_results
+        # Provide diagnostic info when no findings
+        files_scanned = sum(r.files_scanned for r in all_results) if all_results else 0
+        return (
+            f"## Scan Results\n\n"
+            f"**Tools Run**: {', '.join(tools_run)}\n"
+            f"**Files Scanned**: {files_scanned}\n"
+            f"**Findings**: None - code looks clean!\n\n"
+            f"*Tip: If you expected findings, try using scan_mode='all' or min_confidence='LOW' to see more results.*\n"
+        ), all_results
 
     # Build severity summary
     output_parts = [f"## Scan Results\n"]

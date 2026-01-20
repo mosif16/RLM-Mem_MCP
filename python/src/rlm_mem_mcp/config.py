@@ -30,6 +30,17 @@ DEFAULT_EXTENSIONS = {
     ".py", ".js", ".ts", ".jsx", ".tsx", ".go", ".rs", ".java",
     ".c", ".cpp", ".h", ".hpp", ".rb", ".php", ".swift", ".kt",
     ".scala", ".cs", ".m", ".mm", ".vue", ".svelte",
+    # iOS/Swift specific
+    ".xcstrings",       # Xcode localization (new format)
+    ".strings",         # Localization strings
+    ".stringsdict",     # Pluralization rules
+    ".entitlements",    # App entitlements
+    ".xcconfig",        # Build configuration
+    ".modulemap",       # Module maps for C/Obj-C interop
+    ".metal",           # Metal GPU shaders
+    ".intentdefinition", # Siri Intent definitions
+    ".xib",             # Interface Builder (legacy)
+    ".storyboard",      # Storyboard UI files
     # Config files
     ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".env",
     # Documentation
@@ -43,11 +54,29 @@ DEFAULT_EXTENSIONS = {
 
 # Default directories to skip
 DEFAULT_SKIP_DIRS = {
+    # General
     ".git", "node_modules", "__pycache__", "venv", ".venv",
     "dist", "build", ".next", "target", "vendor", ".cache",
     ".idea", ".vscode", "coverage", ".nyc_output", "eggs",
     "*.egg-info", ".tox", ".pytest_cache", ".mypy_cache",
     ".ruff_cache", "htmlcov", ".hypothesis",
+    # iOS/Xcode specific
+    "DerivedData",      # Xcode build artifacts
+    ".build",           # Swift Package Manager build directory
+    "Pods",             # CocoaPods dependencies
+    "Carthage",         # Carthage dependencies
+    "SourcePackages",   # Swift Package Manager cache
+    "*.xcodeproj",      # Xcode project bundles (internal files)
+    "*.xcworkspace",    # Xcode workspace bundles
+    "*.xcassets",       # Asset catalogs (images, colors) - binary
+    "*.framework",      # Framework bundles
+    "*.app",            # App bundles
+    "*.appex",          # App extension bundles
+    "*.lproj",          # Localization bundles (use .strings instead)
+    "*.dSYM",           # Debug symbols
+    "*.ipa",            # App archives
+    "ModuleCache",      # Clang module cache
+    "Index",            # Xcode index data
 }
 
 
