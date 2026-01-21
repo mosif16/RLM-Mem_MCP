@@ -3,14 +3,15 @@ Configuration for RLM-Mem MCP Server
 
 Environment Variables:
 - OPENROUTER_API_KEY: Required for RLM processing via OpenRouter
-- RLM_MODEL: Model for RLM processing (default: anthropic/claude-haiku-4-5-20250115)
-- RLM_AGGREGATOR_MODEL: Model for final aggregation (default: anthropic/claude-haiku-4-5-20250115)
+- RLM_MODEL: Model for RLM processing (default: x-ai/grok-code-fast-1)
+- RLM_AGGREGATOR_MODEL: Model for final aggregation (default: x-ai/grok-code-fast-1)
 - RLM_MAX_RESULT_TOKENS: Maximum tokens in result (default: 4000)
 
 OpenRouter:
 - Uses OpenAI-compatible API at https://openrouter.ai/api/v1
-- Claude Haiku 4.5 is fast and cost-effective (~$0.80/1M input tokens)
-- Supports prompt caching for 90% cost reduction on repeated content
+- Grok Code Fast is optimized for code analysis (~$0.20/1M input, $1.50/1M output)
+- 256K context window, 10K max output, 103 tps throughput
+- Supports prompt caching ($0.02/1M cache read)
 """
 
 import os
@@ -21,8 +22,9 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
-# Default model (OpenRouter model ID) - Claude Haiku 4.5 for speed and cost efficiency
-DEFAULT_MODEL = "anthropic/claude-haiku-4.5"
+# Default model (OpenRouter model ID) - Grok Code Fast for speed and cost efficiency
+# $0.20/1M input, $1.50/1M output, $0.02/1M cache read, 256K context, 10K max output
+DEFAULT_MODEL = "x-ai/grok-code-fast-1"
 
 # Default file extensions to include
 DEFAULT_EXTENSIONS = {
@@ -337,7 +339,7 @@ class RLMConfig:
     api_key: str = field(default_factory=lambda: os.getenv("OPENROUTER_API_KEY", ""))
     api_base_url: str = "https://openrouter.ai/api/v1"
 
-    # Use Gemini 2.5 Flash - fast and cost-effective
+    # Use Grok Code Fast - optimized for code analysis, fast and cost-effective
     model: str = field(default_factory=lambda: os.getenv("RLM_MODEL", DEFAULT_MODEL))
     aggregator_model: str = field(default_factory=lambda: os.getenv("RLM_AGGREGATOR_MODEL", DEFAULT_MODEL))
 
@@ -440,9 +442,9 @@ class RLMConfig:
         default_factory=lambda: int(os.getenv("RLM_MAX_TOTAL_TOKENS", "500000"))
     )  # Maximum tokens to process
 
-    # Claude 4.5 Prompt Caching Configuration
-    # Anthropic requires explicit cache_control blocks
-    # Cache hits cost 10% of normal input tokens (90% savings!)
+    # Prompt Caching Configuration
+    # OpenRouter handles cache_control for supported models
+    # Grok Code Fast: $0.02/1M cache read vs $0.20/1M input (90% savings!)
     use_cache: bool = field(
         default_factory=lambda: os.getenv("RLM_USE_CACHE", "true").lower() == "true"
     )
@@ -485,7 +487,7 @@ class ServerConfig:
     """Configuration for the MCP server."""
 
     name: str = "rlm-recursive-memory"
-    version: str = "1.0.0"
+    version: str = "2.5.0"
     description: str = (
         "MCP server implementing Recursive Language Model (RLM) "
         "for processing arbitrarily large inputs with Claude"

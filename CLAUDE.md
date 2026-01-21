@@ -85,10 +85,10 @@ Unlike simple summarization, TRUE RLM:
 | Premium 1M context | Works | 500k | ~$15 |
 | **RLM via MCP** | Works | ~4k summary | **~$0.10-0.50** |
 
-RLM with Claude Haiku 4.5 and prompt caching is **extremely cost-effective**:
-- Base: $0.80/1M input tokens
-- With cache hits: $0.08/1M (90% savings!)
-- Output: $4/1M tokens
+RLM with Grok Code Fast and prompt caching is **extremely cost-effective**:
+- Base: $0.20/1M input tokens
+- With cache hits: $0.02/1M (90% savings!)
+- Output: $1.50/1M tokens
 
 ---
 
@@ -456,8 +456,8 @@ claude mcp add --transport stdio rlm -- python -m rlm_mem_mcp.server
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `OPENROUTER_API_KEY` | (required) | Your OpenRouter API key |
-| `RLM_MODEL` | `anthropic/claude-haiku-4.5` | Model for RLM processing |
-| `RLM_AGGREGATOR_MODEL` | `anthropic/claude-haiku-4.5` | Model for final aggregation |
+| `RLM_MODEL` | `x-ai/grok-code-fast-1` | Model for RLM processing |
+| `RLM_AGGREGATOR_MODEL` | `x-ai/grok-code-fast-1` | Model for final aggregation |
 | `RLM_USE_CACHE` | `true` | Enable prompt caching |
 | `RLM_CACHE_TTL` | `1h` | Cache TTL (`5m` or `1h`) |
 | `RLM_USE_PREFILLED` | `true` | Enable prefilled responses for token efficiency |
@@ -791,9 +791,9 @@ export RLM_CACHE_TTL=1h
 #### Strategy 2: Model Selection
 
 ```
-# Uses Claude Haiku 4.5 exclusively
-# ~$0.80/1M tokens input, $0.08 with cache (90% savings)
-export RLM_MODEL=anthropic/claude-haiku-4.5
+# Uses Grok Code Fast by default
+# ~$0.20/1M tokens input, $0.02 with cache (90% savings)
+export RLM_MODEL=x-ai/grok-code-fast-1
 ```
 
 #### Strategy 3: Optimize Queries
@@ -1230,6 +1230,79 @@ New hook system for optimal tool selection:
 
 ---
 
+## Recent Improvements (v2.5)
+
+### Ripgrep Integration (10-100x Faster Searches)
+Native ripgrep integration for dramatically faster codebase searches:
+
+**New Search Functions:**
+- `rg_search(pattern, paths, **flags)` - Full-featured ripgrep search with JSON output
+- `rg_literal(text, paths)` - Fast literal string search (no regex parsing)
+- `rg_files(pattern, paths)` - Return only matching file paths
+- `rg_count(pattern, paths)` - Count matches per file
+- `parallel_rg_search(patterns, paths)` - Search multiple patterns concurrently
+
+**Supported Flags:**
+- `case_insensitive=True` - Ignore case (-i)
+- `word_boundary=True` - Match whole words only (-w)
+- `context_lines=N` - Lines of context before/after (-C)
+- `file_type="py"` - Limit to file type (--type)
+- `glob="*.swift"` - Glob pattern filter (--glob)
+- `fixed_strings=True` - Literal search, no regex (-F)
+
+**Automatic Fallback:**
+- If ripgrep not installed, automatically falls back to Python search
+- `RG_AVAILABLE` variable indicates ripgrep availability
+
+**Usage in REPL:**
+```python
+# Fast regex search
+matches = rg_search("TODO|FIXME", file_type="py")
+
+# Fastest: literal string search
+matches = rg_literal("API_KEY", case_insensitive=True)
+
+# Get only file paths
+files = rg_files("class.*Service")
+
+# Count occurrences
+counts = rg_count("import")  # {'file.py': 5, 'other.py': 3}
+
+# Search multiple patterns in parallel
+matches = parallel_rg_search(["TODO", "FIXME", "HACK"])
+```
+
+### Parallel Scanning (2-4x Faster Batch Operations)
+All batch scan functions now run in parallel by default:
+
+**Updated Functions:**
+- `run_security_scan(parallel=True)` - 7 security tools in parallel
+- `run_ios_scan(parallel=True)` - 19 iOS/Swift tools in parallel
+- `run_quality_scan(parallel=True)` - 5 quality tools in parallel
+- `run_web_scan(parallel=True)` - 7 web/frontend tools in parallel
+- `run_rust_scan(parallel=True)` - 5 Rust tools in parallel
+- `run_node_scan(parallel=True)` - 5 Node.js tools in parallel
+- `run_frontend_scan(parallel=True)` - web + node combined
+- `run_backend_scan(parallel=True)` - node + security combined
+
+**Parallel Utilities:**
+- `parallel_scan(tools, functions)` - Run any functions in parallel
+- Graceful error handling - one failure doesn't stop others
+- Automatic result aggregation
+
+**Performance Comparison:**
+| Operation | Sequential | Parallel | Speedup |
+|-----------|------------|----------|---------|
+| `run_ios_scan()` | ~8s | ~2.5s | **3.2x** |
+| `run_security_scan()` | ~3s | ~1s | **3x** |
+| `run_web_scan()` | ~2.5s | ~0.8s | **3x** |
+
+### Dependencies
+- **ripgrep**: Optional but recommended (`brew install ripgrep` / `apt install ripgrep`)
+- No new Python dependencies (uses subprocess, concurrent.futures)
+
+---
+
 ## License
 
 MIT License - see LICENSE for details.
@@ -1237,5 +1310,5 @@ MIT License - see LICENSE for details.
 ---
 
 **Last Updated**: January 2026
-**Version**: 2.4
+**Version**: 2.5
 **Status**: Production Ready

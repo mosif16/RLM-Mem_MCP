@@ -41,7 +41,12 @@ from .content_analyzer import (
     Confidence,
 )
 from .fallback_analyzer import FallbackAnalyzer
-from .structured_tools import StructuredTools, ToolResult, Finding, Confidence as ToolConfidence, Severity
+from .structured_tools import (
+    StructuredTools, ToolResult, Finding, Confidence as ToolConfidence, Severity,
+    # v2.5: Ripgrep integration and parallel scanning
+    rg_search, rg_literal, rg_files, rg_count, RgMatch, RG_AVAILABLE,
+    parallel_scan, parallel_rg_search,
+)
 from .result_verifier import (
     QueryResultVerifier,
     QueryVerificationResult,
@@ -620,6 +625,30 @@ for m in matches:
 ```
 
 Or use `llm_query(text)` for semantic analysis of specific code sections.
+
+## Fast Search with Ripgrep (v2.5)
+
+For 10-100x faster searches on large codebases, use ripgrep integration:
+```python
+# Check if ripgrep is available
+if RG_AVAILABLE:
+    # Fast regex search
+    matches = rg_search("TODO|FIXME", file_type="py")
+    for m in matches:
+        print(f"{{m.file}}:{{m.line}} - {{m.content}}")
+
+    # Fast literal search (fastest - no regex parsing)
+    matches = rg_literal("API_KEY", case_insensitive=True)
+
+    # Get only matching file paths
+    files = rg_files("class.*Service")
+
+    # Count matches per file
+    counts = rg_count("import")  # {{'file.py': 5, 'other.py': 3}}
+
+    # Search multiple patterns in parallel
+    matches = parallel_rg_search(["TODO", "FIXME", "HACK"])
+```
 
 ## Output
 
@@ -1892,6 +1921,15 @@ Remove duplicates (same line, same issue). Keep all unique findings with their l
             # VERIFICATION TOOL (REQUIRED before FINAL_ANSWER)
             "verify_results": self._create_verify_results_function(),
             "VerificationStatus": VerificationStatus,
+
+            # ===== RIPGREP INTEGRATION (v2.5) =====
+            # Fast native search - 10-100x faster than Python regex
+            "rg_search": rg_search,           # Full-featured ripgrep search
+            "rg_literal": rg_literal,         # Fast literal string search (no regex)
+            "rg_files": rg_files,             # Return only matching file paths
+            "rg_count": rg_count,             # Count matches per file
+            "parallel_rg_search": parallel_rg_search,  # Search multiple patterns in parallel
+            "RG_AVAILABLE": RG_AVAILABLE,     # Check if ripgrep is installed
 
             **all_variables
         }
