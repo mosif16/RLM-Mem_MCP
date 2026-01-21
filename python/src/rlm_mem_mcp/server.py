@@ -49,7 +49,12 @@ from .cache_manager import CacheManager
 from .utils import get_memory_monitor, get_metrics_collector
 from .result_verifier import ResultVerifier, BatchVerifier
 from .project_analyzer import ProjectAnalyzer
-from .structured_tools import StructuredTools, ToolResult
+from .structured_tools import (
+    StructuredTools, ToolResult,
+    # v2.6: Single-file tools
+    read_file, grep_pattern, glob_files,
+    FileContent, GrepResult, GlobResult,
+)
 
 
 # Input validation constants
@@ -469,6 +474,111 @@ def create_server() -> Server:
                     },
                 },
             ),
+            # ===== v2.6: SINGLE-FILE TOOLS =====
+            # These replace Claude's native Read, Grep, and Glob tools
+            Tool(
+                name="rlm_read",
+                description=(
+                    "Read a single file with optional line offset and limit. "
+                    "Fast, no LLM overhead. Replaces Claude's native Read tool. "
+                    "Returns file content with line numbers in format: '  123→content'"
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Absolute or relative path to the file to read",
+                        },
+                        "offset": {
+                            "type": "integer",
+                            "description": "Line number to start from (0-indexed). Default: 0",
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Maximum number of lines to read. Default: all lines",
+                        },
+                    },
+                    "required": ["path"],
+                },
+            ),
+            Tool(
+                name="rlm_grep",
+                description=(
+                    "Search for a pattern in files using ripgrep. "
+                    "Fast regex or literal search. Replaces Claude's native Grep tool. "
+                    "Returns matches with file paths, line numbers, and content."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "pattern": {
+                            "type": "string",
+                            "description": "Regex pattern to search for (or literal string if fixed_strings=true)",
+                        },
+                        "path": {
+                            "type": "string",
+                            "description": "File or directory to search in. Default: current directory",
+                        },
+                        "case_insensitive": {
+                            "type": "boolean",
+                            "description": "Ignore case when searching. Default: false",
+                        },
+                        "fixed_strings": {
+                            "type": "boolean",
+                            "description": "Treat pattern as literal string, not regex. Default: false",
+                        },
+                        "context_lines": {
+                            "type": "integer",
+                            "description": "Lines of context before and after match. Default: 0",
+                        },
+                        "file_type": {
+                            "type": "string",
+                            "description": "Limit to file type (e.g., 'py', 'js', 'swift', 'rs')",
+                        },
+                        "glob": {
+                            "type": "string",
+                            "description": "Glob pattern filter (e.g., '*.tsx', '**/*.swift')",
+                        },
+                        "output_mode": {
+                            "type": "string",
+                            "enum": ["content", "files_with_matches", "count"],
+                            "description": (
+                                "Output mode: 'content' shows matching lines, "
+                                "'files_with_matches' shows only file paths, "
+                                "'count' shows match counts per file. Default: 'content'"
+                            ),
+                        },
+                    },
+                    "required": ["pattern"],
+                },
+            ),
+            Tool(
+                name="rlm_glob",
+                description=(
+                    "Find files matching a glob pattern. "
+                    "Fast filesystem search. Replaces Claude's native Glob tool. "
+                    "Returns list of matching file paths."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "pattern": {
+                            "type": "string",
+                            "description": "Glob pattern (e.g., '**/*.py', 'src/**/*.swift', '*.json')",
+                        },
+                        "path": {
+                            "type": "string",
+                            "description": "Base directory to search from. Default: current directory",
+                        },
+                        "include_hidden": {
+                            "type": "boolean",
+                            "description": "Include hidden files/directories. Default: false",
+                        },
+                    },
+                    "required": ["pattern"],
+                },
+            ),
         ]
 
     @server.call_tool()
@@ -486,6 +596,13 @@ def create_server() -> Server:
                 result = await handle_memory_store(arguments)
             elif name == "rlm_memory_recall":
                 result = await handle_memory_recall(arguments)
+            # v2.6: Single-file tools
+            elif name == "rlm_read":
+                result = await handle_rlm_read(arguments)
+            elif name == "rlm_grep":
+                result = await handle_rlm_grep(arguments)
+            elif name == "rlm_glob":
+                result = await handle_rlm_glob(arguments)
             else:
                 result = [TextContent(type="text", text=f"Unknown tool: {name}")]
 
@@ -598,6 +715,8 @@ def _perform_literal_search(content: str, search_terms: list[str]) -> str:
     current_file = "unknown"
     line_number = 0
     in_fence = False  # Track if we're inside a markdown fence
+    files_seen = 0  # Track if we've seen any file headers
+    unknown_matches = 0  # Track matches without proper file context
 
     # Track findings per search term
     findings: dict[str, list[dict]] = {term: [] for term in search_terms}
@@ -608,6 +727,7 @@ def _perform_literal_search(content: str, search_terms: list[str]) -> str:
             current_file = line.replace("### File:", "").strip()
             line_number = 0  # Reset for new file
             in_fence = False  # Reset fence state for new file
+            files_seen += 1
             continue
 
         # Skip markdown fence lines (```language and ```)
@@ -627,6 +747,9 @@ def _perform_literal_search(content: str, search_terms: list[str]) -> str:
             line_lower = line.lower()
             for term in search_terms:
                 if term.lower() in line_lower:
+                    # Track matches without proper file context
+                    if current_file == "unknown":
+                        unknown_matches += 1
                     findings[term].append({
                         "file": current_file,
                         "line": line_number,
@@ -660,6 +783,14 @@ def _perform_literal_search(content: str, search_terms: list[str]) -> str:
                     output_parts.append(f"  ... and {len(file_matches) - 10} more matches\n")
 
     output_parts.append(f"\n---\n*Total: {total_matches} matches across {len(search_terms)} search term(s)*\n")
+
+    # Add warnings for location tracking issues
+    if files_seen == 0 and total_matches > 0:
+        output_parts.append("\n⚠️ **Warning:** No `### File:` headers found in content. All locations show as 'unknown'.\n")
+        output_parts.append("*This may indicate malformed content or missing file metadata.*\n")
+    elif unknown_matches > 0:
+        output_parts.append(f"\n⚠️ **Warning:** {unknown_matches} match(es) have 'unknown' file location (found before first file header).\n")
+
     output_parts.append("*Tip: Use native Grep tool for better performance on literal searches.*\n")
 
     return "".join(output_parts)
@@ -1686,6 +1817,148 @@ async def handle_memory_recall(arguments: dict[str, Any]) -> list[TextContent]:
             return [TextContent(type="text", text="No memories stored")]
 
     output = json.dumps(results, indent=2)
+    return [TextContent(type="text", text=output)]
+
+
+# =============================================================================
+# v2.6: SINGLE-FILE TOOL HANDLERS
+# =============================================================================
+# These handlers provide 1:1 replacements for Claude's native Read, Grep, Glob
+
+
+async def handle_rlm_read(arguments: dict[str, Any]) -> list[TextContent]:
+    """
+    Handle rlm_read tool call.
+
+    Replaces Claude's native Read tool with identical functionality.
+    Fast, no LLM overhead - just reads the file directly.
+    """
+    path = arguments.get("path", "")
+    offset = arguments.get("offset", 0)
+    limit = arguments.get("limit", None)
+
+    # Input validation
+    if not path:
+        return [TextContent(type="text", text="Error: path is required")]
+
+    is_valid, error = validate_path(path)
+    if not is_valid:
+        return [TextContent(type="text", text=f"Error: {error}")]
+
+    # Read the file
+    result = read_file(path, offset=offset, limit=limit)
+
+    if result.error:
+        return [TextContent(type="text", text=f"Error reading file: {result.error}")]
+
+    if not result.exists:
+        return [TextContent(type="text", text=f"File not found: {path}")]
+
+    # Format output like Claude's Read tool
+    output = str(result)
+
+    # Add metadata footer
+    if result.limit:
+        output += f"\n\n*Showing lines {result.offset + 1}-{result.offset + len(result.lines)} of {result.total_lines} total*"
+    else:
+        output += f"\n\n*{result.total_lines} lines total*"
+
+    return [TextContent(type="text", text=output)]
+
+
+async def handle_rlm_grep(arguments: dict[str, Any]) -> list[TextContent]:
+    """
+    Handle rlm_grep tool call.
+
+    Replaces Claude's native Grep tool with identical functionality.
+    Uses ripgrep for fast searching with fallback to Python regex.
+    """
+    pattern = arguments.get("pattern", "")
+    path = arguments.get("path", None)
+    case_insensitive = arguments.get("case_insensitive", False)
+    fixed_strings = arguments.get("fixed_strings", False)
+    context_lines = arguments.get("context_lines", 0)
+    file_type = arguments.get("file_type", None)
+    glob = arguments.get("glob", None)
+    output_mode = arguments.get("output_mode", "content")
+
+    # Input validation
+    if not pattern:
+        return [TextContent(type="text", text="Error: pattern is required")]
+
+    # Convert path to list for grep_pattern
+    paths = [path] if path else None
+
+    # Perform the search
+    result = grep_pattern(
+        pattern=pattern,
+        paths=paths,
+        case_insensitive=case_insensitive,
+        fixed_strings=fixed_strings,
+        context_lines=context_lines,
+        file_type=file_type,
+        glob=glob
+    )
+
+    if result.error:
+        return [TextContent(type="text", text=f"Error: {result.error}")]
+
+    # Format output based on output_mode
+    if output_mode == "files_with_matches":
+        if not result.matches:
+            return [TextContent(type="text", text=f"No files match pattern: {pattern}")]
+        files = sorted(set(m.file for m in result.matches))
+        output = "\n".join(files)
+        output += f"\n\n*{len(files)} files match*"
+
+    elif output_mode == "count":
+        if not result.matches:
+            return [TextContent(type="text", text=f"0 matches for pattern: {pattern}")]
+        # Count per file
+        counts: dict[str, int] = {}
+        for m in result.matches:
+            counts[m.file] = counts.get(m.file, 0) + 1
+        output = "\n".join(f"{f}: {c}" for f, c in sorted(counts.items()))
+        output += f"\n\n*{result.total_matches} total matches in {result.files_matched} files*"
+
+    else:  # content mode (default)
+        output = str(result)
+
+    return [TextContent(type="text", text=output)]
+
+
+async def handle_rlm_glob(arguments: dict[str, Any]) -> list[TextContent]:
+    """
+    Handle rlm_glob tool call.
+
+    Replaces Claude's native Glob tool with identical functionality.
+    Fast filesystem pattern matching.
+    """
+    pattern = arguments.get("pattern", "")
+    path = arguments.get("path", None)
+    include_hidden = arguments.get("include_hidden", False)
+
+    # Input validation
+    if not pattern:
+        return [TextContent(type="text", text="Error: pattern is required")]
+
+    # Perform the glob
+    result = glob_files(
+        pattern=pattern,
+        path=path,
+        include_hidden=include_hidden
+    )
+
+    if result.error:
+        return [TextContent(type="text", text=f"Error: {result.error}")]
+
+    if not result.files:
+        return [TextContent(type="text", text=f"No files match pattern: {pattern}")]
+
+    # Format output - one file per line
+    output = "\n".join(result.files)
+    output += f"\n\n*{result.total_count} files match '{pattern}'*"
+
     return [TextContent(type="text", text=output)]
 
 

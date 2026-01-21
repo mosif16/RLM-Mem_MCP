@@ -1,406 +1,181 @@
-# RLM-Mem MCP Server - Claude Code Guidelines
+# RLM-Mem MCP Server
 
-This is the main documentation for the RLM-Mem MCP (Model Context Protocol) server. For working with Claude Code on this project, use the patterns and tools described here.
+**Version**: 2.6 | **Status**: Production Ready | [arXiv:2512.24601](https://arxiv.org/abs/2512.24601)
 
----
+## Overview
 
-## Table of Contents
+Implements TRUE Recursive Language Model (RLM) technique for Claude Code context management.
 
-1. [Project Overview](#project-overview)
-2. [Core Concepts](#core-concepts)
-3. [Architecture](#architecture)
-4. [API Reference](#api-reference)
-5. [Configuration](#configuration)
-6. [Usage Guide](#usage-guide)
-7. [Development](#development)
+**Problem**: Claude's ~200k token context fails on large codebases (500k+ tokens).
+
+**Solution**: Content stored as `prompt` variable in Python REPL. LLM writes code to examine it, preserving full data while using minimal context (~4k summary).
+
+**Cost**: ~$0.10-0.50 for 500k tokens (vs $15+ for premium 1M context).
 
 ---
 
-## Project Overview
-
-**RLM-Mem MCP Server** implements the TRUE Recursive Language Model (RLM) technique from [arXiv:2512.24601](https://arxiv.org/abs/2512.24601) for ultimate context management with Claude Code.
-
-### The Problem
-
-Claude Code has a context window of ~200k tokens. When analyzing large codebases (500k+ tokens), Claude either:
-- Fails to process everything
-- Experiences "context rot" (degraded performance)
-- Runs out of space for reasoning
-
-### The Solution: TRUE RLM
-
-**Key Insight**: Content is stored as a **VARIABLE** in a Python REPL, NOT in LLM context.
-
-```
-Traditional Summarization (NOT what we do):
-    Large content → LLM summarizes → Information LOST
-
-TRUE RLM Technique:
-    Large content → Stored as `prompt` variable
-    LLM writes Python CODE to examine portions
-    Sub-LLM responses stored as VARIABLES (NOT summarized)
-    Full data PRESERVED - accessible at any time
-```
-
-The LLM acts as a programmer, writing code to search and analyze the content rather than trying to hold it all in context.
-
-### Features
-
-- **TRUE RLM Processing**: Content stored as variables, LLM writes code to examine it
-- **Prompt Caching**: Leverages caching for cost reduction on repeated content
-- **Intelligent Chunking**: Respects file/function/section boundaries when splitting
-- **Memory Store**: Persist important findings across conversations (SQLite-backed)
-- **Robust Architecture**: Circuit breakers, rate limiters, exponential backoff
-- **Async Pipeline**: Fully async with connection pooling and concurrent operations
-- **Multi-Model Support**: Works with OpenRouter (Gemini, Claude, etc.) or Anthropic direct
-
----
-
-## Core Concepts
-
-### TRUE RLM Technique
-
-Unlike simple summarization, TRUE RLM:
-
-1. **Content as Variable**: Files stored in `prompt` variable, NOT in LLM context
-2. **LLM Writes Code**: The LLM generates Python to examine `prompt`
-3. **Sub-LLM Queries**: `llm_query()` calls analyze specific portions
-4. **Results as Variables**: Sub-LLM responses stored in full, NOT summarized
-5. **Full Preservation**: Original data always accessible for re-examination
-
-### Processing Steps
-
-1. **File Collection**: Async walk directories, filter by extension, respect limits
-2. **Variable Storage**: Content stored in REPL environment as `prompt` variable
-3. **Code Generation**: LLM writes Python code to search/analyze content
-4. **Sandboxed Execution**: Code runs in restricted environment with `llm_query()`
-5. **Result Aggregation**: Findings combined into coherent response
-6. **Truncation**: Ensure result fits in context (max 4000 tokens)
-
-### Cost Comparison
-
-| Method | 500k token input | Context Used | Cost |
-|--------|------------------|--------------|------|
-| Direct (if possible) | Fails or degrades | 200k+ (full) | N/A |
-| Premium 1M context | Works | 500k | ~$15 |
-| **RLM via MCP** | Works | ~4k summary | **~$0.10-0.50** |
-
-RLM with Grok Code Fast and prompt caching is **extremely cost-effective**:
-- Base: $0.20/1M input tokens
-- With cache hits: $0.02/1M (90% savings!)
-- Output: $1.50/1M tokens
-
----
-
-## Architecture
-
-### System Overview
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                        Claude Code (User)                       │
-└─────────────────┬───────────────────────────────────────────────┘
-                  │ MCP Protocol (JSON-RPC over stdio)
-                  ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    RLM-Mem MCP Server                           │
-│  ┌──────────────────────────────────────────────────────────┐  │
-│  │ MCP Resource Handler (server.py)                         │  │
-│  │ - Tool definitions and request routing                   │  │
-│  └──────────────────────────────────────────────────────────┘  │
-│  ┌──────────────────────────────────────────────────────────┐  │
-│  │ RLM Processor (rlm_processor.py)                         │  │
-│  │ - File collection, chunking, orchestration              │  │
-│  └──────────────────────────────────────────────────────────┘  │
-│  ┌──────────────────────────────────────────────────────────┐  │
-│  │ REPL Environment (repl_environment.py)                  │  │
-│  │ - Python execution sandbox with llm_query()            │  │
-│  └──────────────────────────────────────────────────────────┘  │
-│  ┌──────────────────────────────────────────────────────────┐  │
-│  │ Support Layer                                            │  │
-│  │ - Cache, Files, Memory, Verification, Tools            │  │
-│  └──────────────────────────────────────────────────────────┘  │
-└─────────────────┬───────────────────────────────────────────────┘
-                  │
-        ┌─────────┼─────────┬─────────┐
-        ▼         ▼         ▼         ▼
-    ┌─────┐  ┌────────┐  ┌──────┐  ┌──────┐
-    │Cache│  │OpenRouter │Anthropic│SQLite│
-    │    │  │   API     │  API    │(Mem) │
-    └─────┘  └────────┘  └──────┘  └──────┘
-```
-
-### Core Components
-
-#### 1. MCP Server (server.py)
-- Handle MCP protocol and resource management
-- Route tool requests to appropriate handler
-- Error handling and response formatting
-
-**Tools Exposed**:
-- `rlm_analyze` - File/directory analysis
-- `rlm_query_text` - Text block processing
-- `rlm_memory_store` - Persist findings
-- `rlm_memory_recall` - Retrieve findings
-- `rlm_status` - Server health check
-
-#### 2. RLM Processor (rlm_processor.py)
-Orchestrates the TRUE RLM analysis pipeline:
-- File collection and chunking
-- Code generation for analysis
-- Result aggregation and verification
-
-**Process**:
-```
-Input → Collection → Chunking → Storage → Code Generation
-  → Execution → Aggregation → Output
-```
-
-#### 3. REPL Environment (repl_environment.py)
-Provides execution sandbox with custom functions:
-```python
-prompt        # str - File/text content
-context       # dict - Metadata about content
-results       # list - Accumulate findings
-llm_query()   # func - Query LLM for specific portions
-```
-
-#### 4. Structured Tools (structured_tools.py)
-Pre-built analysis functions available in REPL:
-- `find_secrets()` - Detect hardcoded credentials
-- `find_sql_injection()` - SQL injection patterns
-- `find_xss()` - XSS vulnerabilities
-- `find_force_unwraps()` - iOS unsafe unwrapping
-- `map_architecture()` - System architecture
-- `analyze_performance()` - Performance issues
-
-#### 5. Result Verifier (result_verifier.py)
-Ensures result quality and accuracy:
-- Pattern verification
-- Semantic verification
-- False positive filtering
-- Confidence scoring (L11 algorithm)
-- Deduplication
-
-**Confidence Scoring**:
-```
-Start Score: 100
-
-Deductions:
-- In dead code: -50
-- In test file: -30
-- Pattern match only: -10
-- In comment: -40
-- Can't verify line: -20
-
-Boosts:
-- Semantic verification: +20
-- Multiple indicators: +15
-
-Final:
-- ≥80: HIGH
-- 50-79: MEDIUM
-- 20-49: LOW
-- <20: FILTERED (false positive)
-```
-
-#### 6. Cache Manager (cache_manager.py)
-Implements Anthropic-style prompt caching:
-- System prompts cached with 5m/1h TTL
-- Reduces cost by ~90% on cache hits
-- LRU response cache for redundant calls
-
-#### 7. File Collector (file_collector.py)
-Efficiently traverse directories:
-- Async I/O for non-blocking access
-- Filtering by extension and path pattern
-- File limits and size constraints
-
-#### 8. Memory Store (memory_store.py)
-Persistent finding storage:
-- SQLite backend (survives server restarts)
-- Fast indexed lookup
-- Tag-based searching
-
----
-
-## API Reference
+## MCP Tools
 
 ### rlm_analyze
+Analyze files/directories (50+ files, security audits, architecture reviews).
 
-Analyze files or directories using custom search queries.
-
-**Parameters**:
 ```javascript
 {
-  "query": "string (required)",              // Specific analysis query
-  "paths": ["string"] (required),            // Files/directories to analyze
-  "query_mode": "string",                    // 'auto', 'semantic', 'scanner', 'literal', 'custom' (v2.3)
-  "scan_mode": "string",                     // 'auto', 'security', 'ios', 'quality', 'all', 'custom'
-  "min_confidence": "string",                // 'HIGH', 'MEDIUM', 'LOW'
-  "include_quality": "boolean",              // Include code quality checks
-  "include_skipped_signatures": "boolean"    // Extract signatures from skipped files (v2.3)
+  "query": "string (required)",           // Specific analysis query
+  "paths": ["string"] (required),         // Files/directories
+  "query_mode": "auto|semantic|scanner|literal|custom",
+  "scan_mode": "auto|security|ios|quality|web|rust|node|all|custom",
+  "min_confidence": "HIGH|MEDIUM|LOW",
+  "include_quality": false,
+  "include_skipped_signatures": false
 }
 ```
 
-**Query Mode** (v2.3):
-```
-• 'auto' (default): Auto-detect best mode based on query complexity
-• 'semantic': LLM interprets query and writes custom search code (TRUE RLM)
-• 'scanner': Use pre-built scanners only (ios, security, quality)
-• 'literal': Fast grep-style literal search for quoted strings (no LLM)
-• 'custom': Query-driven semantic analysis WITHOUT pre-built scanners
-```
+**Query Modes**:
+- `auto`: Auto-detect best mode
+- `semantic`: LLM writes custom search code (TRUE RLM)
+- `scanner`: Pre-built scanners only (fastest)
+- `literal`: Fast grep-style search (~40ms)
+- `custom`: Semantic analysis without scanners
 
-**Query Patterns**:
-
-**Security Analysis:**
+**Query Examples**:
 ```
-"Find (1) SQL injection via string concat (2) hardcoded secrets
- matching sk-, api_key, password (3) eval/exec with user input.
- Report: file:line, code, severity."
-```
-
-**iOS/Swift Specific:**
-```
-"Find (1) force unwraps (!) excluding != (2) closures missing
- [weak self] (3) @ObservedObject with default value.
- Report: file:line, code, fix."
-```
-
-**Python Vulnerabilities:**
-```
-"Find (1) pickle.loads with untrusted data (2) bare except clauses
- (3) mutable default args. Report: file:line, code."
-```
-
-**JavaScript Issues:**
-```
-"Find (1) innerHTML XSS (2) missing await (3) useEffect missing deps.
- Report: file:line, code."
-```
-
-**Architecture Review:**
-```
-"Map all modules with purpose, entry points, dependencies,
- data flow."
-```
-
-**Response Structure**:
-```javascript
-{
-  "findings": [
-    {
-      "file": "path/to/file.py",
-      "line": 42,
-      "code": "source code snippet",
-      "issue": "description of issue",
-      "confidence": "HIGH|MEDIUM|LOW|FILTERED",
-      "severity": "CRITICAL|HIGH|MEDIUM|LOW|INFO",
-      "fix": "suggested fix (optional)",
-      "category": "category tag"
-    }
-  ],
-  "summary": "Brief summary of findings",
-  "files_scanned": 123,
-  "errors": []
-}
+Security: "Find (1) SQL injection (2) hardcoded secrets (3) eval/exec. Report: file:line, code, severity"
+iOS: "Find (1) force unwraps (2) missing [weak self] (3) @ObservedObject issues"
+Architecture: "Map modules with purpose, entry points, dependencies, data flow"
 ```
 
 ### rlm_query_text
+Process large text (logs, transcripts, documents).
 
-Process large text blocks (logs, transcripts, documents) directly.
+```javascript
+{ "query": "string", "text": "string" }
+```
 
-**Parameters**:
+### rlm_read
+Read single file (replaces native Read). Fast, no LLM overhead.
+
+```javascript
+{ "path": "string", "offset": 0, "limit": null }
+```
+
+### rlm_grep
+Pattern search with ripgrep (replaces native Grep).
+
 ```javascript
 {
-  "query": "string (required)",        // What to extract/analyze
-  "text": "string (required)"           // The text content to process
+  "pattern": "string",
+  "path": ".",
+  "case_insensitive": false,
+  "fixed_strings": false,
+  "context_lines": 0,
+  "file_type": "py|js|swift|rs",
+  "glob": "*.tsx",
+  "output_mode": "content|files_with_matches|count"
 }
 ```
 
-**Query Patterns**:
+### rlm_glob
+Find files by pattern (replaces native Glob).
 
-**Log Analysis:**
-```
-"Extract (1) ERROR/WARN entries with timestamps (2) stack traces
- with root cause (3) error frequency by type.
- Format: timestamp | level | message | count"
-```
-
-**Configuration Extraction:**
-```
-"Extract (1) all environment variables (2) connection strings
- (3) feature flags. Format: key = value with file location"
-```
-
-**Transcript Analysis:**
-```
-"Extract (1) key decisions made (2) action items with owners
- (3) unresolved questions. Format: bullet points with timestamps"
-```
-
-**JSON/Data Analysis:**
-```
-"Extract (1) all unique field names (2) data types per field
- (3) nested structure depth. Format: field: type (count)"
-```
-
-### rlm_memory_store
-
-Persist important findings for later recall.
-
-**Parameters**:
 ```javascript
-{
-  "key": "string (required)",           // Unique identifier
-  "value": "string (required)",         // Content to store
-  "tags": ["string"] (optional)         // Categorization tags
-}
+{ "pattern": "**/*.py", "path": ".", "include_hidden": false }
 ```
 
-### rlm_memory_recall
+### rlm_memory_store / rlm_memory_recall
+Persist and retrieve findings (SQLite-backed).
 
-Retrieve stored findings.
-
-**Parameters (Option 1: By Key)**:
 ```javascript
-{
-  "key": "security_audit_2024-01-19"
-}
-```
+// Store
+{ "key": "audit_2024", "value": "findings...", "tags": ["security"] }
 
-**Parameters (Option 2: By Tags)**:
-```javascript
-{
-  "search_tags": ["security", "high-priority"]
-}
+// Recall by key or tags
+{ "key": "audit_2024" }
+{ "search_tags": ["security"] }
 ```
 
 ### rlm_status
+Server health, cache stats, configuration.
 
-Check server health, cache stats, and configuration.
+---
 
-**Response Structure**:
-```javascript
-{
-  "status": "healthy|degraded|unhealthy",
-  "uptime_seconds": 3600,
-  "config": { ... },
-  "cache_stats": { ... },
-  "memory": { ... },
-  "rate_limit": { ... }
-}
+## Tool Selection Guide
+
+| Task | Best Tool |
+|------|-----------|
+| Read 1 file | `rlm_read` |
+| Search patterns | `rlm_grep` |
+| Find files | `rlm_glob` |
+| Analyze 50+ files | `rlm_analyze` |
+| Security audit | `rlm_analyze` + `scan_mode="security"` |
+| iOS audit | `rlm_analyze` + `scan_mode="ios"` |
+
+---
+
+## Available Analysis Tools
+
+### Security
+`find_secrets()`, `find_sql_injection()`, `find_xss()`, `find_command_injection()`, `find_python_security()`
+
+### iOS/Swift
+`find_force_unwraps()`, `find_retain_cycles()`, `find_weak_self_issues()`, `find_async_await_issues()`, `find_sendable_issues()`, `find_mainactor_issues()`, `find_swiftui_performance_issues()`, `find_memory_management_issues()`, `find_error_handling_issues()`, `find_accessibility_issues()`, `find_localization_issues()`
+
+### Web/Frontend
+`find_react_issues()`, `find_vue_issues()`, `find_angular_issues()`, `find_dom_security()`, `find_a11y_issues()`, `find_css_issues()`
+
+### Rust
+`find_unsafe_blocks()`, `find_unwrap_usage()`, `find_rust_concurrency_issues()`, `find_rust_error_handling()`, `find_rust_clippy_patterns()`
+
+### Node.js
+`find_callback_hell()`, `find_promise_issues()`, `find_node_security()`, `find_require_issues()`, `find_node_async_issues()`
+
+### Quality
+`find_long_functions()`, `find_complex_functions()`, `find_code_smells()`, `find_dead_code()`, `find_todos()`
+
+### Architecture
+`map_architecture()`, `find_imports()`, `analyze_typescript_imports()`, `build_call_graph()`
+
+### Batch Scans (parallel by default)
+`run_security_scan()`, `run_ios_scan()`, `run_quality_scan()`, `run_web_scan()`, `run_rust_scan()`, `run_node_scan()`, `run_frontend_scan()`, `run_backend_scan()`
+
+---
+
+## REPL Environment
+
+Code executes in sandboxed Python with these globals:
+
+```python
+prompt        # str - File/text content
+context       # dict - Metadata
+results       # list - Accumulate findings
+llm_query()   # func - Query LLM for analysis
+
+# Ripgrep functions (10-100x faster)
+rg_search(pattern, **flags)      # Full regex search
+rg_literal(text)                 # Literal string search
+rg_files(pattern)                # Return file paths only
+rg_count(pattern)                # Count matches per file
+parallel_rg_search(patterns)     # Multiple patterns concurrently
+RG_AVAILABLE                     # bool - ripgrep installed?
+
+# File functions
+read_file(path)                  # Read with line numbers
+grep_pattern(pattern, **flags)   # Search patterns
+glob_files(pattern)              # Find files
 ```
 
-### Confidence Levels
+---
 
-The system uses a 4-level confidence scale:
+## Confidence Levels
 
-- **HIGH** (80+): Multiple indicators verified, semantic confirmation
-- **MEDIUM** (50-79): Pattern matched, some uncertainty
-- **LOW** (20-49): Weak pattern match, likely false positive
-- **FILTERED**: Ruled out (dead code, test file, etc.)
+| Level | Score | Meaning |
+|-------|-------|---------|
+| HIGH | 80+ | Multiple indicators verified |
+| MEDIUM | 50-79 | Pattern matched, some uncertainty |
+| LOW | 20-49 | Weak match, likely false positive |
+| FILTERED | <20 | Ruled out (dead code, test, comment) |
+
+**Scoring**: Start 100, deduct for dead code (-50), test file (-30), comment (-40), boost for semantic verification (+20).
 
 ---
 
@@ -409,43 +184,25 @@ The system uses a 4-level confidence scale:
 ### Installation
 
 ```bash
-# Clone the repository
 git clone https://github.com/mosif16/RLM-Mem_MCP.git
-cd RLM-Mem_MCP
-
-# Install Python dependencies
-cd python
-pip install -e .
-
-# Set your API key (OpenRouter recommended for flexibility)
+cd RLM-Mem_MCP/python && pip install -e .
 export OPENROUTER_API_KEY=sk-or-...
-
-# Or use Anthropic directly
-export ANTHROPIC_API_KEY=sk-ant-...
 ```
 
-### Configure Claude Code
-
-Add the MCP server to Claude Code:
+### Claude Code Setup
 
 ```bash
-# Using the CLI
 claude mcp add --transport stdio rlm -- python -m rlm_mem_mcp.server
-
-# Or add to ~/.claude/mcp_servers.json manually
 ```
 
-**Manual configuration** (`~/.claude/mcp_servers.json`):
-
+Or in `~/.claude/mcp_servers.json`:
 ```json
 {
   "mcpServers": {
     "rlm": {
       "command": "python",
       "args": ["-m", "rlm_mem_mcp.server"],
-      "env": {
-        "OPENROUTER_API_KEY": "${OPENROUTER_API_KEY}"
-      }
+      "env": { "OPENROUTER_API_KEY": "${OPENROUTER_API_KEY}" }
     }
   }
 }
@@ -455,860 +212,106 @@ claude mcp add --transport stdio rlm -- python -m rlm_mem_mcp.server
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `OPENROUTER_API_KEY` | (required) | Your OpenRouter API key |
-| `RLM_MODEL` | `x-ai/grok-code-fast-1` | Model for RLM processing |
-| `RLM_AGGREGATOR_MODEL` | `x-ai/grok-code-fast-1` | Model for final aggregation |
-| `RLM_USE_CACHE` | `true` | Enable prompt caching |
-| `RLM_CACHE_TTL` | `1h` | Cache TTL (`5m` or `1h`) |
-| `RLM_USE_PREFILLED` | `true` | Enable prefilled responses for token efficiency |
-| `RLM_MAX_RESULT_TOKENS` | `4000` | Max tokens in result |
-| `RLM_MAX_CHUNK_TOKENS` | `8000` | Max tokens per chunk |
-| `RLM_OVERLAP_TOKENS` | `200` | Overlap tokens between chunks |
-
-### File Filtering
-
-**Included extensions**:
-- Code: `.py`, `.js`, `.ts`, `.tsx`, `.go`, `.rs`, `.java`, `.c`, `.cpp`, etc.
-- Config: `.json`, `.yaml`, `.toml`, `.ini`
-- Docs: `.md`, `.txt`, `.rst`
-
-**Skipped directories**:
-- `.git`, `node_modules`, `__pycache__`, `venv`, `dist`, `build`, etc.
+| `OPENROUTER_API_KEY` | required | API key |
+| `RLM_MODEL` | `x-ai/grok-code-fast-1` | Processing model |
+| `RLM_USE_CACHE` | `true` | Enable caching (90% cost savings) |
+| `RLM_CACHE_TTL` | `1h` | Cache TTL |
+| `RLM_MAX_RESULT_TOKENS` | `4000` | Max result tokens |
+| `RLM_MAX_CHUNK_TOKENS` | `8000` | Max chunk tokens |
 
 ---
 
-## Usage Guide
-
-### Common Use Cases
-
-#### 1. Security Audit
-
-Find all security vulnerabilities in a codebase.
-
-**In Claude Code:**
-```
-Please audit this project for security vulnerabilities. Look for:
-- SQL injection (string concatenation, dynamic queries)
-- XSS vulnerabilities (innerHTML, unsanitized DOM)
-- Hardcoded secrets (API keys, passwords)
-- Unsafe deserialization
-- Path traversal issues
-```
-
-**What it finds:**
-- SQL injection in user_service.py:42
-- Hardcoded API key in config.py:15
-- XSS in template rendering (app.js:128)
-- Unsafe pickle.loads() in serializer.py:56
-
-#### 2. Architecture Review
-
-Understand how the system is structured.
-
-**In Claude Code:**
-```
-Explain the architecture of this project. What are the main components,
-how do they interact, what's the data flow, and what patterns are used?
-```
-
-**What it finds:**
-- Project structure (API, Services, Data layer)
-- Entry points (main.py, cli.py, etc.)
-- Component interactions (request flow)
-- Design patterns (Factory, Strategy, etc.)
-- Data flow (user input → processing → output)
-
-#### 3. Performance Analysis
-
-Find performance bottlenecks.
-
-**In Claude Code:**
-```
-Analyze this codebase for performance issues. Look for:
-- Inefficient database queries (N+1 problems)
-- Missing indexes
-- Slow algorithms
-- Memory leaks
-- Blocking operations
-```
-
-**What it finds:**
-- N+1 queries in user list endpoint
-- Inefficient sorting algorithms
-- Blocking database calls in async code
-- Memory growth in long-running processes
-
-#### 4. Code Quality Assessment
-
-Evaluate code quality and standards.
-
-**In Claude Code:**
-```
-Check the code quality. Find:
-- Functions that are too long
-- High complexity functions
-- Dead code
-- Missing error handling
-- Inconsistent style
-```
-
-#### 5. Log Analysis
-
-Parse and analyze large log files.
-
-**In Claude Code:**
-```
-Here's a 500MB production log file. Find all errors, warnings,
-and suspicious patterns.
-```
-
-**Understanding logs:**
-```
-Error Summary:
-- Total Errors: 1,247
-- Timeframe: 2024-01-19 08:00 - 2024-01-19 14:00
-- Most common error: "Connection timeout" (45%)
-- Affected services: auth (60%), api (30%), db (10%)
-- Peak time: 10:30-11:00 (250 errors in 30 min)
-```
-
-#### 6. iOS/Swift Security
-
-Audit iOS app for Swift-specific issues.
-
-**In Claude Code:**
-```
-Security audit for this iOS app. Check for:
-- Force unwraps
-- Missing weak references in closures
-- Unsafe memory patterns
-- Missing error handling
-```
-
-#### 7. Dependency Analysis
-
-Understand dependencies and identify issues.
-
-**In Claude Code:**
-```
-Analyze the project dependencies. Find:
-- Unused dependencies
-- Conflicting versions
-- Security vulnerabilities in dependencies
-- Heavy/bloated dependencies
-```
-
-### Advanced Patterns
-
-#### Pattern 1: Iterative Analysis
-
-**Workflow:**
-```
-Initial audit → Find issues → Store in memory → Fix issues
-    ↓
-Verify fixes → Run targeted analysis → Update memory → Repeat
-```
-
-**In Claude Code:**
-```
-# First run - find all security issues
-[Audit finds 15 vulnerabilities]
-
-# Store findings
-Store in memory with tag "security-audit-2024-01"
-
-# Fix issues
-[Developer fixes 5 issues]
-
-# Run targeted re-check
-Analyze only modified files for the same issues
-
-# Track progress
-Recall memory: "security-audit-2024-01"
-Compare: Found 10 issues (5 fixed, 5 to go)
-```
-
-#### Pattern 2: Comparative Analysis
-
-**Workflow:**
-```
-Analyze version 1 → Analyze version 2 → Compare → Document changes
-```
-
-#### Pattern 3: Compliance Checking
-
-**Workflow:**
-```
-Define requirements → Audit against requirements → Report gaps → Verify fixes
-```
-
-### Tips & Tricks
-
-#### Tip 1: Be Specific in Queries
-
-**Bad query:**
-```
-"Find problems in the code"
-```
-
-**Good query:**
-```
-"Find SQL injection by (1) string concatenation in queries
- (2) unparameterized user input to database (3) dynamic
- SQL construction. Report: file:line, code, severity"
-```
-
-#### Tip 2: Use Min Confidence
-
-```
-# Find only high-confidence issues
-min_confidence: "HIGH"
-
-# Good for: Critical security audits, production issues
-
-# Find all potential issues (more false positives)
-min_confidence: "LOW"
-
-# Good for: Initial exploration, catching edge cases
-```
-
-#### Tip 3: Leverage Scan Modes
-
-```
-# Security analysis
-scan_mode: "security"
-
-# iOS-specific checks
-scan_mode: "ios"
-
-# Code quality
-scan_mode: "quality"
-
-# Everything
-scan_mode: "all"
-```
-
-#### Tip 4: Use Memory for Long Projects
-
-```
-# After each analysis session
-Store findings: rlm_memory_store({
-  "key": "project_audit_phase_1",
-  "value": "Summary of findings",
-  "tags": ["audit", "phase-1", "critical"]
-})
-
-# Later, recall progress
-Findings = rlm_memory_recall({
-  "search_tags": ["audit", "critical"]
-})
-```
-
-#### Tip 5: Iterate on Complex Analysis
-
-```
-# Don't try to analyze everything at once
-# Break into phases:
-
-Phase 1: Security vulnerabilities
-Phase 2: Performance issues
-Phase 3: Code quality
-Phase 4: Architecture review
-Phase 5: Dependency analysis
-
-# Each phase is faster, cleaner results
-```
-
-### Troubleshooting
-
-#### Issue: Getting too many false positives
-
-**Solution:**
-```
-# Increase confidence threshold
-min_confidence: "HIGH"
-
-# Be more specific in query
-# Add semantic context
-# Exclude test files
-```
-
-#### Issue: Analysis takes too long
-
-**Solution:**
-```
-# Reduce files analyzed
-paths: ["src/", "api/"]  # Instead of ["."]
-
-# Exclude large directories
-export RLM_EXTRA_SKIP_DIRS=node_modules,dist,build
-
-# Use faster model
-export RLM_MODEL=google/gemini-2-flash
-```
-
-#### Issue: Results are too brief
-
-**Solution:**
-```
-# Increase result tokens
-export RLM_MAX_RESULT_TOKENS=8000
-
-# Use more capable model
-export RLM_MODEL=anthropic/claude-opus-4.5
-
-# Ask for more detail in query
-"Provide detailed analysis with specific examples"
-```
-
-#### Issue: Results are not specific enough
-
-**Solution:**
-```
-# Improve query specificity
-"Find exact lines and code snippets, not general patterns"
-
-# Add multiple criteria
-"Find A, B, and C - report where all are present"
-
-# Use structured output
-"Format as: file | line | code | issue | fix"
-```
-
-### Cost Optimization
-
-#### Strategy 1: Cache Frequently
-
-```
-# Enable caching
-export RLM_USE_CACHE=true
-export RLM_CACHE_TTL=1h
-
-# Re-run analysis frequently
-# 90% cost reduction on cache hits
-```
-
-#### Strategy 2: Model Selection
-
-```
-# Uses Grok Code Fast by default
-# ~$0.20/1M tokens input, $0.02 with cache (90% savings)
-export RLM_MODEL=x-ai/grok-code-fast-1
-```
-
-#### Strategy 3: Optimize Queries
-
-```
-# Small, specific queries = fewer tokens
-"Find SQL injection" → costs $0.10
-"Find all possible vulnerabilities" → costs $2.00
-
-# Narrow paths = fewer files
-paths: ["src/api/"] → faster, cheaper
-paths: ["."] → comprehensive, expensive
-```
-
----
-
-## Development
-
-### Project Structure
+## Project Structure
 
 ```
 RLM-Mem_MCP/
-├── python/
-│   ├── src/
-│   │   └── rlm_mem_mcp/
-│   │       ├── __init__.py              # Package exports
-│   │       ├── server.py                # MCP server entry point
-│   │       ├── rlm_processor.py         # Core RLM implementation
-│   │       ├── repl_environment.py      # TRUE RLM REPL with llm_query()
-│   │       ├── file_collector.py        # Async file collection
-│   │       ├── cache_manager.py         # Prompt caching
-│   │       ├── memory_store.py          # SQLite-backed persistent memory
-│   │       ├── structured_tools.py      # Pre-built analysis tools
-│   │       ├── result_verifier.py       # Confidence scoring and verification
-│   │       ├── config.py                # Environment configuration
-│   │       ├── utils.py                 # Performance monitoring
-│   │       └── ...other modules
-│   ├── tests/
-│   │   ├── test_integration.py          # End-to-end tests
-│   │   ├── test_benchmark.py            # Performance benchmarks
-│   │   ├── test_stress.py               # Stress tests
-│   │   └── conftest.py                  # Test fixtures
-│   ├── requirements.txt
-│   └── pyproject.toml
-├── .claude/                             # Claude Code session storage
-│   └── ... (auto-managed)
-├── docs/                                # Documentation (archived)
-├── .mcp.json                            # Project MCP config
-├── CLAUDE.md                            # This file
-└── README.md                            # Quick start
+├── python/src/rlm_mem_mcp/
+│   ├── server.py              # MCP entry point
+│   ├── rlm_processor.py       # Core RLM implementation
+│   ├── repl_environment.py    # REPL sandbox with llm_query()
+│   ├── structured_tools.py    # Pre-built analysis tools
+│   ├── result_verifier.py     # Confidence scoring
+│   ├── cache_manager.py       # Prompt caching
+│   ├── memory_store.py        # SQLite persistence
+│   └── file_collector.py      # Async file collection
+├── CLAUDE.md                  # This file
+└── README.md
 ```
 
-### Running Tests
+---
 
-```bash
-cd python
-pip install -e ".[dev]"
-pytest
+## Architecture
+
+```
+Claude Code → MCP Protocol → RLM-Mem Server
+                              ├── MCP Handler (server.py)
+                              ├── RLM Processor (orchestration)
+                              ├── REPL Environment (sandboxed execution)
+                              └── Support (cache, memory, verification)
+                                    ↓
+                              OpenRouter/Anthropic API + SQLite
 ```
 
-### Contributing
+**Flow**: Input → File Collection → Chunking → Store as `prompt` → LLM writes code → Execute → Aggregate → Output
 
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Run tests
-5. Submit a pull request
+---
 
-### Key Design Patterns
+## File Support
 
-#### Circuit Breaker
-```
-State: CLOSED (normal operation)
-    ↓
-[3 consecutive failures]
-    ↓
-State: OPEN (stop requests)
-    ↓
-[Wait 30 seconds]
-    ↓
-State: HALF_OPEN (test request)
-    ↓
-Success? → CLOSED
-Failure? → OPEN (reset timer)
-```
+**Code**: `.py`, `.js`, `.ts`, `.tsx`, `.swift`, `.rs`, `.go`, `.java`, `.c`, `.cpp`, `.rb`, `.php`
 
-#### Exponential Backoff
-```
-Attempt 1: Wait 1s
-Attempt 2: Wait 2s
-Attempt 3: Wait 4s
-Attempt 4: Wait 8s
-Attempt 5: Wait 16s
-Max: 32s, Max attempts: 5
-```
+**Web**: `.html`, `.css`, `.scss`, `.vue`, `.svelte`, `.astro`
 
-#### Rate Limiting
-```
-Token bucket algorithm:
-- Bucket size: 1,000,000 tokens/min
-- Refill rate: Configured
-- On request: Deduct tokens
-- If insufficient: Reject (429)
-```
+**Config**: `.json`, `.yaml`, `.toml`, `.plist`, `.xcconfig`
 
-### Performance Characteristics
+**iOS**: `.swift`, `.storyboard`, `.xib`, `.strings`, `.entitlements`
 
-#### Time Complexity
-- File collection: O(n) where n = file count
-- Chunking: O(m) where m = total tokens
-- Analysis: O(k) where k = chunk count (parallelizable)
-- Aggregation: O(r) where r = result count
+**Skipped**: `.git`, `node_modules`, `__pycache__`, `venv`, `dist`, `build`, `DerivedData`, `Pods`, `target/`
 
-#### Real-World Performance
-| Operation | Typical Time | Range |
-|-----------|--------------|-------|
-| Collect 100 files | 50ms | 10-200ms |
-| Chunk 100k tokens | 100ms | 50-300ms |
-| Analyze 10 chunks | 5-10s | 3-30s |
-| Aggregate results | 100ms | 50-500ms |
-| **Total** | **5-12s** | **3-35s** |
+---
 
-### Security Considerations
+## Best Practices
 
-#### Sandbox Security
-- REPL executes in restricted Python environment
-- No file system access (except `prompt` variable)
-- No network access (except controlled `llm_query()`)
-- Timeout protection (30s per chunk)
-- Memory limits enforced
+1. **Be specific** - "Find SQL injection via string concat" not "find problems"
+2. **Use scan modes** - `ios`, `security`, `web`, `rust`, `node` for targeted analysis
+3. **Set confidence** - `HIGH` for critical audits, `MEDIUM` for general
+4. **Store findings** - Use `rlm_memory_store` to persist across sessions
+5. **Break into phases** - Security → Performance → Quality → Architecture
+6. **Use ripgrep** - Install for 10-100x faster searches
 
-#### API Security
-- API keys stored in environment variables
-- No keys in logs or error messages
-- Credentials not returned to Claude Code
-- Rate limiting prevents abuse
+---
 
-#### Data Privacy
-- File content never stored persistently (except REPL variable)
-- Memory store stores only findings, not source code
-- Cache expires automatically
-- User can disable memory store
+## Troubleshooting
+
+| Issue | Solution |
+|-------|----------|
+| Too many false positives | Use `min_confidence: "HIGH"` |
+| Analysis too slow | Narrow `paths`, use `scan_mode`, install ripgrep |
+| Results too brief | Increase `RLM_MAX_RESULT_TOKENS` |
+| Not specific enough | Add numbered criteria + output format to query |
+
+---
+
+## Version History
+
+**v2.6** (Current): Single-file tools (`rlm_read`, `rlm_grep`, `rlm_glob`)
+
+**v2.5**: Ripgrep integration (10-100x speedup), parallel batch scans (2-4x speedup)
+
+**v2.4**: Web/React, Rust, Node.js support with 25+ new analysis tools
+
+**v2.3**: Query mode system (`auto`, `semantic`, `scanner`, `literal`, `custom`)
+
+**v2.2**: Full Swift/iOS support with concurrency, SwiftUI, accessibility tools
 
 ---
 
 ## References
 
-### Papers
-- [Recursive Language Models (arXiv:2512.24601)](https://arxiv.org/abs/2512.24601) - Zhang, Kraska, Khattab - MIT, 2025
-
-### Anthropic Documentation
+- [RLM Paper (arXiv:2512.24601)](https://arxiv.org/abs/2512.24601) - Zhang, Kraska, Khattab - MIT
 - [Model Context Protocol](https://modelcontextprotocol.io/)
-- [Prompt Caching](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)
-- [Advanced Tool Use](https://www.anthropic.com/engineering/advanced-tool-use)
-- [Claude Code Best Practices](https://www.anthropic.com/engineering/claude-code-best-practices)
-
-### Related Projects
-- [Official RLM Library](https://github.com/alexzhang13/rlm)
 - [MCP SDK](https://github.com/anthropics/mcp)
 
 ---
 
-## Quick Reference
-
-### When to use rlm_analyze
-- Analyzing 50+ files
-- Searching entire codebase
-- Tasks with "all", "every", or "entire" scope
-- Security audits
-- Architecture reviews
-
-### When NOT to use rlm_analyze
-- Working with 1-5 specific files
-- Making targeted edits
-- Quick lookups in known locations
-
-### Available Tools
-
-| Category | Tools |
-|----------|-------|
-| **Security** | `find_secrets()`, `find_sql_injection()`, `find_xss()`, `find_command_injection()`, `find_python_security()` |
-| **iOS/Swift Core** | `find_force_unwraps()`, `find_retain_cycles()`, `find_main_thread_violations()`, `find_weak_self_issues()`, `find_swiftdata_issues()` |
-| **Swift Concurrency** | `find_async_await_issues()`, `find_sendable_issues()`, `find_mainactor_issues()`, `find_task_cancellation_issues()` |
-| **Swift Memory/Error** | `find_memory_management_issues()`, `find_error_handling_issues()` |
-| **SwiftUI** | `find_swiftui_performance_issues()`, `find_stateobject_issues()` |
-| **iOS Quality** | `find_accessibility_issues()`, `find_localization_issues()`, `find_deprecated_apis()` |
-| **Web/React** | `find_react_issues()`, `find_vue_issues()`, `find_angular_issues()`, `find_dom_security()`, `find_a11y_issues()`, `find_css_issues()` |
-| **Rust** | `find_unsafe_blocks()`, `find_unwrap_usage()`, `find_rust_concurrency_issues()`, `find_rust_error_handling()`, `find_rust_clippy_patterns()` |
-| **Node.js** | `find_callback_hell()`, `find_promise_issues()`, `find_node_security()`, `find_require_issues()`, `find_node_async_issues()` |
-| **Quality** | `find_long_functions()`, `find_complex_functions()`, `find_code_smells()`, `find_dead_code()`, `find_todos()` |
-| **TypeScript** | `analyze_typescript_imports()`, `trace_websocket_flow()`, `build_call_graph()` |
-| **Persistence** | `find_persistence_patterns()`, `find_state_mutations()` |
-| **Architecture** | `map_architecture()`, `find_imports()` |
-| **Batch Scans** | `run_security_scan()`, `run_quality_scan()`, `run_ios_scan()`, `run_web_scan()`, `run_rust_scan()`, `run_node_scan()`, `run_frontend_scan()`, `run_backend_scan()` |
-
-### Best Practices
-1. Be specific in your queries - avoid vague searches
-2. Use appropriate confidence levels (HIGH for critical, MEDIUM for general)
-3. Leverage scan modes for targeted analysis
-4. Store important findings in memory for reference
-5. Break complex analysis into phases
-6. Cache results when possible for cost savings
-
----
-
-## Recent Improvements (v2.2)
-
-### Full Swift/iOS Support
-Comprehensive Swift file and iOS project support:
-
-**File Extensions Added:**
-- `.swift`, `.xcstrings`, `.strings`, `.stringsdict` - Code and localization
-- `.entitlements`, `.xcconfig`, `.plist` - Configuration
-- `.storyboard`, `.xib` - Interface Builder
-- `.metal`, `.intentdefinition`, `.modulemap` - Specialized files
-
-**Skip Directories Added:**
-- `DerivedData`, `.build`, `SourcePackages` - Build artifacts
-- `Pods`, `Carthage` - Dependency managers
-- `*.xcodeproj`, `*.xcworkspace`, `*.xcassets` - Xcode bundles
-- `*.framework`, `*.app`, `*.appex`, `*.dSYM` - Build outputs
-
-**New Swift Analysis Tools:**
-- `find_async_await_issues()` - Task.detached, sequential awaits, missing try await
-- `find_sendable_issues()` - @unchecked Sendable, nonisolated(unsafe), data races
-- `find_swiftui_performance_issues()` - AnyView, GeometryReader misuse, @State issues
-- `find_memory_management_issues()` - unowned optionals, missing weak self, timer leaks
-- `find_error_handling_issues()` - Empty catch, try? silencing, fatalError usage
-- `find_accessibility_issues()` - Missing labels, gesture accessibility
-- `find_localization_issues()` - Hardcoded strings, NSLocalizedString issues
-
-**Enhanced iOS Project Detection:**
-- Auto-detects iOS projects from Package.swift, Info.plist, Podfile, Cartfile
-- Recognizes iOS indicator files (AppDelegate.swift, ContentView.swift, etc.)
-- Improved tech stack detection for Apple frameworks
-
-### Sanitizer Detection for XSS Scanner
-The XSS vulnerability scanner now recognizes common sanitization functions and reduces false positives:
-- `escapeHtml()`, `DOMPurify.sanitize()`, `xss()`, `htmlEncode()`
-- Context-aware detection (checks surrounding lines for sanitization)
-- Confidence levels adjusted based on sanitization presence
-
-### REPL Iteration Controls
-New configuration options to ensure thorough analysis:
-- `RLM_MIN_ITERATIONS` (default: 3) - Minimum iterations before accepting results
-- `RLM_REQUIRE_TOOL_EXECUTION` (default: true) - Forces at least one tool execution
-- Prevents "0 iterations" early exits
-
-### Line Number Validation
-All findings now validate line numbers against actual file length:
-- Invalid line numbers are clamped to valid range
-- Findings with corrected lines marked as LOW confidence
-- Prevents references exceeding file length (e.g., line 550 in 548-line file)
-
-### Enhanced Quality Scanner
-More sensitive thresholds and additional checks:
-- `find_long_functions()` threshold lowered to 30 lines (from 50)
-- New `find_complex_functions()` for cyclomatic complexity (>10)
-- New `find_code_smells()` for magic numbers, deep nesting, long params
-- New `find_dead_code()` for unreachable code detection
-
-### TypeScript Analysis Tools
-New tools for JavaScript/TypeScript codebases:
-- `analyze_typescript_imports()` - Import/export dependency mapping
-- `trace_websocket_flow()` - WebSocket message flow tracing
-- `build_call_graph()` - Function call graph analysis
-
----
-
-## Recent Improvements (v2.3)
-
-### Query Mode System
-New `query_mode` parameter for explicit control over how queries are interpreted:
-
-**Available Modes:**
-- `auto` (default): Auto-detect best mode based on query complexity
-- `semantic`: LLM interprets query and writes custom search code (TRUE RLM from paper)
-- `scanner`: Use pre-built scanners only (ios, security, quality) - fastest for standard audits
-- `literal`: Fast grep-style literal search for quoted strings (no LLM) - ~40ms
-- `custom`: Query-driven semantic analysis WITHOUT pre-built scanners - for feature discovery
-
-**When to Use Each Mode:**
-```
-# Literal mode - fast search for specific strings
-query_mode: "literal"
-query: 'Find files containing "ForecastEngine" or "WeatherData"'
-
-# Semantic mode - complex feature discovery
-query_mode: "semantic"
-query: "Trace how user authentication flows through the app, from login to session management"
-
-# Scanner mode - standard security/quality audits
-query_mode: "scanner"
-scan_mode: "security"
-query: "Find security vulnerabilities"
-
-# Custom mode - semantic analysis without scanner interference
-query_mode: "custom"
-query: "Find all places where LongRangeForecastView interacts with ForecastEngine"
-```
-
-### Path Handling Improvements
-Better support for relative paths with helpful error messages:
-
-- **Relative paths**: `paths: ["mybill"]` now resolves to `./mybill`
-- **Suggestions**: `"Path not found: 'mybill' | Did you mean: ./MyBill, ./mybill-ios?"`
-- **Available directories**: Shows `ls` of cwd when path not found
-- **Resolved paths**: Logs actual resolved path for clarity
-
-### Large File Skipping Improvements
-New `include_skipped_signatures` parameter:
-
-```javascript
-{
-  "include_skipped_signatures": true  // Extract signatures from skipped files
-}
-```
-
-**Output Example:**
-```
-## Skipped Files (32 total)
-
-**exceeds token limit** (15 files)
-  - `ReportsHubView.swift` [EXISTS]
-    Signatures: class ReportsHubView, func loadReports(), func filterByDate()
-  - `DataManager.swift` [EXISTS]
-    Signatures: class DataManager, struct CacheEntry, func fetchData()
-```
-
-### Architecture Mapping Improvements
-Enhanced `map_architecture()` now returns detailed output:
-
-- **Full file paths** grouped by category (not just counts)
-- **Key classes/structs/functions** extracted from each file
-- **Module dependencies** showing most common imports
-- **Categorization**: entry_points, views_ui, models, services, utilities, tests, config
-
-**Example Output:**
-```
-## Architecture Mapping
-
-**entry_points** (3 files)
-  - src/main.py [Classes: Application] [Funcs: main, setup]
-  - src/cli.py [Classes: CLI] [Funcs: parse_args, run]
-
-**services** (12 files)
-  - src/services/auth.py [Classes: AuthService, TokenManager]
-  - src/services/data.py [Classes: DataService] [Funcs: fetch, cache]
-
-**dependencies** (Top 15 imports)
-  - asyncio: 45 files
-  - typing: 38 files
-  - dataclasses: 22 files
-```
-
----
-
-## Recent Improvements (v2.4)
-
-### Full Web/Frontend Support
-Comprehensive support for React, Vue, Angular, and modern web development:
-
-**New Web Analysis Tools:**
-- `find_react_issues()` - Missing keys, useEffect deps, stale closures, state mutation
-- `find_vue_issues()` - v-for without :key, prop mutation, watcher cleanup
-- `find_angular_issues()` - Subscription leaks, change detection, template issues
-- `find_dom_security()` - eval, document.write, innerHTML XSS, postMessage
-- `find_a11y_issues()` - Missing alt, ARIA labels, keyboard accessibility
-- `find_css_issues()` - !important overuse, z-index wars, hardcoded colors
-
-**File Extensions Added:**
-- HTML: `.html`, `.htm`, `.xhtml`
-- CSS: `.css`, `.scss`, `.sass`, `.less`, `.styl`, `.stylus`
-- Templates: `.ejs`, `.hbs`, `.pug`, `.mustache`, `.njk`, `.liquid`, `.jinja2`
-- Frameworks: `.vue`, `.svelte`, `.astro`
-- WebAssembly: `.wasm`, `.wat`
-
-**Skip Directories Added:**
-- `.next`, `.nuxt`, `.output`, `.svelte-kit`, `.angular`
-- `.parcel-cache`, `.turbo`, `.vercel`, `.netlify`
-- `storybook-static`, `.docusaurus`, `.astro`
-
-### Full Rust Support
-Comprehensive Rust analysis with safety-focused tools:
-
-**New Rust Analysis Tools:**
-- `find_unsafe_blocks()` - unsafe blocks/functions, raw pointers, FFI
-- `find_unwrap_usage()` - .unwrap(), .expect(), panic!, unreachable!
-- `find_rust_concurrency_issues()` - Arc without Mutex, data races, deadlocks
-- `find_rust_error_handling()` - Result handling, error types, propagation
-- `find_rust_clippy_patterns()` - Manual detection of common clippy lints
-
-**File Extensions Added:**
-- `.rs` (Rust source)
-- Cargo.toml, Cargo.lock handled
-
-**Skip Directories Added:**
-- `target/`, `.cargo/`
-
-### Full Node.js Support
-Comprehensive Node.js and JavaScript backend analysis:
-
-**New Node.js Analysis Tools:**
-- `find_callback_hell()` - Deeply nested callbacks (4+ levels)
-- `find_promise_issues()` - Unhandled rejections, Promise anti-patterns
-- `find_node_security()` - Command injection, path traversal, eval
-- `find_require_issues()` - Dynamic requires, circular deps, deprecated modules
-- `find_node_async_issues()` - Missing await, event listener leaks
-
-**File Extensions Added:**
-- `.mjs`, `.cjs` (ES modules, CommonJS)
-- `.nvmrc`, `.npmrc`, `.yarnrc`
-
-**Skip Directories Added:**
-- `.npm`, `.yarn`, `.pnpm-store`, `.nx`, `.rush`
-
-### New Scan Modes
-New batch scan modes for ecosystem-specific analysis:
-
-| Mode | Description |
-|------|-------------|
-| `scan_mode="web"` | React + Vue + Angular + DOM + a11y + CSS |
-| `scan_mode="rust"` | unsafe + unwrap + concurrency + errors + clippy |
-| `scan_mode="node"` | callbacks + promises + security + require + async |
-| `scan_mode="frontend"` | web + node combined |
-| `scan_mode="backend"` | node + security combined |
-
-### RLM-First Tool Guidance
-New hook system for optimal tool selection:
-
-- `pretool-rlm-guidance.js` - Suggests RLM for broad searches
-- Auto-detects when Grep/Glob should use rlm_analyze instead
-- Reduces context consumption on large codebases
-
----
-
-## Recent Improvements (v2.5)
-
-### Ripgrep Integration (10-100x Faster Searches)
-Native ripgrep integration for dramatically faster codebase searches:
-
-**New Search Functions:**
-- `rg_search(pattern, paths, **flags)` - Full-featured ripgrep search with JSON output
-- `rg_literal(text, paths)` - Fast literal string search (no regex parsing)
-- `rg_files(pattern, paths)` - Return only matching file paths
-- `rg_count(pattern, paths)` - Count matches per file
-- `parallel_rg_search(patterns, paths)` - Search multiple patterns concurrently
-
-**Supported Flags:**
-- `case_insensitive=True` - Ignore case (-i)
-- `word_boundary=True` - Match whole words only (-w)
-- `context_lines=N` - Lines of context before/after (-C)
-- `file_type="py"` - Limit to file type (--type)
-- `glob="*.swift"` - Glob pattern filter (--glob)
-- `fixed_strings=True` - Literal search, no regex (-F)
-
-**Automatic Fallback:**
-- If ripgrep not installed, automatically falls back to Python search
-- `RG_AVAILABLE` variable indicates ripgrep availability
-
-**Usage in REPL:**
-```python
-# Fast regex search
-matches = rg_search("TODO|FIXME", file_type="py")
-
-# Fastest: literal string search
-matches = rg_literal("API_KEY", case_insensitive=True)
-
-# Get only file paths
-files = rg_files("class.*Service")
-
-# Count occurrences
-counts = rg_count("import")  # {'file.py': 5, 'other.py': 3}
-
-# Search multiple patterns in parallel
-matches = parallel_rg_search(["TODO", "FIXME", "HACK"])
-```
-
-### Parallel Scanning (2-4x Faster Batch Operations)
-All batch scan functions now run in parallel by default:
-
-**Updated Functions:**
-- `run_security_scan(parallel=True)` - 7 security tools in parallel
-- `run_ios_scan(parallel=True)` - 19 iOS/Swift tools in parallel
-- `run_quality_scan(parallel=True)` - 5 quality tools in parallel
-- `run_web_scan(parallel=True)` - 7 web/frontend tools in parallel
-- `run_rust_scan(parallel=True)` - 5 Rust tools in parallel
-- `run_node_scan(parallel=True)` - 5 Node.js tools in parallel
-- `run_frontend_scan(parallel=True)` - web + node combined
-- `run_backend_scan(parallel=True)` - node + security combined
-
-**Parallel Utilities:**
-- `parallel_scan(tools, functions)` - Run any functions in parallel
-- Graceful error handling - one failure doesn't stop others
-- Automatic result aggregation
-
-**Performance Comparison:**
-| Operation | Sequential | Parallel | Speedup |
-|-----------|------------|----------|---------|
-| `run_ios_scan()` | ~8s | ~2.5s | **3.2x** |
-| `run_security_scan()` | ~3s | ~1s | **3x** |
-| `run_web_scan()` | ~2.5s | ~0.8s | **3x** |
-
-### Dependencies
-- **ripgrep**: Optional but recommended (`brew install ripgrep` / `apt install ripgrep`)
-- No new Python dependencies (uses subprocess, concurrent.futures)
-
----
-
-## License
-
-MIT License - see LICENSE for details.
-
----
-
-**Last Updated**: January 2026
-**Version**: 2.5
-**Status**: Production Ready
+**License**: MIT

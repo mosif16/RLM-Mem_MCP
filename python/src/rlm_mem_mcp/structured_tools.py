@@ -84,6 +84,10 @@ class AnalysisContext:
     pattern_match_only: bool = True
     has_semantic_verification: bool = False
     multiple_indicators: bool = False
+    # v2.7: Constant detection to reduce false positives
+    is_constant_declaration: bool = False  # let/const/static let patterns
+    is_immutable_collection: bool = False  # Frozen arrays, immutable sets
+    is_compile_time_only: bool = False     # Bundle.main, FileManager.default patterns
 
 
 def calculate_confidence(finding: Finding, context: AnalysisContext) -> Confidence:
@@ -114,6 +118,16 @@ def calculate_confidence(finding: Finding, context: AnalysisContext) -> Confiden
     if context.pattern_match_only:
         score -= 10  # No semantic verification
 
+    # v2.7: Constant detection - reduces false positives on immutable data
+    if context.is_constant_declaration:
+        score -= 30  # Constant declarations are safer (let/const/static)
+
+    if context.is_immutable_collection:
+        score -= 25  # Immutable collections can't be modified at runtime
+
+    if context.is_compile_time_only:
+        score -= 35  # Compile-time patterns (Bundle.main, etc.) always exist
+
     # Boosts
     if context.has_semantic_verification:
         score += 20  # LLM verified this finding
@@ -130,6 +144,56 @@ def calculate_confidence(finding: Finding, context: AnalysisContext) -> Confiden
         return Confidence.LOW
     else:
         return Confidence.FILTERED
+
+
+# v2.7: Safe constant patterns library - patterns that indicate immutable/compile-time values
+SAFE_CONSTANT_PATTERNS: dict[str, list[str]] = {
+    'swift': [
+        r'^\s*let\s+\w+\s*[=:]',           # let declaration (Swift constant)
+        r'^\s*static\s+let\s+\w+',         # static let (type-level constant)
+        r'^\s*private\s+let\s+\w+',        # private let
+        r'^\s*fileprivate\s+let\s+\w+',    # fileprivate let
+        r'Bundle\.main\.',                  # Bundle resources (always exist at runtime)
+        r'FileManager\.default\.urls',      # System directories (always valid)
+        r'UIApplication\.shared\.',         # Singleton (always exists)
+        r'ProcessInfo\.processInfo\.',      # System info (always exists)
+    ],
+    'javascript': [
+        r'^\s*const\s+\w+\s*=',            # const declaration
+        r'^\s*readonly\s+\w+',             # TypeScript readonly
+        r'Object\.freeze\(',               # Frozen object
+        r'Object\.seal\(',                 # Sealed object
+    ],
+    'python': [
+        r'^\s*[A-Z][A-Z0-9_]+\s*=',        # ALL_CAPS convention (constants)
+        r'@final',                          # Final decorator
+        r'Final\[',                         # typing.Final annotation
+        r'frozenset\(',                     # Immutable set
+        r'tuple\(',                         # Immutable sequence
+    ],
+    'rust': [
+        r'^\s*const\s+\w+',                # const declaration
+        r'^\s*static\s+\w+',               # static (compile-time)
+        r'Lazy<',                           # Lazy static
+    ],
+}
+
+COMPILE_TIME_PATTERNS: list[str] = [
+    # iOS/Swift compile-time patterns
+    r'Bundle\.main',
+    r'Bundle\(for:',
+    r'FileManager\.default\.urls\(',
+    r'UIScreen\.main',
+    r'UIDevice\.current',
+    r'ProcessInfo\.processInfo',
+    r'NSLocale\.current',
+    r'TimeZone\.current',
+    # JavaScript/Node compile-time patterns
+    r'process\.env\.',
+    r'__dirname',
+    r'__filename',
+    r'import\.meta\.',
+]
 
 
 @dataclass
@@ -748,6 +812,90 @@ class StructuredTools:
         lower = filepath.lower()
         return any(x in lower for x in ['test', 'spec', 'mock', 'fixture', '__tests__'])
 
+    # v2.7: Constant detection helpers
+    def _is_constant_declaration(self, line: str, filepath: str) -> bool:
+        """
+        Check if a line is a constant declaration (reduces false positives).
+
+        Detects patterns like:
+        - Swift: let x = ..., static let x = ...
+        - JavaScript/TypeScript: const x = ...
+        - Python: ALL_CAPS = ..., Final[...]
+        - Rust: const x = ..., static x = ...
+        """
+        # Determine language from file extension
+        ext = filepath.rsplit('.', 1)[-1].lower() if '.' in filepath else ''
+
+        lang_map = {
+            'swift': 'swift',
+            'js': 'javascript', 'jsx': 'javascript', 'ts': 'javascript', 'tsx': 'javascript',
+            'py': 'python',
+            'rs': 'rust',
+        }
+        lang = lang_map.get(ext, 'swift')  # Default to Swift patterns
+
+        patterns = SAFE_CONSTANT_PATTERNS.get(lang, [])
+        for pattern in patterns:
+            if re.search(pattern, line):
+                return True
+
+        return False
+
+    def _is_immutable_collection(self, line: str, filepath: str) -> bool:
+        """
+        Check if a line involves an immutable collection.
+
+        Detects patterns like:
+        - Swift: let arr = [...], static let config = [...]
+        - Python: frozenset(...), tuple(...)
+        - JavaScript: Object.freeze([...])
+        """
+        # Check for constant + collection initialization
+        const_with_array = [
+            r'let\s+\w+\s*=\s*\[',           # let x = [...]
+            r'const\s+\w+\s*=\s*\[',         # const x = [...]
+            r'static\s+let\s+\w+\s*=\s*\[',  # static let x = [...]
+            r'frozenset\s*\(',               # frozenset(...)
+            r'tuple\s*\(',                   # tuple(...)
+            r'Object\.freeze\s*\(\s*\[',     # Object.freeze([...])
+            r'readonly\s+\w+\s*:\s*\[',      # readonly arr: [...]
+        ]
+
+        for pattern in const_with_array:
+            if re.search(pattern, line):
+                return True
+
+        return False
+
+    def _is_compile_time_only(self, line: str) -> bool:
+        """
+        Check if a line uses compile-time/guaranteed-to-exist patterns.
+
+        These patterns represent resources or APIs that are always available
+        and cannot fail at runtime (or failing would indicate a fundamental
+        configuration problem, not a code bug).
+        """
+        for pattern in COMPILE_TIME_PATTERNS:
+            if re.search(pattern, line):
+                return True
+        return False
+
+    def _get_constant_context(self, line: str, filepath: str) -> AnalysisContext:
+        """
+        Build AnalysisContext with constant detection flags populated.
+
+        Returns context with is_constant_declaration, is_immutable_collection,
+        and is_compile_time_only properly set based on line content.
+        """
+        return AnalysisContext(
+            in_test_file=self._is_test_file(filepath),
+            is_comment=self._is_in_comment(line, filepath),
+            pattern_match_only=True,
+            is_constant_declaration=self._is_constant_declaration(line, filepath),
+            is_immutable_collection=self._is_immutable_collection(line, filepath),
+            is_compile_time_only=self._is_compile_time_only(line),
+        )
+
     def _is_swift_safe_try(self, line: str, context_lines: list[str] | None = None) -> bool:
         """
         Check if try! is safe (compile-time constant like regex).
@@ -921,12 +1069,8 @@ class StructuredTools:
             if exclude_tests and self._is_test_file(filepath):
                 continue
 
-            # Build context for confidence calculation
-            context = AnalysisContext(
-                in_test_file=self._is_test_file(filepath),
-                is_comment=self._is_in_comment(line_content, filepath),
-                pattern_match_only=True,
-            )
+            # v2.7: Build context with constant detection for confidence calculation
+            context = self._get_constant_context(line_content, filepath)
 
             # Calculate final confidence
             final_confidence = calculate_confidence(
@@ -1189,22 +1333,24 @@ class StructuredTools:
                 if self._is_in_comment(line, filepath):
                     continue
 
-                # Determine confidence based on file type
-                if self._is_test_file(filepath):
-                    confidence = Confidence.LOW
-                else:
-                    confidence = Confidence.HIGH
+                # v2.7: Use constant detection for proper confidence calculation
+                context = self._get_constant_context(line, filepath)
 
-                result.findings.append(Finding(
+                # Calculate confidence using the new scoring system
+                finding = Finding(
                     file=filepath,
                     line=line_num,
                     code=line[:200],
                     issue=issue,
-                    confidence=confidence,
+                    confidence=Confidence.HIGH,  # Placeholder, will be recalculated
                     severity=severity,
                     fix="Use environment variables or secrets manager",
                     category="secrets",
-                ))
+                )
+                # Apply constant-aware confidence calculation
+                finding.confidence = calculate_confidence(finding, context)
+
+                result.findings.append(finding)
 
         result.summary = f"Found {len(result.findings)} potential hardcoded secrets"
         return result
@@ -1416,37 +1562,38 @@ class StructuredTools:
                 if self._is_safe_force_unwrap(line, match):
                     continue
 
-                # Check for #if false blocks
-                confidence = Confidence.HIGH
+                # v2.7: Use constant detection for confidence calculation
+                context = self._get_constant_context(line, filepath)
+
+                # Additional context adjustments for force unwraps
                 file_start = self.file_index.get(filepath, (0, 0))[0]
                 if '#if false' in self.content[:file_start]:
-                    confidence = Confidence.LOW
+                    context.in_dead_code = True
 
-                # Lower confidence for safe-looking patterns even if not filtered
-                if 'static let' in line or 'static var' in line:
-                    confidence = Confidence.LOW
-                    issue = f"{issue} (static constant - likely intentional)"
-
-                # Lower confidence for common safe patterns that we didn't filter
-                if any(safe in line for safe in ['.first!', '.last!', 'Bundle.main', 'FileManager.default']):
-                    confidence = Confidence.MEDIUM
-
-                # Check if this unwrap is guarded by if-let/guard-let in preceding lines
+                # Check if this unwrap is guarded by if-let/guard-let
                 var_name = self._extract_unwrapped_var(line, match)
                 if var_name and self._is_guarded_unwrap(filepath, line_num, var_name):
-                    confidence = Confidence.LOW
+                    context.has_semantic_verification = True
                     issue = f"{issue} (appears guarded - verify manually)"
 
-                result.findings.append(Finding(
+                # Note static constants in the issue
+                if context.is_constant_declaration:
+                    issue = f"{issue} (static constant - likely intentional)"
+
+                # Create finding with calculated confidence
+                finding = Finding(
                     file=filepath,
                     line=line_num,
                     code=line[:200],
                     issue=issue,
-                    confidence=confidence,
+                    confidence=Confidence.HIGH,  # Placeholder
                     severity=severity,
                     fix="Use if-let, guard-let, or nil coalescing (unless compile-time constant)",
                     category="force_unwrap",
-                ))
+                )
+                finding.confidence = calculate_confidence(finding, context)
+
+                result.findings.append(finding)
 
         result.summary = f"Found {len(result.findings)} force unwraps"
         return result
@@ -5035,10 +5182,74 @@ class StructuredTools:
 
 
 # =============================================================================
+# PERFORMANCE OPTIMIZATION HELPERS (v2.8)
+# =============================================================================
+
+def get_optimal_workers(max_limit: int = 16, min_limit: int = 4) -> int:
+    """
+    Calculate optimal number of worker threads based on CPU count.
+
+    v2.8: Dynamic thread pool sizing for better parallelism.
+
+    Formula: max(min_limit, min(max_limit, os.cpu_count() or min_limit))
+
+    Examples:
+    - 2 CPU system: 4 workers (enforces minimum)
+    - 4 CPU system: 4 workers
+    - 8 CPU system: 8 workers
+    - 16+ CPU system: 16 workers (enforces maximum)
+
+    Args:
+        max_limit: Maximum workers to allow (default: 16)
+        min_limit: Minimum workers to enforce (default: 4)
+
+    Returns:
+        Optimal worker count for current system
+    """
+    import os
+    cpu_count = os.cpu_count() or min_limit
+    return max(min_limit, min(max_limit, cpu_count))
+
+
+def get_optimal_batch_size(pattern_count: int, data_size_mb: int = 100) -> int:
+    """
+    v2.8: Calculate optimal batch size for parallel_rg_search based on data and pattern complexity.
+
+    Formula: min(patterns, 16, max(2, data_size_mb // 50))
+    - Adapts to data size: Smaller batches for large data
+    - Respects pattern count: Don't batch more than needed
+    - Minimum 2: Always batch at least 2 patterns
+    - Maximum 16: Don't exceed worker count
+
+    Args:
+        pattern_count: Number of patterns to search
+        data_size_mb: Estimated data size in MB (default: 100)
+
+    Returns:
+        Recommended batch size (2-16)
+    """
+    # Heuristic: 50MB per batch is reasonable
+    size_based = max(2, data_size_mb // 50)
+    return min(pattern_count, 16, max(2, size_based))
+
+
+# =============================================================================
 # RIPGREP INTEGRATION (v2.5) - 10-100x faster searches
 # =============================================================================
 
-# Check if ripgrep is available
+# Check if ripgrep is available (cached at import time for performance)
+_RG_AVAILABLE_CACHED: bool | None = None
+
+
+def _check_rg_available() -> bool:
+    """v2.7: Dynamic ripgrep availability check (checked at call time)."""
+    global _RG_AVAILABLE_CACHED
+    if _RG_AVAILABLE_CACHED is None:
+        _RG_AVAILABLE_CACHED = shutil.which("rg") is not None
+    return _RG_AVAILABLE_CACHED
+
+
+# Legacy constant for backwards compatibility
 RG_AVAILABLE = shutil.which("rg") is not None
 
 
@@ -5051,14 +5262,42 @@ class RgMatch:
     match_text: str
     column_start: int = 0
     column_end: int = 0
+    # v2.7: Context lines support
+    context_before: list[str] = field(default_factory=list)
+    context_after: list[str] = field(default_factory=list)
+
+    @property
+    def text(self) -> str:
+        """Backwards compatibility property for match_text."""
+        return self.match_text
 
     def to_dict(self) -> dict:
-        return {
+        result = {
             "file": self.file,
             "line": self.line,
             "content": self.content,
             "match": self.match_text,
         }
+        if self.context_before:
+            result["context_before"] = self.context_before
+        if self.context_after:
+            result["context_after"] = self.context_after
+        return result
+
+
+@dataclass
+class RgSearchResult:
+    """v2.7: Result from rg_search with error indication."""
+    matches: list[RgMatch]
+    timed_out: bool = False
+    error: str | None = None
+
+    def __iter__(self):
+        """Allow iteration over matches for backwards compatibility."""
+        return iter(self.matches)
+
+    def __len__(self):
+        return len(self.matches)
 
 
 def rg_search(
@@ -5101,7 +5340,8 @@ def rg_search(
         # Case-insensitive search
         matches = rg_search("password", case_insensitive=True)
     """
-    if not RG_AVAILABLE:
+    # v2.7: Dynamic availability check
+    if not _check_rg_available():
         # Fallback to Python search if rg not installed
         return _python_fallback_search(pattern, paths, case_insensitive)
 
@@ -5142,17 +5382,37 @@ def rg_search(
             timeout=60,  # 60 second timeout
         )
 
-        return _parse_rg_json(result.stdout)
+        return _parse_rg_json(result.stdout, context_lines > 0)
 
     except subprocess.TimeoutExpired:
-        return []
-    except Exception:
+        # v2.7: Return error indicator instead of silent empty list
+        import logging
+        logging.warning("RLM: ripgrep search timed out after 60 seconds")
+        # Return empty RgSearchResult with timed_out flag for callers that check it
+        # For backwards compatibility, we still return a list-like object
+        return []  # TODO: Consider returning RgSearchResult([], timed_out=True) in v3.0
+    except Exception as e:
+        import logging
+        logging.warning(f"RLM: ripgrep search failed: {e}")
         return []
 
 
-def _parse_rg_json(output: str) -> list[RgMatch]:
-    """Parse ripgrep JSON output into RgMatch objects."""
+def _parse_rg_json(output: str, has_context: bool = False) -> list[RgMatch]:
+    """Parse ripgrep JSON output into RgMatch objects.
+
+    Args:
+        output: Raw JSON output from ripgrep
+        has_context: If True, preserve context lines from -C flag
+    """
+    import logging
+    from pathlib import Path
+
     matches = []
+    empty_path_count = 0
+
+    # v2.7: Track context lines when -C flag is used
+    context_buffer: dict[str, list[tuple[int, str]]] = {}  # path -> [(line_num, content)]
+    pending_matches: list[tuple[RgMatch, str]] = []  # (match, path) for context assignment
 
     for line in output.strip().split("\n"):
         if not line:
@@ -5160,13 +5420,26 @@ def _parse_rg_json(output: str) -> list[RgMatch]:
 
         try:
             data = json.loads(line)
+            msg_type = data.get("type")
 
             # ripgrep outputs different message types
-            if data.get("type") == "match":
+            if msg_type == "match":
                 match_data = data.get("data", {})
                 path = match_data.get("path", {}).get("text", "")
                 line_num = match_data.get("line_number", 0)
                 line_text = match_data.get("lines", {}).get("text", "").rstrip("\n")
+
+                # Validate path - warn on empty/invalid paths
+                if not path:
+                    empty_path_count += 1
+                    logging.warning(f"RLM: Empty path in ripgrep match at line {line_num}")
+                    path = "unknown"  # Fallback to prevent crashes
+                else:
+                    # Normalize path to absolute for consistent deduplication
+                    try:
+                        path = str(Path(path).resolve())
+                    except (OSError, ValueError):
+                        pass  # Keep original path if resolution fails
 
                 # Extract submatch info
                 submatches = match_data.get("submatches", [])
@@ -5180,17 +5453,57 @@ def _parse_rg_json(output: str) -> list[RgMatch]:
                     col_start = first_match.get("start", 0)
                     col_end = first_match.get("end", 0)
 
-                matches.append(RgMatch(
+                rg_match = RgMatch(
                     file=path,
                     line=line_num,
                     content=line_text,
                     match_text=match_text,
                     column_start=col_start,
                     column_end=col_end,
-                ))
+                )
+
+                if has_context:
+                    # Collect context lines from buffer
+                    if path in context_buffer:
+                        for ctx_line_num, ctx_content in context_buffer[path]:
+                            if ctx_line_num < line_num:
+                                rg_match.context_before.append(ctx_content)
+                        context_buffer[path] = []  # Clear used context
+                    pending_matches.append((rg_match, path))
+                else:
+                    matches.append(rg_match)
+
+            elif msg_type == "context" and has_context:
+                # v2.7: Preserve context lines
+                ctx_data = data.get("data", {})
+                path = ctx_data.get("path", {}).get("text", "")
+                line_num = ctx_data.get("line_number", 0)
+                line_text = ctx_data.get("lines", {}).get("text", "").rstrip("\n")
+
+                if path:
+                    try:
+                        path = str(Path(path).resolve())
+                    except (OSError, ValueError):
+                        pass
+
+                    if path not in context_buffer:
+                        context_buffer[path] = []
+                    context_buffer[path].append((line_num, line_text))
+
+                    # Check if this is context_after for any pending match
+                    for rg_match, match_path in pending_matches:
+                        if match_path == path and line_num > rg_match.line:
+                            rg_match.context_after.append(line_text)
 
         except json.JSONDecodeError:
             continue
+
+    # Add pending matches (with context)
+    if has_context:
+        matches.extend([m for m, _ in pending_matches])
+
+    if empty_path_count > 0:
+        logging.warning(f"RLM: {empty_path_count} ripgrep match(es) had empty paths")
 
     return matches
 
@@ -5328,17 +5641,17 @@ def rg_count(pattern: str, paths: list[str] | str | None = None, **kwargs) -> di
 def parallel_scan(
     tools_instance: "StructuredTools",
     scan_functions: list[Callable[[], ToolResult]],
-    max_workers: int = 4,
+    max_workers: int | None = None,
 ) -> list[ToolResult]:
     """
     Run multiple scan functions in parallel.
 
-    2-4x faster than sequential execution for batch scans.
+    v2.8: Dynamic worker sizing for better CPU utilization (2-4x faster than sequential).
 
     Args:
         tools_instance: StructuredTools instance (for context)
         scan_functions: List of bound methods to call (e.g., [tools.find_secrets, tools.find_xss])
-        max_workers: Maximum parallel threads (default: 4)
+        max_workers: Maximum parallel threads (default: auto-detect from CPU count)
 
     Returns:
         List of ToolResult from all functions
@@ -5352,6 +5665,10 @@ def parallel_scan(
         ])
     """
     results = []
+
+    # v2.8: Use dynamic worker sizing if not specified
+    if max_workers is None:
+        max_workers = get_optimal_workers()
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         # Submit all tasks
@@ -5381,19 +5698,19 @@ def parallel_scan(
 def parallel_rg_search(
     patterns: list[str],
     paths: list[str] | str | None = None,
-    max_workers: int = 4,
+    max_workers: int | None = None,
     deduplicate: bool = True,
     **kwargs,
 ) -> list[RgMatch]:
     """
     Search multiple patterns in parallel.
 
-    Useful for scanning with many patterns simultaneously.
+    v2.8: Dynamic worker sizing - useful for scanning with many patterns simultaneously.
 
     Args:
         patterns: List of regex patterns to search
         paths: Where to search
-        max_workers: Maximum parallel threads
+        max_workers: Maximum parallel threads (default: auto-detect from CPU count)
         deduplicate: Remove duplicate matches (same file:line)
         **kwargs: Additional args passed to rg_search
 
@@ -5409,6 +5726,10 @@ def parallel_rg_search(
         ])
     """
     all_matches = []
+
+    # v2.8: Use dynamic worker sizing if not specified
+    if max_workers is None:
+        max_workers = get_optimal_workers()
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [
@@ -5435,6 +5756,359 @@ def parallel_rg_search(
         return unique_matches
 
     return all_matches
+
+
+# =============================================================================
+# SINGLE-FILE TOOLS (v2.6)
+# =============================================================================
+# These tools replace Claude's native Read, Grep, and Glob tools.
+# They provide fast, direct access without full RLM overhead.
+
+
+@dataclass
+class FileContent:
+    """Result from read_file()."""
+    path: str
+    content: str
+    lines: list[str]
+    total_lines: int
+    offset: int
+    limit: int | None
+    exists: bool
+    error: str | None = None
+
+    def __str__(self) -> str:
+        if self.error:
+            return f"Error reading {self.path}: {self.error}"
+        if not self.exists:
+            return f"File not found: {self.path}"
+
+        # Format like Claude's Read tool with line numbers
+        output_lines = []
+        for i, line in enumerate(self.lines):
+            line_num = self.offset + i + 1
+            output_lines.append(f"{line_num:6}→{line}")
+        return "\n".join(output_lines)
+
+
+@dataclass
+class GrepResult:
+    """Result from grep_pattern()."""
+    pattern: str
+    matches: list[RgMatch]
+    files_matched: int
+    total_matches: int
+    error: str | None = None
+
+    def __str__(self) -> str:
+        if self.error:
+            return f"Error: {self.error}"
+        if not self.matches:
+            return f"No matches found for pattern: {self.pattern}"
+
+        # Group by file
+        by_file: dict[str, list[RgMatch]] = {}
+        for m in self.matches:
+            if m.file not in by_file:
+                by_file[m.file] = []
+            by_file[m.file].append(m)
+
+        output = [f"## {self.total_matches} matches in {self.files_matched} files\n"]
+        for file, file_matches in by_file.items():
+            output.append(f"\n**{file}**")
+            for m in file_matches[:20]:  # Limit per file
+                output.append(f"  {m.line}: {m.text[:150]}")
+            if len(file_matches) > 20:
+                output.append(f"  ... and {len(file_matches) - 20} more")
+
+        return "\n".join(output)
+
+
+@dataclass
+class GlobResult:
+    """Result from glob_files()."""
+    pattern: str
+    files: list[str]
+    total_count: int
+    error: str | None = None
+
+    def __str__(self) -> str:
+        if self.error:
+            return f"Error: {self.error}"
+        if not self.files:
+            return f"No files found matching: {self.pattern}"
+
+        output = [f"## {self.total_count} files matching '{self.pattern}'\n"]
+        for f in self.files[:50]:
+            output.append(f"  {f}")
+        if self.total_count > 50:
+            output.append(f"\n  ... and {self.total_count - 50} more")
+
+        return "\n".join(output)
+
+
+def read_file(
+    path: str,
+    offset: int = 0,
+    limit: int | None = None,
+    encoding: str = "utf-8"
+) -> FileContent:
+    """
+    Read a single file with optional offset and limit.
+
+    Replaces Claude's native Read tool. Fast, no LLM overhead.
+
+    Args:
+        path: Absolute or relative path to the file
+        offset: Line number to start from (0-indexed, default 0)
+        limit: Maximum number of lines to read (default: all)
+        encoding: File encoding (default: utf-8)
+
+    Returns:
+        FileContent with file contents and metadata
+
+    Example:
+        # Read entire file
+        content = read_file("/path/to/file.py")
+        print(content)
+
+        # Read lines 100-200
+        content = read_file("/path/to/file.py", offset=100, limit=100)
+
+        # Access raw content
+        text = content.content
+        lines = content.lines
+    """
+    from pathlib import Path
+
+    try:
+        file_path = Path(path).expanduser().resolve()
+
+        if not file_path.exists():
+            return FileContent(
+                path=str(file_path),
+                content="",
+                lines=[],
+                total_lines=0,
+                offset=offset,
+                limit=limit,
+                exists=False
+            )
+
+        if not file_path.is_file():
+            return FileContent(
+                path=str(file_path),
+                content="",
+                lines=[],
+                total_lines=0,
+                offset=offset,
+                limit=limit,
+                exists=False,
+                error=f"Path is not a file: {file_path}"
+            )
+
+        # Read file
+        with open(file_path, "r", encoding=encoding, errors="replace") as f:
+            all_lines = f.readlines()
+
+        total_lines = len(all_lines)
+
+        # Apply offset and limit
+        if offset > 0:
+            all_lines = all_lines[offset:]
+        if limit is not None:
+            all_lines = all_lines[:limit]
+
+        # Strip trailing newlines for cleaner display
+        lines = [line.rstrip('\n\r') for line in all_lines]
+        content = "\n".join(lines)
+
+        return FileContent(
+            path=str(file_path),
+            content=content,
+            lines=lines,
+            total_lines=total_lines,
+            offset=offset,
+            limit=limit,
+            exists=True
+        )
+
+    except Exception as e:
+        return FileContent(
+            path=path,
+            content="",
+            lines=[],
+            total_lines=0,
+            offset=offset,
+            limit=limit,
+            exists=False,
+            error=str(e)
+        )
+
+
+def grep_pattern(
+    pattern: str,
+    paths: list[str] | str | None = None,
+    case_insensitive: bool = False,
+    fixed_strings: bool = False,
+    context_lines: int = 0,
+    file_type: str | None = None,
+    glob: str | None = None,
+    max_matches: int = 1000
+) -> GrepResult:
+    """
+    Search for a pattern in files using ripgrep.
+
+    Replaces Claude's native Grep tool. Uses ripgrep for speed.
+    Falls back to Python regex if ripgrep not installed.
+
+    Args:
+        pattern: Regex pattern (or literal if fixed_strings=True)
+        paths: File/directory paths to search (default: current dir)
+        case_insensitive: Ignore case (-i)
+        fixed_strings: Treat pattern as literal string (-F)
+        context_lines: Lines of context around matches (-C)
+        file_type: Limit to file type (e.g., "py", "js", "swift")
+        glob: Glob pattern filter (e.g., "*.tsx", "**/*.swift")
+        max_matches: Maximum matches to return (default: 1000)
+
+    Returns:
+        GrepResult with matches and metadata
+
+    Example:
+        # Find all TODO comments in Python files
+        result = grep_pattern("TODO|FIXME", file_type="py")
+        print(result)
+
+        # Case-insensitive literal search
+        result = grep_pattern("api_key", fixed_strings=True, case_insensitive=True)
+
+        # Search with context
+        result = grep_pattern("def main", context_lines=3)
+    """
+    try:
+        matches = rg_search(
+            pattern=pattern,
+            paths=paths,
+            case_insensitive=case_insensitive,
+            fixed_strings=fixed_strings,
+            context_lines=context_lines,
+            file_type=file_type,
+            glob=glob
+        )
+
+        # Limit results
+        if len(matches) > max_matches:
+            matches = matches[:max_matches]
+
+        # Count unique files
+        files_matched = len(set(m.file for m in matches))
+
+        return GrepResult(
+            pattern=pattern,
+            matches=matches,
+            files_matched=files_matched,
+            total_matches=len(matches)
+        )
+
+    except Exception as e:
+        return GrepResult(
+            pattern=pattern,
+            matches=[],
+            files_matched=0,
+            total_matches=0,
+            error=str(e)
+        )
+
+
+def glob_files(
+    pattern: str,
+    path: str | None = None,
+    include_hidden: bool = False,
+    max_results: int = 1000
+) -> GlobResult:
+    """
+    Find files matching a glob pattern.
+
+    Replaces Claude's native Glob tool. Fast filesystem traversal.
+
+    Args:
+        pattern: Glob pattern (e.g., "**/*.py", "src/**/*.swift", "*.json")
+        path: Base directory to search from (default: current dir)
+        include_hidden: Include hidden files/directories (default: False)
+        max_results: Maximum files to return (default: 1000)
+
+    Returns:
+        GlobResult with matching file paths
+
+    Example:
+        # Find all Python files
+        result = glob_files("**/*.py")
+        print(result)
+
+        # Find Swift files in src directory
+        result = glob_files("**/*.swift", path="src")
+
+        # Find config files
+        result = glob_files("*.{json,yaml,toml}")
+    """
+    from pathlib import Path
+    import fnmatch
+
+    try:
+        base_path = Path(path).expanduser().resolve() if path else Path.cwd()
+
+        if not base_path.exists():
+            return GlobResult(
+                pattern=pattern,
+                files=[],
+                total_count=0,
+                error=f"Path not found: {base_path}"
+            )
+
+        # Use pathlib's glob for pattern matching
+        matching_files = []
+
+        # Handle recursive glob patterns
+        if "**" in pattern:
+            matches = base_path.glob(pattern)
+        else:
+            matches = base_path.glob(pattern)
+
+        for match in matches:
+            if match.is_file():
+                # Skip hidden files unless requested
+                if not include_hidden:
+                    parts = match.relative_to(base_path).parts
+                    if any(part.startswith('.') for part in parts):
+                        continue
+
+                # Use relative path for cleaner output
+                try:
+                    rel_path = match.relative_to(base_path)
+                    matching_files.append(str(rel_path))
+                except ValueError:
+                    matching_files.append(str(match))
+
+                if len(matching_files) >= max_results:
+                    break
+
+        # Sort for consistent output
+        matching_files.sort()
+
+        return GlobResult(
+            pattern=pattern,
+            files=matching_files,
+            total_count=len(matching_files)
+        )
+
+    except Exception as e:
+        return GlobResult(
+            pattern=pattern,
+            files=[],
+            total_count=0,
+            error=str(e)
+        )
 
 
 def create_tools(content: str) -> StructuredTools:

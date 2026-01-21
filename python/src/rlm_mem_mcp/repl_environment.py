@@ -46,6 +46,9 @@ from .structured_tools import (
     # v2.5: Ripgrep integration and parallel scanning
     rg_search, rg_literal, rg_files, rg_count, RgMatch, RG_AVAILABLE,
     parallel_scan, parallel_rg_search,
+    # v2.6: Single-file tools (replace Claude's native Read, Grep, Glob)
+    read_file, grep_pattern, glob_files,
+    FileContent, GrepResult, GlobResult,
 )
 from .result_verifier import (
     QueryResultVerifier,
@@ -941,7 +944,8 @@ Start by selecting the appropriate tool(s), run them, VERIFY results, then set F
 
         async def _async_batch_query(queries: list[str], max_tokens: int) -> list[str]:
             """Execute multiple queries in parallel with semaphore for rate limiting."""
-            semaphore = asyncio.Semaphore(5)  # Max 5 concurrent requests
+            # v2.8: Increased from 5 to 10+ for better LLM API concurrency
+            semaphore = asyncio.Semaphore(10)  # Max 10 concurrent requests
 
             async def limited_query(text: str, idx: int) -> str:
                 async with semaphore:
@@ -1930,6 +1934,12 @@ Remove duplicates (same line, same issue). Keep all unique findings with their l
             "rg_count": rg_count,             # Count matches per file
             "parallel_rg_search": parallel_rg_search,  # Search multiple patterns in parallel
             "RG_AVAILABLE": RG_AVAILABLE,     # Check if ripgrep is installed
+
+            # ===== SINGLE-FILE TOOLS (v2.6) =====
+            # Replace Claude's native Read, Grep, Glob tools
+            "read_file": read_file,           # Read single file with offset/limit
+            "grep_pattern": grep_pattern,     # Search pattern in files (ripgrep wrapper)
+            "glob_files": glob_files,         # Find files by glob pattern
 
             **all_variables
         }
