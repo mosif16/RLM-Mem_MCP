@@ -2,6 +2,24 @@
 
 An MCP (Model Context Protocol) server implementing the **TRUE Recursive Language Model (RLM)** technique for ultimate context management with Claude Code.
 
+## ⚖️ Licensing & Pricing
+
+### Free Use (MIT License)
+- ✅ Personal projects
+- ✅ Academic research
+- ✅ Non-commercial open source
+- ✅ Non-profit organizations
+- ✅ Annual revenue < $50K
+
+### Commercial Use (Revenue Sharing Required)
+- 💰 **10% Revenue Share** for services/products using this technology
+- 🏢 Commercial licenses required for companies/enterprises
+- 📧 Contact: `msayf@recordandlearn.info`
+- 🌐 Website: recordandlearn.info
+- 📄 [Commercial License Details](./COMMERCIAL_LICENSE.md)
+
+**Important**: Commercial use without proper licensing voids all warranties and may result in legal action.
+
 **v2.9 Status**: 🚀 Optimization Initiative Underway
 - ✅ Code organization complete (5 new modules, 1,524 LOC)
 - 📊 Performance roadmap planned (60-100% cumulative gain)
@@ -175,16 +193,25 @@ Claude uses rlm_query_text({
 
 ### Environment Variables
 
+#### Core Configuration
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `OPENROUTER_API_KEY` | (required) | Your OpenRouter API key |
-| `RLM_MODEL` | `google/gemini-2.5-flash-lite` | Model for RLM processing |
-| `RLM_AGGREGATOR_MODEL` | `google/gemini-2.5-flash-lite` | Model for final aggregation |
+| `RLM_MODEL` | `x-ai/grok-code-fast-1` | Model for RLM processing |
+| `RLM_AGGREGATOR_MODEL` | `x-ai/grok-code-fast-1` | Model for final aggregation |
 | `RLM_USE_CACHE` | `true` | Enable prompt caching |
 | `RLM_CACHE_TTL` | `5m` | Cache TTL (`5m` or `1h`) |
 | `RLM_MAX_RESULT_TOKENS` | `4000` | Max tokens in result |
 | `RLM_MAX_CHUNK_TOKENS` | `8000` | Max tokens per chunk |
 | `RLM_OVERLAP_TOKENS` | `200` | Overlap tokens between chunks |
+
+#### Commercial Licensing (Optional)
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `RLM_COMMERCIAL_LICENSE_KEY` | (empty) | Commercial license key for revenue sharing |
+| `RLM_ORGANIZATION_NAME` | (empty) | Organization name for commercial licensing |
+| `RLM_ENABLE_TELEMETRY` | `false` | Enable usage telemetry for license compliance |
+| `RLM_LICENSE_SERVER_URL` | `https://recordandlearn.info/license` | License validation server URL |
 
 ### File Filtering
 
@@ -392,4 +419,8 @@ pytest
 
 ## License
 
-MIT License - see [LICENSE](LICENSE) for details.
+Business Source License 1.1 with commercial licensing for monetization - see [LICENSE](LICENSE) for details.
+
+- **Free Use**: MIT license for non-commercial personal/academic use
+- **Commercial Use**: Revenue sharing required - see [COMMERCIAL_LICENSE.md](COMMERCIAL_LICENSE.md)
+- **Terms of Service**: [TERMS_OF_SERVICE.md](TERMS_OF_SERVICE.md)

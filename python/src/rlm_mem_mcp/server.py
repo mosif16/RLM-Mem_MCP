@@ -48,6 +48,7 @@ from .rlm_processor import RLMProcessor, SemanticCache, ProgressEvent
 from .cache_manager import CacheManager
 from .utils import get_memory_monitor, get_metrics_collector
 from .result_verifier import ResultVerifier, BatchVerifier
+from .licensing import validate_commercial_license
 from .project_analyzer import ProjectAnalyzer
 from .structured_tools import (
     StructuredTools, ToolResult,
@@ -307,6 +308,21 @@ def _log_timing(operation: str, start_time: float, **extra: Any) -> None:
 def create_server() -> Server:
     """Create and configure the MCP server."""
     server = Server("rlm-recursive-memory")
+
+    # Validate commercial licensing on server startup
+    config = get_config()
+    is_valid, message, license_info = validate_commercial_license(config)
+
+    if not is_valid:
+        print(f"\n🚫 LICENSE VALIDATION FAILED 🚫", file=sys.stderr)
+        print(f"Message: {message}", file=sys.stderr)
+        print(f"For commercial licensing: licensing@rlm-mem.dev", file=sys.stderr)
+        print(f"Free use terms: Read COMMERCIAL_LICENSE.md and TERMS_OF_SERVICE.md\n", file=sys.stderr)
+        # Continue with limited functionality - server still starts but shows licensing warning
+
+    if license_info and license_info.is_valid:
+        print(f"✅ Commercial license validated for: {license_info.organization_name}", file=sys.stderr)
+        print(f"Revenue share rate: {license_info.revenue_share_rate * 100:.1f}%\n", file=sys.stderr)
 
     @server.list_tools()
     async def list_tools() -> list[Tool]:

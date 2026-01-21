@@ -335,6 +335,11 @@ def _get_skipped_directories() -> Set[str]:
 class RLMConfig:
     """Configuration for RLM processing."""
 
+    # Licensing & Commercial Use
+    commercial_license_key: str = field(default_factory=lambda: os.getenv("RLM_COMMERCIAL_LICENSE_KEY", ""))
+    organization_name: str = field(default_factory=lambda: os.getenv("RLM_ORGANIZATION_NAME", ""))
+    enable_telemetry: bool = field(default_factory=lambda: os.getenv("RLM_ENABLE_TELEMETRY", "false").lower() == "true")
+
     # API Configuration (OpenRouter)
     api_key: str = field(default_factory=lambda: os.getenv("OPENROUTER_API_KEY", ""))
     api_base_url: str = "https://openrouter.ai/api/v1"

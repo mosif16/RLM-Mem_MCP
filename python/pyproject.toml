@@ -7,15 +7,18 @@ name = "rlm-mem-mcp"
 version = "1.0.0"
 description = "MCP Server implementing RLM (Recursive Language Model) for ultimate context management via OpenRouter"
 requires-python = ">=3.10"
-license = "MIT"
+license = {text = "Business Source License 1.1 + MIT"}
 keywords = ["mcp", "rlm", "context-management", "openrouter", "gemini"]
 authors = [
-    { name = "RLM-Mem MCP Contributors" }
+    { name = "Record & Learn LLC", email = "msayf@recordandlearn.info" }
+]
+maintainers = [
+    { name = "Record & Learn LLC", email = "msayf@recordandlearn.info" }
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: Business Source License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
@@ -46,8 +49,9 @@ dev = [
 rlm-mcp-server = "rlm_mem_mcp.server:main"
 
 [project.urls]
-Homepage = "https://github.com/mosif16/RLM-Mem_MCP"
+Homepage = "https://recordandlearn.info"
 Repository = "https://github.com/mosif16/RLM-Mem_MCP"
+Documentation = "https://recordandlearn.info/docs"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/rlm_mem_mcp"]
