@@ -41,6 +41,40 @@ from .cache_manager import CacheManager
 from .file_collector import CollectionResult
 from .incremental_cache import IncrementalCache, get_incremental_cache
 
+# Import from refactored modules
+from .chunking import (
+    extract_query_keywords,
+    smart_chunk_filter,
+    find_function_boundaries,
+    function_aware_chunking,
+    hybrid_verify_finding,
+)
+from .query_routing import (
+    get_session_context,
+    save_session_context,
+    build_iterative_query,
+    clear_session_context,
+    detect_query_type,
+)
+from .result_aggregation import (
+    ProgressEvent,
+    ChunkResult,
+    RLMResult,
+    merge_chunk_results,
+    deduplicate_findings,
+    aggregate_scanner_results,
+    format_findings_markdown,
+)
+from .scanner_integration import (
+    BROAD_QUERY_PATTERNS,
+    QUERY_DECOMPOSITIONS,
+    QUERY_TYPE_KEYWORDS,
+    enhance_query,
+    is_broad_query,
+    detect_query_type_from_keywords,
+    get_decomposition_queries,
+)
+
 
 # Performance tuning constants
 LLM_REQUEST_TIMEOUT_SECONDS = 120  # Max time for a single LLM call
@@ -222,538 +256,17 @@ def get_model_selector() -> AdaptiveModelSelector:
 
 
 # =============================================================================
-# L2: TOKEN OPTIMIZATION - SMART CHUNK FILTERING
+# NOTE: The following are now imported from refactored modules:
+# - chunking.py: extract_query_keywords, smart_chunk_filter, find_function_boundaries,
+#                function_aware_chunking, hybrid_verify_finding
+# - query_routing.py: get_session_context, save_session_context, build_iterative_query,
+#                     clear_session_context, detect_query_type
+# - result_aggregation.py: ProgressEvent, ChunkResult, RLMResult, merge_chunk_results,
+#                          deduplicate_findings, aggregate_scanner_results, format_findings_markdown
+# - scanner_integration.py: BROAD_QUERY_PATTERNS, QUERY_DECOMPOSITIONS, QUERY_TYPE_KEYWORDS,
+#                           enhance_query, is_broad_query, detect_query_type_from_keywords,
+#                           get_decomposition_queries
 # =============================================================================
-
-def extract_query_keywords(query: str) -> list[str]:
-    """Extract searchable keywords from a query."""
-    # Common stop words to ignore
-    stop_words = {'find', 'search', 'look', 'for', 'the', 'a', 'an', 'in', 'is', 'are', 'all', 'any'}
-
-    words = re.findall(r'\b\w+\b', query.lower())
-    keywords = [w for w in words if w not in stop_words and len(w) > 2]
-
-    # Add domain-specific keywords
-    if 'security' in query.lower():
-        keywords.extend(['password', 'secret', 'key', 'token', 'auth', 'eval', 'exec'])
-    if 'ios' in query.lower() or 'swift' in query.lower():
-        keywords.extend(['unwrap', 'weak', 'self', 'optional', 'guard'])
-
-    return list(set(keywords))
-
-
-def smart_chunk_filter(chunk: str, query: str, context_lines: int = 10) -> str:
-    """
-    L2: Extract only query-relevant portions of a chunk before LLM call.
-
-    This reduces token usage by 30-50% by filtering irrelevant content.
-    """
-    keywords = extract_query_keywords(query)
-
-    if not keywords:
-        return chunk  # Can't filter without keywords
-
-    lines = chunk.split('\n')
-    relevant_indices: set[int] = set()
-
-    # Find lines matching keywords and include context
-    for i, line in enumerate(lines):
-        line_lower = line.lower()
-        if any(kw in line_lower for kw in keywords):
-            # Include context window around match
-            start = max(0, i - context_lines)
-            end = min(len(lines), i + context_lines + 1)
-            relevant_indices.update(range(start, end))
-
-    if not relevant_indices:
-        # No matches - return truncated preview
-        return '\n'.join(lines[:50]) + "\n... (no keyword matches, showing first 50 lines)"
-
-    # Build filtered content preserving order
-    sorted_indices = sorted(relevant_indices)
-    filtered_lines = []
-    last_idx = -1
-
-    for idx in sorted_indices:
-        if last_idx >= 0 and idx > last_idx + 1:
-            filtered_lines.append("... (skipped lines)")
-        filtered_lines.append(lines[idx])
-        last_idx = idx
-
-    return '\n'.join(filtered_lines)
-
-
-# =============================================================================
-# L7: FUNCTION-AWARE CHUNKING FOR CONTEXT MANAGEMENT
-# =============================================================================
-
-def find_function_boundaries(content: str, file_type: str) -> list[tuple[int, int, str]]:
-    """
-    L7: Find function/method boundaries in source code.
-
-    Returns list of (start_pos, end_pos, function_name) tuples.
-    """
-    boundaries = []
-
-    if file_type in ['.py']:
-        # Python: def/async def/class
-        pattern = r'^(async\s+)?def\s+(\w+)|^class\s+(\w+)'
-        for match in re.finditer(pattern, content, re.MULTILINE):
-            start = match.start()
-            name = match.group(2) or match.group(3) or "unknown"
-            # Find end by next function/class at same indent or EOF
-            indent = len(content[content.rfind('\n', 0, start)+1:start])
-            end_pattern = rf'^.{{{indent}}}(def |class |async def )'
-            end_match = re.search(end_pattern, content[start+1:], re.MULTILINE)
-            end = start + end_match.start() + 1 if end_match else len(content)
-            boundaries.append((start, end, name))
-
-    elif file_type in ['.swift']:
-        # Swift: func/class/struct/enum
-        pattern = r'(func|class|struct|enum|extension)\s+(\w+)'
-        for match in re.finditer(pattern, content):
-            start = match.start()
-            name = match.group(2)
-            # Find matching brace end
-            brace_count = 0
-            in_func = False
-            end = start
-            for i, char in enumerate(content[start:]):
-                if char == '{':
-                    brace_count += 1
-                    in_func = True
-                elif char == '}':
-                    brace_count -= 1
-                    if in_func and brace_count == 0:
-                        end = start + i + 1
-                        break
-            boundaries.append((start, end, name))
-
-    elif file_type in ['.js', '.ts', '.tsx', '.jsx']:
-        # JavaScript/TypeScript: function/class/arrow functions
-        pattern = r'(function\s+(\w+)|class\s+(\w+)|const\s+(\w+)\s*=\s*(?:async\s*)?\()'
-        for match in re.finditer(pattern, content):
-            start = match.start()
-            name = match.group(2) or match.group(3) or match.group(4) or "anonymous"
-            # Simple brace matching
-            brace_count = 0
-            in_func = False
-            end = start
-            for i, char in enumerate(content[start:]):
-                if char == '{':
-                    brace_count += 1
-                    in_func = True
-                elif char == '}':
-                    brace_count -= 1
-                    if in_func and brace_count == 0:
-                        end = start + i + 1
-                        break
-            boundaries.append((start, end, name))
-
-    return boundaries
-
-
-def function_aware_chunking(content: str, file_type: str, max_chunk_tokens: int = 8000) -> list[str]:
-    """
-    L7: Chunk content at function/class boundaries instead of arbitrary token limits.
-
-    This prevents truncating code mid-logic and improves analysis accuracy.
-    """
-    # Rough estimate: 1 token ≈ 4 chars
-    max_chars = max_chunk_tokens * 4
-
-    boundaries = find_function_boundaries(content, file_type)
-
-    if not boundaries:
-        # Fallback to simple chunking if no functions found
-        chunks = []
-        for i in range(0, len(content), max_chars):
-            chunks.append(content[i:i + max_chars])
-        return chunks
-
-    chunks = []
-    current_chunk = ""
-    current_size = 0
-
-    for start, end, name in boundaries:
-        func_content = content[start:end]
-        func_size = len(func_content)
-
-        if func_size > max_chars:
-            # Function too large - split it with overlap
-            if current_chunk:
-                chunks.append(current_chunk)
-                current_chunk = ""
-                current_size = 0
-
-            # Split large function
-            for i in range(0, func_size, max_chars - 500):  # 500 char overlap
-                chunks.append(f"# Part of {name}\n" + func_content[i:i + max_chars])
-
-        elif current_size + func_size > max_chars:
-            # Would exceed limit - save current and start new
-            chunks.append(current_chunk)
-            current_chunk = func_content
-            current_size = func_size
-
-        else:
-            # Add to current chunk
-            current_chunk += func_content
-            current_size += func_size
-
-    if current_chunk:
-        chunks.append(current_chunk)
-
-    return chunks
-
-
-# =============================================================================
-# L6: HYBRID SEARCH - REGEX + SEMANTIC VERIFICATION
-# =============================================================================
-
-def hybrid_verify_finding(finding_code: str, finding_issue: str, context: str) -> tuple[bool, str]:
-    """
-    L6: Verify a regex-based finding using semantic analysis.
-
-    Returns (is_valid, reason).
-    """
-    # Quick heuristic checks before LLM call
-    false_positive_patterns = [
-        (r'#.*' + re.escape(finding_code[:20]), "Appears in comment"),
-        (r'""".*' + re.escape(finding_code[:20]) + r'.*"""', "Appears in docstring"),
-        (r"'''.*" + re.escape(finding_code[:20]) + r".*'''", "Appears in docstring"),
-        (r'//.*' + re.escape(finding_code[:20]), "Appears in comment"),
-        (r'/\*.*' + re.escape(finding_code[:20]) + r'.*\*/', "Appears in block comment"),
-    ]
-
-    for pattern, reason in false_positive_patterns:
-        try:
-            if re.search(pattern, context, re.DOTALL | re.IGNORECASE):
-                return False, reason
-        except re.error:
-            pass
-
-    # Check for test file patterns
-    test_indicators = ['test_', '_test.', 'spec.', 'mock', 'fixture', 'assert']
-    if any(ind in context.lower() for ind in test_indicators):
-        return True, "Test file - lower confidence"
-
-    return True, "Verified"
-
-
-# =============================================================================
-# L8: ITERATIVE REFINEMENT - SESSION CONTEXT PRESERVATION
-# =============================================================================
-
-# Global session context store
-_session_contexts: dict[str, dict] = {}
-
-
-def get_session_context(session_id: str) -> dict | None:
-    """L8: Retrieve prior session context for iterative refinement."""
-    return _session_contexts.get(session_id)
-
-
-def save_session_context(session_id: str, context: dict):
-    """L8: Save session context for follow-up queries."""
-    # Limit stored sessions
-    if len(_session_contexts) >= 100:
-        # Remove oldest
-        oldest = min(_session_contexts.keys(), key=lambda k: _session_contexts[k].get('timestamp', 0))
-        del _session_contexts[oldest]
-
-    _session_contexts[session_id] = {
-        **context,
-        'timestamp': time.time()
-    }
-
-
-def build_iterative_query(query: str, session_id: str) -> str:
-    """
-    L8: Build query that incorporates prior session context.
-
-    This enables iterative refinement without re-analyzing everything.
-    """
-    prior = get_session_context(session_id)
-    if not prior:
-        return query
-
-    findings_summary = prior.get('findings_summary', '')
-    files_analyzed = prior.get('files_analyzed', [])
-
-    if findings_summary:
-        return f"""Prior analysis found:
-{findings_summary}
-
-Files already analyzed: {', '.join(files_analyzed[:10])}
-
-Follow-up query: {query}
-
-Focus on:
-1. Areas not yet covered
-2. Deeper analysis of flagged issues
-3. New patterns not in prior findings"""
-
-    return query
-
-
-def clear_session_context(session_id: str):
-    """L8: Clear session context."""
-    if session_id in _session_contexts:
-        del _session_contexts[session_id]
-
-
-# Query quality detection - patterns that indicate overly broad queries
-# NOTE: These patterns should NOT have $ anchor - we want partial matching
-BROAD_QUERY_PATTERNS = [
-    # Audit/review patterns (no $ anchor for partial matching)
-    r"^(audit|check|review|analyze|find)\s+(everything|all|the\s+codebase|this\s+codebase)",
-    r"^find\s+(all\s+)?(problems|issues|bugs)",
-    r"^(security\s+)?audit",
-    r"^check\s+(for\s+)?security",
-    r"^review\s+(the\s+)?code",
-    r"^summarize",
-    # Common vague patterns
-    r"^find\s+security\s+(issues|problems|vulnerabilities)$",
-    r"^(look\s+for|search\s+for)\s+(issues|problems|bugs)",
-    r"^what.*wrong",
-    r"^any\s+(issues|problems|bugs)",
-    # iOS/Swift specific broad patterns
-    r"^find\s+(force\s+)?unwraps?$",
-    r"^check\s+(for\s+)?(memory\s+)?leaks?$",
-    r"^find\s+swift\s+(issues|problems)$",
-    r"^review\s+(ios|swift)\s+code$",
-    # Python specific broad patterns
-    r"^find\s+python\s+(issues|problems)$",
-    r"^check\s+python\s+code$",
-    # JavaScript/TypeScript broad patterns
-    r"^find\s+(js|javascript|typescript|ts)\s+(issues|problems)$",
-    r"^review\s+(react|vue|angular)\s+code$",
-    # API/backend broad patterns
-    r"^check\s+(api|backend|server)$",
-    r"^find\s+api\s+(issues|problems)$",
-    # General broad patterns
-    r"^what\s+does\s+this\s+(do|code\s+do)$",
-    r"^explain\s+(this|the\s+code)$",
-    r"^how\s+does\s+this\s+work$",
-]
-
-# Enhanced decomposition templates with detailed sub-queries
-# Each sub-query is designed to generate specific, actionable Python code
-QUERY_DECOMPOSITIONS = {
-    "security": [
-        "Find INJECTION vulnerabilities: (1) SQL injection via string concatenation or f-strings in queries (2) Command injection via subprocess, os.system, os.popen with user input (3) Code injection via eval(), exec(), compile() with external data. For each finding: file:line, code snippet, severity (CRITICAL/HIGH/MEDIUM).",
-        "Find HARDCODED SECRETS: (1) API keys matching patterns like 'sk-', 'api_key=', 'apikey' (2) Passwords in variables named password, passwd, pwd, secret (3) Private keys, tokens, credentials in source. For each: file:line, code snippet, secret type.",
-        "Find AUTH/ACCESS issues: (1) Missing @login_required or auth decorators on sensitive endpoints (2) Broken access controls - missing permission checks (3) Session issues - insecure cookies, missing CSRF. For each: file:line, code snippet.",
-        "Find DATA EXPOSURE: (1) Sensitive data in logs (passwords, tokens, PII) (2) Unencrypted storage of secrets (3) Debug endpoints exposing internal state. For each: file:line, code snippet.",
-    ],
-    "quality": [
-        "Find CODE COMPLEXITY issues: (1) Functions over 50 lines - list with line counts (2) Cyclomatic complexity over 10 (3) Classes over 500 lines. For each: file:line, metric value, suggestion.",
-        "Find ERROR HANDLING issues: (1) Bare except: clauses that catch everything (2) Empty except blocks that swallow errors (3) Missing try/except around file I/O, network calls, JSON parsing. For each: file:line, code snippet.",
-        "Find CODE SMELLS: (1) Duplicate code blocks (similar logic in multiple places) (2) Dead code - unreachable branches, unused functions (3) Magic numbers without constants. For each: file:line, description.",
-        "Find TYPE SAFETY issues: (1) Missing type hints on public functions (2) Any type usage that should be specific (3) Unsafe casts or coercion. For each: file:line, suggestion.",
-    ],
-    "architecture": [
-        "Map PROJECT STRUCTURE: (1) List all modules/packages with one-line purpose (2) Identify entry points (main, CLI, API endpoints) (3) List external dependencies and their roles.",
-        "Map DATA FLOW: (1) How data enters the system (APIs, files, user input) (2) How data is processed and transformed (3) How data exits (responses, files, external calls).",
-        "Find ARCHITECTURAL CONCERNS: (1) Circular dependencies between modules (2) God classes with too many responsibilities (3) Tight coupling - classes that know too much about each other (4) Missing abstraction layers.",
-    ],
-    "ios": [
-        "Find FORCE UNWRAPS: Look for '!' used for force unwrapping (NOT '!=' comparisons). Match: variable!.method, try!, as!, implicitly unwrapped properties. For each: file:line, code snippet, safer alternative.",
-        "Find MEMORY ISSUES: (1) Closures missing [weak self] or [unowned self] (2) Delegate properties not marked weak (3) Strong reference cycles in class properties. For each: file:line, code snippet, fix.",
-        "Find CONCURRENCY ISSUES: (1) UI updates not on main thread (2) Missing @MainActor on UI-touching code (3) Data races - shared mutable state without synchronization. For each: file:line, code snippet.",
-        "Find SWIFTUI ISSUES: (1) @ObservedObject with default value (should be @StateObject) (2) Heavy computation in body (3) Missing .task or .onAppear for async work. For each: file:line, code snippet.",
-    ],
-    "python": [
-        "Find PYTHON SECURITY: (1) pickle.loads with untrusted data (2) yaml.load without SafeLoader (3) eval/exec with user input (4) subprocess with shell=True. For each: file:line, code snippet, severity.",
-        "Find PYTHON QUALITY: (1) Missing docstrings on public functions (2) Mutable default arguments (def f(x=[]):) (3) Bare except clauses (4) Using type() instead of isinstance(). For each: file:line, code snippet.",
-        "Find PYTHON ASYNC: (1) Blocking calls in async functions (2) Missing await on coroutines (3) sync functions called where async expected. For each: file:line, code snippet.",
-    ],
-    "javascript": [
-        "Find JS SECURITY: (1) innerHTML with user data (XSS) (2) eval() usage (3) document.write() (4) Regex DoS (catastrophic backtracking). For each: file:line, code snippet, severity.",
-        "Find JS QUALITY: (1) var instead of let/const (2) == instead of === (3) Missing error handling on promises (4) Callback hell (deeply nested callbacks). For each: file:line, code snippet.",
-        "Find REACT ISSUES: (1) Missing key prop in lists (2) Direct state mutation (3) useEffect with missing dependencies (4) Unnecessary re-renders. For each: file:line, code snippet.",
-    ],
-    "api": [
-        "Find API SECURITY: (1) Missing authentication on endpoints (2) Missing rate limiting (3) SQL injection in query params (4) Mass assignment vulnerabilities. For each: file:line, code snippet.",
-        "Find API QUALITY: (1) Missing input validation (2) Inconsistent error responses (3) Missing pagination on list endpoints (4) N+1 query patterns. For each: file:line, code snippet.",
-        "Map API ENDPOINTS: List all endpoints with: method, path, auth requirement, request/response types.",
-    ],
-    "database": [
-        "Find DB SECURITY: (1) SQL injection via string formatting (2) Hardcoded credentials (3) Missing parameterized queries (4) Excessive permissions. For each: file:line, code snippet.",
-        "Find DB QUALITY: (1) N+1 query patterns (2) Missing indexes on queried columns (3) Large transactions (4) Missing connection pooling. For each: file:line, code snippet.",
-        "Map DB SCHEMA: List all tables/models, their fields, relationships, and indexes.",
-    ],
-    "testing": [
-        "Find TEST QUALITY: (1) Tests without assertions (2) Flaky tests - time-dependent, order-dependent (3) Missing edge case coverage (4) Tests that test implementation not behavior. For each: file:line, description.",
-        "Find TEST COVERAGE GAPS: (1) Public functions without tests (2) Error paths not tested (3) Integration points not tested. List functions/modules lacking tests.",
-    ],
-}
-
-# Query type keywords for detection
-QUERY_TYPE_KEYWORDS = {
-    "ios": ["swift", "ios", "xcode", "unwrap", "swiftui", "uikit", "storekit", "widget", "cocoa", "objc", "objective-c"],
-    "security": ["security", "vulnerab", "injection", "xss", "csrf", "secret", "password", "auth", "exploit", "attack", "hack"],
-    "quality": ["quality", "code smell", "refactor", "clean", "duplicate", "complexity", "maintainab", "readable"],
-    "architecture": ["architecture", "structure", "module", "depend", "design", "pattern", "layer", "component"],
-    "python": ["python", "py", "django", "flask", "fastapi", "pytest", "pip", "venv"],
-    "javascript": ["javascript", "js", "typescript", "ts", "react", "vue", "angular", "node", "npm", "webpack"],
-    "api": ["api", "endpoint", "rest", "graphql", "route", "controller", "request", "response"],
-    "database": ["database", "db", "sql", "query", "orm", "model", "migration", "schema", "table"],
-    "testing": ["test", "spec", "coverage", "mock", "fixture", "assert", "unittest", "pytest", "jest"],
-}
-
-
-def enhance_query(query: str, detected_type: str) -> str:
-    """
-    Enhance a vague query with specific search criteria.
-
-    This transforms broad queries into actionable search instructions
-    that generate better Python code in the REPL.
-
-    Args:
-        query: Original user query
-        detected_type: Detected query type (security, ios, python, etc.)
-
-    Returns:
-        Enhanced query with specific criteria
-    """
-    query_lower = query.lower().strip()
-
-    # Enhancement templates by query type
-    enhancements = {
-        "security": """
-Analyze for security vulnerabilities:
-1. INJECTION: SQL (string concat in queries), Command (subprocess/os.system), Code (eval/exec)
-2. SECRETS: Hardcoded API keys, passwords, tokens, private keys
-3. AUTH: Missing authentication, broken access control, session issues
-4. DATA: Sensitive data in logs, unencrypted storage, debug endpoints
-
-For each finding report: file:line [Confidence: HIGH/MEDIUM/LOW], code snippet, severity, fix suggestion.""",
-
-        "ios": """
-Analyze Swift/iOS code for:
-1. MEMORY: Force unwraps (!), missing [weak self], retain cycles, delegate references
-2. CONCURRENCY: Main thread violations, missing @MainActor, data races
-3. SWIFTUI: @ObservedObject vs @StateObject, heavy body computation
-4. QUALITY: Hardcoded strings, missing localization, deprecated APIs
-
-For each finding report: file:line [Confidence: HIGH/MEDIUM/LOW], code snippet, safer alternative.""",
-
-        "python": """
-Analyze Python code for:
-1. SECURITY: pickle with untrusted data, yaml.load without SafeLoader, eval/exec, subprocess shell=True
-2. QUALITY: Missing docstrings, mutable default args, bare except, type() vs isinstance()
-3. ASYNC: Blocking calls in async, missing await, sync/async mixing
-
-For each finding report: file:line [Confidence: HIGH/MEDIUM/LOW], code snippet, fix.""",
-
-        "javascript": """
-Analyze JavaScript/TypeScript code for:
-1. SECURITY: innerHTML XSS, eval(), document.write(), regex DoS
-2. QUALITY: var vs let/const, == vs ===, unhandled promises, callback hell
-3. REACT: Missing keys, state mutation, useEffect deps, re-render issues
-
-For each finding report: file:line [Confidence: HIGH/MEDIUM/LOW], code snippet, fix.""",
-
-        "api": """
-Analyze API code for:
-1. SECURITY: Missing auth, no rate limiting, injection vulnerabilities
-2. QUALITY: Missing validation, inconsistent errors, no pagination, N+1 queries
-3. STRUCTURE: List all endpoints with method, path, auth requirement
-
-For each finding report: file:line [Confidence: HIGH/MEDIUM/LOW], code snippet.""",
-
-        "database": """
-Analyze database code for:
-1. SECURITY: SQL injection, hardcoded credentials, missing parameterization
-2. PERFORMANCE: N+1 queries, missing indexes, large transactions
-3. SCHEMA: Map tables, relationships, indexes
-
-For each finding report: file:line [Confidence: HIGH/MEDIUM/LOW], code snippet.""",
-
-        "quality": """
-Analyze code quality:
-1. COMPLEXITY: Functions >50 lines, cyclomatic complexity >10, god classes
-2. ERRORS: Bare except, empty catch, missing error handling on I/O
-3. SMELLS: Duplicate code, dead code, magic numbers, poor naming
-
-For each finding report: file:line [Confidence: HIGH/MEDIUM/LOW], description, suggestion.""",
-
-        "architecture": """
-Analyze architecture:
-1. STRUCTURE: List all modules with purpose, entry points, external dependencies
-2. DATA FLOW: How data enters, transforms, and exits the system
-3. CONCERNS: Circular deps, god classes, tight coupling, missing abstractions
-
-Report with file references where applicable.""",
-
-        "testing": """
-Analyze test quality:
-1. QUALITY: Tests without assertions, flaky tests, implementation-testing
-2. COVERAGE: Public functions without tests, untested error paths
-3. STRUCTURE: Test organization, fixture usage, mock patterns
-
-For each finding report: file:line, description, improvement suggestion.""",
-    }
-
-    # If we have a specific enhancement, use it
-    if detected_type in enhancements:
-        return f"{query}\n\n{enhancements[detected_type]}"
-
-    # Default enhancement for general queries
-    return f"""{query}
-
-Analyze thoroughly and report findings with:
-- file:line reference for each finding
-- [Confidence: HIGH/MEDIUM/LOW] based on verification
-- Code snippet showing the issue
-- Specific, actionable suggestion for improvement"""
-
-
-@dataclass
-class ProgressEvent:
-    """Structured progress event for streaming updates."""
-    event_type: str  # "start", "file_collected", "chunk_analyzed", "finding_verified", "complete", "error"
-    message: str
-    progress_percent: float
-    details: dict = field(default_factory=dict)
-
-    def to_dict(self) -> dict:
-        return {
-            "event_type": self.event_type,
-            "message": self.message,
-            "progress_percent": self.progress_percent,
-            "details": self.details,
-        }
-
-
-@dataclass
-class ChunkResult:
-    """Result from processing a single chunk."""
-
-    chunk_id: int
-    content_preview: str  # First 200 chars
-    response: str
-    token_count: int
-    relevance_score: float
-    processing_time_ms: int
-
-
-@dataclass
-class RLMResult:
-    """Final result from RLM processing."""
-
-    query: str
-    scope: str  # Description of what was processed
-    response: str
-    chunk_results: list[ChunkResult] = field(default_factory=list)
-    total_tokens_processed: int = 0
-    total_api_calls: int = 0
-    cache_hits: int = 0
-    processing_time_ms: int = 0
-    truncated: bool = False
-    error: str | None = None
 
 
 class CircuitBreaker:

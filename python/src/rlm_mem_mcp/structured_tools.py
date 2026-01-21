@@ -18,6 +18,10 @@ All tools return a ToolResult with:
 v2.5 Additions:
     - Ripgrep integration for 10-100x faster searches
     - Parallel scanning for 2-4x faster batch operations
+
+v2.9 Additions:
+    - Scanner modules refactored into scanners/ package
+    - Re-exports from new modules for backward compatibility
 """
 
 import re
@@ -29,6 +33,40 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Callable, Any
 from enum import Enum
+
+# v2.9: Re-export scanner modules for backward compatibility
+# Users can import from here or directly from the scanner modules
+from .scanners import (
+    SecurityScanner,
+    create_security_scanner,
+    iOSSwiftScanner,
+    create_ios_swift_scanner,
+    WebFrontendScanner,
+    create_web_frontend_scanner,
+    RustScanner,
+    create_rust_scanner,
+    NodeScanner,
+    create_node_scanner,
+    QualityScanner,
+    create_quality_scanner,
+    ArchitectureScanner,
+    create_architecture_scanner,
+    BatchScanner,
+    create_batch_scanner,
+)
+
+# Re-export base classes and patterns
+from .scan_base import ScannerBase
+from .scan_patterns import (
+    SECRET_PATTERNS,
+    SQL_INJECTION_PATTERNS,
+    COMMAND_INJECTION_PATTERNS,
+    XSS_PATTERNS,
+    SANITIZER_PATTERNS,
+    QUALITY_PATTERNS,
+    IOS_PATTERNS,
+    REACT_PATTERNS,
+)
 
 
 class Confidence(Enum):
