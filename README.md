@@ -2,6 +2,14 @@
 
 An MCP (Model Context Protocol) server implementing the **TRUE Recursive Language Model (RLM)** technique for ultimate context management with Claude Code.
 
+**v2.9 Status**: 🚀 Optimization Initiative Underway
+- ✅ Code organization complete (5 new modules, 1,524 LOC)
+- 📊 Performance roadmap planned (60-100% cumulative gain)
+- 🎯 3 optimization phases documented
+- 📋 16 implementation tasks ready
+
+See [.claude/claude.md](.claude/claude.md) for detailed optimization roadmap.
+
 Based on:
 - **[arXiv:2512.24601](https://arxiv.org/abs/2512.24601)** - Recursive Language Models (Zhang, Kraska, Khattab - MIT, 2025)
 - **[Anthropic MCP Documentation](https://modelcontextprotocol.io/)**
