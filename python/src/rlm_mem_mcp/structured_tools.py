@@ -64,7 +64,6 @@ from .scan_patterns import (
     XSS_PATTERNS,
     SANITIZER_PATTERNS,
     QUALITY_PATTERNS,
-    IOS_PATTERNS,
     REACT_PATTERNS,
 )
 
