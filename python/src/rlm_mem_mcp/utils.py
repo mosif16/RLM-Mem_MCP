@@ -10,9 +10,14 @@ Includes:
 import asyncio
 import functools
 import gc
-import resource
 import sys
 import time
+
+# resource module is Unix-only, optional on Windows
+try:
+    import resource
+except ImportError:
+    resource = None  # type: ignore
 from dataclasses import dataclass, field
 from typing import Any, Callable, TypeVar, ParamSpec
 from collections import defaultdict
@@ -104,6 +109,9 @@ def get_metrics_collector() -> MetricsCollector:
 
 def get_memory_usage() -> int:
     """Get current memory usage in bytes."""
+    if resource is None:
+        # resource module not available (e.g., Windows)
+        return 0
     try:
         # Try to get RSS (Resident Set Size) on Unix
         usage = resource.getrusage(resource.RUSAGE_SELF)

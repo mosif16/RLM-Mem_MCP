@@ -310,8 +310,8 @@ def create_server() -> Server:
     server = Server("rlm-recursive-memory")
 
     # Validate commercial licensing on server startup
-    config = get_config()
-    is_valid, message, license_info = validate_commercial_license(config)
+    rlm_config, server_config = get_config()
+    is_valid, message, license_info = validate_commercial_license(rlm_config)
 
     if not is_valid:
         print(f"\n🚫 LICENSE VALIDATION FAILED 🚫", file=sys.stderr)
